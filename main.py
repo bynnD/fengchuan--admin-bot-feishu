@@ -3,8 +3,18 @@ import json
 import httpx
 import lark_oapi as lark
 import time
-from lark_oapi.api.im.v1 import CreateMessageRequestBody, CreateMessageRequest
-from lark_oapi.api.approval.v4 import CreateInstanceRequestBody, CreateInstanceRequest
+try:
+    from lark_oapi.api.im.v1.message import CreateMessageRequestBody, CreateMessageRequest
+except ImportError:
+    from lark_oapi.api.im.v1 import message as _im_message
+    CreateMessageRequestBody = _im_message.CreateMessageRequestBody
+    CreateMessageRequest = _im_message.CreateMessageRequest
+try:
+    from lark_oapi.api.approval.v4.instance import CreateInstanceRequestBody, CreateInstanceRequest
+except ImportError:
+    from lark_oapi.api.approval.v4 import instance as _approval_instance
+    CreateInstanceRequestBody = _approval_instance.CreateInstanceRequestBody
+    CreateInstanceRequest = _approval_instance.CreateInstanceRequest
 from approval_config import APPROVAL_CODES, APPROVAL_FIELDS, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import validate_approval
 
