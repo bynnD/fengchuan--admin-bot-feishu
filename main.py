@@ -63,23 +63,38 @@ client = lark.Client.builder() \
     .build()
 
 def send_message(open_id, text):
-    """发送普通文本消息"""
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(open_id) \
-        .msg_type("text") \
-        .content(json.dumps({"text": text})) \
-        .build()
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("open_id") \
-        .request_body(body) \
-        .build()
-    resp = client.im.v1.message.create(request)
-    if not resp.success():
-        print(f"发送消息失败: {resp.msg}")
+    if CreateMessageRequestBody and CreateMessageRequest:
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(open_id) \
+            .msg_type("text") \
+            .content(json.dumps({"text": text})) \
+            .build()
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("open_id") \
+            .request_body(body) \
+            .build()
+        resp = client.im.v1.message.create(request)
+        if not resp.success():
+            print(f"发送消息失败: {resp.msg}")
+        return text
+    token = get_tenant_access_token()
+    if not token:
+        print("发送消息失败: 未获取到租户令牌")
+        return text
+    try:
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+        payload = {
+            "receive_id": open_id,
+            "content": json.dumps({"text": text}),
+            "msg_type": "text"
+        }
+        res = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        print(f"发送消息失败: {e}")
     return text
 
 def send_link_message(open_id, text, link_url):
-    """发送带链接的消息（富文本）"""
     content = {
         "zh_cn": {
             "title": "请点击链接办理",
@@ -91,16 +106,33 @@ def send_link_message(open_id, text, link_url):
             ]
         }
     }
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(open_id) \
-        .msg_type("post") \
-        .content(json.dumps(content)) \
-        .build()
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("open_id") \
-        .request_body(body) \
-        .build()
-    client.im.v1.message.create(request)
+    if CreateMessageRequestBody and CreateMessageRequest:
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(open_id) \
+            .msg_type("post") \
+            .content(json.dumps(content)) \
+            .build()
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("open_id") \
+            .request_body(body) \
+            .build()
+        client.im.v1.message.create(request)
+        return text
+    token = get_tenant_access_token()
+    if not token:
+        print("发送链接消息失败: 未获取到租户令牌")
+        return text
+    try:
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+        payload = {
+            "receive_id": open_id,
+            "content": json.dumps(content),
+            "msg_type": "post"
+        }
+        res = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        print(f"发送链接消息失败: {e}")
     return text
 
 def get_tenant_access_token():
@@ -245,23 +277,51 @@ def analyze_message(history):
 
 def create_approval(user_id, approval_type, fields, admin_comment):
     approval_code = APPROVAL_CODES[approval_type]
-    # 将 admin_comment 放入 fields 中，如果表单有这个字段的话
-    # 根据 rules_config，admin_comment 是必须的
     fields["admin_comment"] = admin_comment
-    
     form_data = json.dumps([
         {"id": k, "type": "input", "value": str(v)}
         for k, v in fields.items()
     ])
-    body = CreateInstanceRequestBody.builder() \
-        .approval_code(approval_code) \
-        .user_id(user_id) \
-        .form(form_data) \
-        .build()
-    request = CreateInstanceRequest.builder() \
-        .request_body(body) \
-        .build()
-    return client.approval.v4.instance.create(request)
+    if CreateInstanceRequestBody and CreateInstanceRequest:
+        body = CreateInstanceRequestBody.builder() \
+            .approval_code(approval_code) \
+            .user_id(user_id) \
+            .form(form_data) \
+            .build()
+        request = CreateInstanceRequest.builder() \
+            .request_body(body) \
+            .build()
+        return client.approval.v4.instance.create(request)
+    token = get_tenant_access_token()
+    if not token:
+        class Resp: 
+            def success(self): return False
+            @property
+            def msg(self): return "未获取到租户令牌"
+        return Resp()
+    try:
+        url = "https://open.feishu.cn/open-apis/approval/v4/instances/create"
+        payload = {
+            "approval_code": approval_code,
+            "user_id": user_id,
+            "form": form_data
+        }
+        res = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=10)
+        data = res.json()
+        class Resp:
+            def __init__(self, ok, msg): self._ok=ok; self._msg=msg
+            def success(self): return self._ok
+            @property
+            def msg(self): return self._msg
+        ok = res.status_code == 200 and data.get("code") == 0
+        msg = "" if ok else data.get("msg", str(data))
+        return Resp(ok, msg)
+    except Exception as e:
+        class Resp: 
+            def success(self): return False
+            @property
+            def msg(self): return str(e)
+        return Resp()
 
 def format_success_message(approval_type, fields, admin_comment):
     lines = [f"✅ 已为你提交{approval_type}申请!"]
