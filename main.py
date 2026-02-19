@@ -3,18 +3,40 @@ import json
 import httpx
 import lark_oapi as lark
 import time
-try:
-    from lark_oapi.api.im.v1.message import CreateMessageRequestBody, CreateMessageRequest
-except ImportError:
-    from lark_oapi.api.im.v1 import message as _im_message
-    CreateMessageRequestBody = _im_message.CreateMessageRequestBody
-    CreateMessageRequest = _im_message.CreateMessageRequest
-try:
-    from lark_oapi.api.approval.v4.instance import CreateInstanceRequestBody, CreateInstanceRequest
-except ImportError:
-    from lark_oapi.api.approval.v4 import instance as _approval_instance
-    CreateInstanceRequestBody = _approval_instance.CreateInstanceRequestBody
-    CreateInstanceRequest = _approval_instance.CreateInstanceRequest
+import importlib
+
+def _resolve_class(paths):
+    for mod, cls in paths:
+        try:
+            m = importlib.import_module(mod)
+            c = getattr(m, cls, None)
+            if c:
+                return c
+        except Exception:
+            continue
+    return None
+
+# 兼容不同版本 lark-oapi 的导出路径
+CreateMessageRequestBody = _resolve_class([
+    ("lark_oapi.api.im.v1", "CreateMessageRequestBody"),
+    ("lark_oapi.api.im.v1.model.message", "CreateMessageRequestBody"),
+    ("lark_oapi.api.im.v1.message", "CreateMessageRequestBody"),
+])
+CreateMessageRequest = _resolve_class([
+    ("lark_oapi.api.im.v1", "CreateMessageRequest"),
+    ("lark_oapi.api.im.v1.model.message", "CreateMessageRequest"),
+    ("lark_oapi.api.im.v1.message", "CreateMessageRequest"),
+])
+CreateInstanceRequestBody = _resolve_class([
+    ("lark_oapi.api.approval.v4", "CreateInstanceRequestBody"),
+    ("lark_oapi.api.approval.v4.model.instance", "CreateInstanceRequestBody"),
+    ("lark_oapi.api.approval.v4.instance", "CreateInstanceRequestBody"),
+])
+CreateInstanceRequest = _resolve_class([
+    ("lark_oapi.api.approval.v4", "CreateInstanceRequest"),
+    ("lark_oapi.api.approval.v4.model.instance", "CreateInstanceRequest"),
+    ("lark_oapi.api.approval.v4.instance", "CreateInstanceRequest"),
+])
 from approval_config import APPROVAL_CODES, APPROVAL_FIELDS, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import validate_approval
 
