@@ -3,8 +3,8 @@ import json
 import httpx
 import lark_oapi as lark
 import time
-from lark_oapi.api.im.v1 import *
-from lark_oapi.api.approval.v4 import *
+from lark_oapi.api.im.v1 import CreateMessageRequestBody, CreateMessageRequest
+from lark_oapi.api.approval.v4 import CreateInstanceRequestBody, CreateInstanceRequest
 from approval_config import APPROVAL_CODES, APPROVAL_FIELDS, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import validate_approval
 
@@ -333,13 +333,45 @@ def on_message(data):
         if open_id:
             send_message(open_id, "⚠️ 系统出现异常，请检查配置或稍后再试。")
 
+def on_message_read(data):
+    return
+
+def on_chat_access_event(data):
+    return
+
+def on_reaction_created(data):
+    return
+
+def register_if_available(builder, method_name, func):
+    method = getattr(builder, method_name, None)
+    if method:
+        return method(func)
+    return builder
+
 if __name__ == "__main__":
     if not validate_env():
         raise SystemExit(1)
     # 注册处理器
-    handler = lark.EventDispatcherHandler.builder("", "") \
-        .register_p2_im_message_receive_v1(on_message) \
-        .build()
+    handler_builder = lark.EventDispatcherHandler.builder("", "") \
+        .register_p2_im_message_receive_v1(on_message)
+
+    handler_builder = register_if_available(
+        handler_builder,
+        "register_p2_im_message_read_v1",
+        on_message_read
+    )
+    handler_builder = register_if_available(
+        handler_builder,
+        "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
+        on_chat_access_event
+    )
+    handler_builder = register_if_available(
+        handler_builder,
+        "register_p2_im_message_reaction_created_v1",
+        on_reaction_created
+    )
+
+    handler = handler_builder.build()
 
     # 启动客户端
     ws_client = lark.ws.Client(
