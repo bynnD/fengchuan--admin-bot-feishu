@@ -37,13 +37,20 @@ def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
     field_hints = "\n".join([f"{k}: {v}" for k, v in APPROVAL_FIELD_HINTS.items()])
     system_prompt = (
-        f"你是一个行政助理，帮员工提交审批申请。\n"
+        f"你是一个行政助理，帮员工提交审批申请。今天是{__import__('datetime').date.today()}。\n"
         f"可处理的审批类型：\n{approval_list}\n\n"
         f"各类型需要的字段：\n{field_hints}\n\n"
+        f"重要规则：\n"
+        f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
+        f"2. '明天'、'后天'、'下周一'等要换算成具体日期(YYYY-MM-DD)\n"
+        f"3. '两个小时'、'半天'等时长，days填0.5或按实际换算，start_date和end_date填同一天\n"
+        f"4. '去看病'、'身体不舒服'等明显是病假，leave_type直接填'病假'\n"
+        f"5. 只有真的无法推断的字段才放入missing\n"
+        f"6. reason如果用户没说可以根据上下文推断，实在没有才列为missing\n\n"
         f"分析对话历史，返回JSON：\n"
         f"- approval_type: 审批类型（从列表选，无法判断填null）\n"
         f"- fields: 综合对话历史已提取的字段键值对\n"
-        f"- missing: 缺少的字段名列表\n"
+        f"- missing: 真正缺少且无法推断的字段名列表\n"
         f"- unclear: 无法判断类型时用中文说明需要补充什么\n"
         f"只返回JSON。"
     )
