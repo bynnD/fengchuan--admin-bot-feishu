@@ -65,7 +65,7 @@ def _fetch_from_api(approval_code, token):
                 continue
             info = {"name": field_name, "type": field_type}
             if field_type == "fieldList":
-                sub_items = item.get("value") or item.get("option") or item.get("children") or []
+                sub_items = item.get("children") or item.get("value") or item.get("option") or []
                 if isinstance(sub_items, str):
                     try:
                         parsed = json.loads(sub_items) if sub_items else []
@@ -81,7 +81,7 @@ def _fetch_from_api(approval_code, token):
                                         sub_items = parsed[k]
                                         break
                         else:
-                            sub_items = parsed
+                            sub_items = parsed if isinstance(parsed, list) else []
                     except json.JSONDecodeError:
                         sub_items = []
                 if not isinstance(sub_items, list):
@@ -99,7 +99,8 @@ def _fetch_from_api(approval_code, token):
                                 for s in first_row if isinstance(s, dict) and s.get("id")
                             ]
                     if not info["sub_fields"]:
-                        print(f"fieldList {field_id} 解析到 {len(sub_items)} 项但无有效 id，原始 value 预览: {str(item.get('value', ''))[:200]}")
+                        raw_preview = json.dumps(item, ensure_ascii=False)[:400]
+                        print(f"fieldList {field_id}({field_name}) 无有效子字段，原始 item 预览: {raw_preview}")
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):

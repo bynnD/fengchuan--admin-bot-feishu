@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import httpx
 import lark_oapi as lark
@@ -91,8 +92,12 @@ def upload_approval_file(file_name, file_content):
             print(f"文件上传响应非JSON: status={res.status_code}, body前200字: {raw_text[:200]}")
             return None, "接口返回格式异常，请稍后重试"
         if data.get("code") == 0:
-            file_code = data.get("data", {}).get("code", "")
+            d = data.get("data", {})
+            file_code = d.get("code") or d.get("file_token") or d.get("file_code") or ""
             print(f"文件上传成功: {file_name} -> {file_code}")
+            if not file_code:
+                print(f"警告: API 返回成功但无 file code，完整 data: {d}")
+                return None, "接口返回成功但未返回文件标识，请重试"
             return file_code, None
         err_msg = data.get("msg", "未知错误")
         err_code = data.get("code", "")
@@ -119,11 +124,13 @@ def send_message(open_id, text):
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
-    """发送卡片消息。use_desktop_link=True 时，PC 端用 lark:// 在桌面客户端打开，避免跳浏览器"""
+    """发送卡片消息。use_desktop_link=True 时，PC 端用 feishu.cn 链接在客户端内嵌打开"""
     if use_desktop_link and "instanceCode=" in url:
+        m = re.search(r"instanceCode=([^&]+)", url)
+        ic = m.group(1) if m else ""
         https_url = url.replace("lark://", "https://", 1) if url.startswith("lark://") else url
-        lark_url = "lark://" + https_url[8:] if https_url.startswith("https://") else url
-        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": lark_url}}
+        feishu_url = f"https://www.feishu.cn/approval/detail/{ic}" if ic else https_url
+        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": feishu_url}}
     else:
         btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     card = {
@@ -826,9 +833,42 @@ def on_message(data):
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
+        path = self.path.split("?")[0]
+        if path == "/debug-form":
+            from urllib.parse import parse_qs
+            qs = parse_qs((self.path.split("?") + ["?"])[1])
+            at = (qs.get("type") or [""])[0] or "采购申请"
+            try:
+                code = APPROVAL_CODES.get(at, "")
+                token = get_token()
+                res = httpx.get(
+                    f"https://open.feishu.cn/open-apis/approval/v4/approvals/{code}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10
+                )
+                data = res.json()
+                form_str = data.get("data", {}).get("form", "[]")
+                form = json.loads(form_str) if isinstance(form_str, str) else form_str
+                out = {"approval": at, "fields": []}
+                for item in form:
+                    fid = item.get("id")
+                    fname = item.get("name", "")
+                    ftype = item.get("type", "")
+                    out["fields"].append({"id": fid, "name": fname, "type": ftype})
+                    if ftype == "fieldList":
+                        out["fields"][-1]["raw_item"] = item
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
 
     def log_message(self, *args):
         pass
