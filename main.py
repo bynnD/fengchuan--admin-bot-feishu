@@ -163,7 +163,10 @@ def _format_widget_value(widget, logical_key, value):
     if logical_key in ["start_date", "end_date"] or logical_key.endswith("_date") or widget_type in ["date", "datetime", "date_time"]:
         return f"{value}T00:00:00+08:00"
     if logical_key == "days":
-        return str(value)
+        try:
+            return float(value)
+        except:
+            return value
     options = _extract_options(widget)
     option_id = _match_option_id(options, str(value)) if options else None
     if option_id is not None:
@@ -390,9 +393,6 @@ def _get_user_department_leader(user_id):
         return None
 
 def revoke_instance(approval_code, instance_code, user_id):
-    """
-    撤销审批实例（用于模拟“草稿”状态）
-    """
     try:
         token = get_token()
         res = httpx.post(
@@ -442,16 +442,17 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
             leave_mapping_rules,
             approval_type
         )
+        leave_value_map = group_value if group_value else {
+            "widgetLeaveGroupType": fields.get("leave_type", "事假"),
+            "widgetLeaveGroupStartTime": f"{fields.get('start_date', '2026-01-01')}T00:00:00+08:00",
+            "widgetLeaveGroupEndTime": f"{fields.get('end_date', '2026-01-01')}T00:00:00+08:00",
+            "widgetLeaveGroupInterval": float(fields.get("days", 1)),
+            "widgetLeaveGroupReason": fields.get("reason", "API提交")
+        }
         form_list = [{
             "id": group_widget_id,
             "type": "leaveGroupV2",
-            "value": group_value if group_value else {
-                "end": f"{end}T00:00:00+08:00",
-                "start": f"{start}T00:00:00+08:00",
-                "interval": days,
-                "name": leave_type,
-                "reason": reason
-            }
+            "value": [_wrap_group_value(leave_value_map)]
         }]
 
     elif approval_type == "外出":
@@ -474,14 +475,15 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
             out_mapping_rules,
             approval_type
         )
+        out_value_map = group_value if group_value else {
+            "end": f"{end}T00:00:00+08:00",
+            "start": f"{start}T00:00:00+08:00",
+            "reason": f"{destination} {reason}".strip()
+        }
         form_list = [{
             "id": group_widget_id,
             "type": "outGroup",
-            "value": group_value if group_value else {
-                "end": f"{end}T00:00:00+08:00",
-                "start": f"{start}T00:00:00+08:00",
-                "reason": f"{destination} {reason}".strip()
-            }
+            "value": [_wrap_group_value(out_value_map)]
         }]
 
     elif approval_type == "采购申请":
@@ -575,7 +577,6 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
     if data.get("code") == 0 and draft:
         instance_code = data.get("data", {}).get("instance_code")
         if instance_code:
-            # 立即撤销，形成“草稿”状态
             if revoke_instance(approval_code, instance_code, user_id):
                 return True, "已创建草稿（请点击下方链接编辑并提交）", data.get("data", {})
             else:
