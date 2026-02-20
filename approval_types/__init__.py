@@ -26,6 +26,7 @@ for t in _TYPES:
     DATE_FIELDS.update(getattr(t, "DATE_FIELDS", set()))
 
 FIELD_LABELS_REVERSE = {v: k for k, v in FIELD_LABELS.items()}
+IMAGE_SUPPORT_TYPES = {t.NAME for t in _TYPES if getattr(t, "SUPPORTS_IMAGE", False)}
 
 
 def get_admin_comment(approval_type, fields):

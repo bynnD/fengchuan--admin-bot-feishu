@@ -6,8 +6,9 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
-    get_admin_comment
+    IMAGE_SUPPORT_TYPES, get_admin_comment
 )
+import base64
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
 import time
@@ -42,6 +43,82 @@ def get_token():
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
+
+
+def download_image(message_id, image_key):
+    """从飞书下载图片，返回 base64 编码"""
+    try:
+        token = get_token()
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}",
+            params={"type": "image"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15
+        )
+        if res.status_code == 200:
+            return base64.b64encode(res.content).decode("utf-8")
+        print(f"下载图片失败: status={res.status_code}")
+    except Exception as e:
+        print(f"下载图片异常: {e}")
+    return None
+
+
+def ocr_image(image_base64):
+    """调用飞书 OCR 识别图片文字"""
+    try:
+        token = get_token()
+        res = httpx.post(
+            "https://open.feishu.cn/open-apis/optical_char_recognition/v1/image/basic_recognize",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"image": image_base64},
+            timeout=15
+        )
+        data = res.json()
+        if data.get("code") == 0:
+            lines = data.get("data", {}).get("text_list", [])
+            return "\n".join(lines)
+        print(f"OCR 失败: {data.get('msg')}")
+    except Exception as e:
+        print(f"OCR 异常: {e}")
+    return None
+
+
+def analyze_document_for_seal(ocr_text, user_text=""):
+    """根据 OCR 文字和用户描述，用 AI 提取用印申请字段"""
+    prompt = (
+        f"你是行政助理，根据以下文档内容和用户说明，提取用印申请所需的信息。\n\n"
+        f"文档OCR文字：\n{ocr_text}\n\n"
+    )
+    if user_text:
+        prompt += f"用户说明：{user_text}\n\n"
+    prompt += (
+        f"请从文档中识别并返回JSON，包含以下字段（能识别多少填多少）：\n"
+        f"- company: 用印公司名称\n"
+        f"- seal_type: 需要的印章类型(公章/合同章/法人章/财务章)\n"
+        f"- document_name: 文件名称/标题\n"
+        f"- document_type: 文件类型(合同/协议/报告/证明等)\n"
+        f"- reason: 用印事由(简要说明文件用途)\n"
+        f"- document_count: 文件份数(默认1)\n"
+        f"只返回JSON，不要其他文字。"
+    )
+    try:
+        res = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return json.loads(content)
+    except Exception as e:
+        print(f"文档分析失败: {e}")
+        return {}
 
 
 def send_message(open_id, text):
@@ -124,7 +201,11 @@ def analyze_message(history):
             timeout=30
         )
         res.raise_for_status()
-        raw = json.loads(res.json()["choices"][0]["message"]["content"])
+        content = res.json()["choices"][0]["message"]["content"]
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        raw = json.loads(content)
         if "requests" in raw:
             return raw
         if raw.get("approval_type"):
@@ -132,6 +213,7 @@ def analyze_message(history):
         return {"requests": [], "unclear": raw.get("unclear", "无法识别审批类型。")}
     except Exception as e:
         print(f"AI分析失败: {e}")
+        traceback.print_exc()
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
@@ -189,13 +271,15 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
     return str(raw_value) if raw_value else ""
 
 
-def _to_datetime_str(date_val):
-    """将日期值转为 'YYYY-MM-DD HH:MM:SS' 格式（dateInterval 需要）"""
+def _to_rfc3339(date_val):
+    """将日期值转为 RFC3339 格式（dateInterval 需要）"""
     s = str(date_val).strip()
     if len(s) == 10:
-        return f"{s} 00:00:00"
-    if "T" in s:
-        return s.replace("T", " ").split("+")[0]
+        return f"{s}T00:00:00+08:00"
+    if "T" in s and "+" not in s:
+        return f"{s}+08:00"
+    if "T" not in s and " " in s:
+        return s.replace(" ", "T") + "+08:00"
     return s
 
 
@@ -230,9 +314,11 @@ def build_form(approval_type, fields, token):
             form_list.append({
                 "id": field_id,
                 "type": "dateInterval",
-                "start": _to_datetime_str(start_val),
-                "end": _to_datetime_str(end_val),
-                "interval": "1.0"
+                "value": {
+                    "start": _to_rfc3339(start_val),
+                    "end": _to_rfc3339(end_val),
+                    "interval": 1.0
+                }
             })
             continue
 
@@ -265,8 +351,8 @@ def build_form(approval_type, fields, token):
                             raw = opt.get("value", raw_str)
                             matched = True
                             break
-                if not matched and not raw:
-                    raw = opts[0].get("value", "") if opts and isinstance(opts[0], dict) else ""
+                if not matched:
+                    raw = opts[0].get("value", "") if isinstance(opts[0], dict) else ""
         value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
         if logical_key in DATE_FIELDS and raw:
@@ -278,7 +364,7 @@ def build_form(approval_type, fields, token):
     unused_texts = [str(v) for k, v in fields.items() if k not in used_keys and v]
     if unused_texts:
         for item in form_list:
-            if item.get("type") in ("textarea", "input") and not item.get("value"):
+            if item.get("type") == "textarea" and not item.get("value"):
                 item["value"] = "；".join(unused_texts)
                 break
 
@@ -353,6 +439,76 @@ def _on_message_read(_data):
     pass
 
 
+def _handle_image_message(open_id, user_id, message_id, content_json):
+    """处理图片消息：下载→OCR→分析→创建用印申请"""
+    image_key = content_json.get("image_key", "")
+    if not image_key:
+        send_message(open_id, "无法获取图片，请重新发送。")
+        return
+
+    send_message(open_id, "正在识别文档内容，请稍候...")
+
+    image_b64 = download_image(message_id, image_key)
+    if not image_b64:
+        send_message(open_id, "图片下载失败，请重试或直接用文字描述您的用印需求。")
+        return
+
+    ocr_text = ocr_image(image_b64)
+    if not ocr_text:
+        send_message(open_id, "文档识别失败，请直接用文字描述您的用印需求，例如：\n"
+                     "「帮我给XX合同盖公章，微驰公司」")
+        return
+
+    print(f"OCR结果: {ocr_text[:200]}...")
+
+    prev_texts = [m["content"] for m in CONVERSATIONS.get(open_id, []) if m["role"] == "user"]
+    user_context = "；".join(prev_texts[-3:]) if prev_texts else ""
+
+    doc_fields = analyze_document_for_seal(ocr_text, user_context)
+    print(f"文档分析结果: {doc_fields}")
+
+    if not doc_fields:
+        send_message(open_id, "无法从文档中提取信息，请用文字补充：\n"
+                     "用印公司、印章类型、文件名称、用印事由")
+        return
+
+    doc_fields.setdefault("usage_method", "盖章")
+    doc_fields.setdefault("document_count", "1")
+    doc_fields.setdefault("lawyer_reviewed", "否")
+
+    missing = []
+    for key in ["company", "seal_type", "document_name", "reason"]:
+        if not doc_fields.get(key):
+            label = FIELD_LABELS.get(key, key)
+            missing.append(label)
+
+    if missing:
+        summary = format_fields_summary(doc_fields, "用印申请")
+        msg = (f"已从文档中识别到以下信息：\n{summary}\n\n"
+               f"还缺少：{'、'.join(missing)}\n请补充。")
+        send_message(open_id, msg)
+        CONVERSATIONS.setdefault(open_id, [])
+        CONVERSATIONS[open_id].append({"role": "assistant", "content": f"[文档识别] {json.dumps(doc_fields, ensure_ascii=False)}"})
+        CONVERSATIONS[open_id].append({"role": "assistant", "content": f"请补充：{'、'.join(missing)}"})
+        return
+
+    admin_comment = get_admin_comment("用印申请", doc_fields)
+    summary = format_fields_summary(doc_fields, "用印申请")
+
+    success, msg, resp_data = create_approval(user_id, "用印申请", doc_fields)
+    if success:
+        instance_code = resp_data.get("instance_code", "")
+        if instance_code:
+            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+            send_card_message(open_id, card_content, link, "查看工单")
+        send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+    else:
+        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}\n\n已识别信息：\n{summary}")
+
+    CONVERSATIONS[open_id] = []
+
+
 def on_message(data):
     event_id = data.header.event_id
     if event_id in PROCESSED_EVENTS:
@@ -364,7 +520,18 @@ def on_message(data):
         event = data.event
         open_id = event.sender.sender_id.open_id
         user_id = event.sender.sender_id.user_id
-        text = json.loads(event.message.content).get("text", "").strip()
+        msg_type = event.message.message_type
+        message_id = event.message.message_id
+        content_json = json.loads(event.message.content)
+
+        if msg_type == "image":
+            _handle_image_message(open_id, user_id, message_id, content_json)
+            return
+
+        text = content_json.get("text", "").strip()
+        if not text:
+            send_message(open_id, "请发送文字消息描述您的审批需求，或发送文档图片进行用印申请。")
+            return
 
         if open_id not in CONVERSATIONS:
             CONVERSATIONS[open_id] = []
