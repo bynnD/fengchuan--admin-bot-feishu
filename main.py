@@ -5,11 +5,10 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP,
-    APPROVAL_GROUP_WIDGET_IDS, APPROVAL_GROUP_MAPPING_RULES, APPROVAL_FLAT_MAPPING_RULES,
-    FREE_PROCESS_CONFIG
+    LINK_ONLY_TYPES, FIELD_ID_FALLBACK
 )
 from rules_config import get_admin_comment
+from field_cache import get_form_fields, invalidate_cache
 import datetime
 import time
 
@@ -20,7 +19,6 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 PROCESSED_EVENTS = set()
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
-_approval_definition_cache = {"data": {}, "expires_at": {}}
 
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
@@ -43,217 +41,6 @@ def get_token():
     return _token_cache["token"]
 
 
-def _fetch_approval_definition(approval_code):
-    now = time.time()
-    cached = _approval_definition_cache["data"].get(approval_code)
-    expires_at = _approval_definition_cache["expires_at"].get(approval_code, 0)
-    if cached is not None and now < expires_at:
-        return cached
-    try:
-        token = get_token()
-        res = httpx.get(
-            f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        data = res.json()
-        if data.get("code") != 0:
-            if "user access token not support" in str(data.get("msg", "")):
-                print(f"获取审批定义失败({approval_code}): 权限不足或不支持的审批类型。请检查应用是否具备 'approval:approval' 权限，且审批定义非'自由流程'。")
-            else:
-                print(f"获取审批定义失败({approval_code}): {data}")
-            return None
-        
-        payload = data.get("data", {})
-        approval = payload.get("approval", payload)
-        form_schema = approval.get("form") or payload.get("form")
-        if not form_schema:
-            return None
-        if isinstance(form_schema, str):
-            form_schema = json.loads(form_schema)
-        _approval_definition_cache["data"][approval_code] = form_schema
-        _approval_definition_cache["expires_at"][approval_code] = now + 600
-        return form_schema
-    except Exception:
-        return None
-
-
-def _normalize_text(value):
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        for key in ["text", "content", "name", "label", "title", "value"]:
-            if key in value:
-                return _normalize_text(value[key])
-        return ""
-    if isinstance(value, list):
-        return " ".join([_normalize_text(v) for v in value if _normalize_text(v)])
-    return str(value)
-
-
-def _collect_widgets(node, widgets):
-    if isinstance(node, dict):
-        if "id" in node and "type" in node:
-            widgets.append(node)
-        for v in node.values():
-            _collect_widgets(v, widgets)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_widgets(item, widgets)
-
-
-def _extract_widget_label(widget):
-    for key in ["name", "label", "title", "text", "display_name", "desc", "placeholder"]:
-        if key in widget:
-            label = _normalize_text(widget.get(key)).strip()
-            if label:
-                return label
-    return ""
-
-
-def _get_child_widgets(group_widget):
-    for key in ["children", "sub_widgets", "widgets", "items", "fields", "controls", "elements"]:
-        val = group_widget.get(key)
-        if isinstance(val, list) and any(isinstance(i, dict) and "id" in i for i in val):
-            return val
-    widgets = []
-    _collect_widgets(group_widget, widgets)
-    group_id = group_widget.get("id")
-    return [w for w in widgets if w is not group_widget and w.get("id") != group_id]
-
-
-def _build_label_mapping(child_widgets, mapping_rules):
-    mapping = {}
-    for widget in child_widgets:
-        label = _extract_widget_label(widget)
-        if not label:
-            continue
-        for logical_key, keywords in mapping_rules.items():
-            if logical_key in mapping:
-                continue
-            if any(k in label for k in keywords):
-                mapping[logical_key] = widget
-    return mapping
-
-
-def _extract_options(widget):
-    for key in ["options", "option", "select_options", "values", "items"]:
-        val = widget.get(key)
-        if isinstance(val, list) and val and isinstance(val[0], dict):
-            return val
-    return []
-
-
-def _match_option_id(options, desired):
-    for opt in options:
-        label = _normalize_text(
-            opt.get("name") or opt.get("label") or opt.get("text") or opt.get("value") or opt.get("title")
-        )
-        if not label:
-            continue
-        if desired == label or desired in label:
-            return opt.get("id") or opt.get("value") or opt.get("key")
-    return None
-
-
-def _format_widget_value(widget, logical_key, value):
-    if value is None:
-        return ""
-    widget_type = str(widget.get("type", "")).lower()
-    if logical_key in ["start_date", "end_date"] or logical_key.endswith("_date") or widget_type in ["date", "datetime", "date_time"]:
-        return f"{value}T00:00:00+08:00"
-    if logical_key == "days":
-        try:
-            return float(value)
-        except:
-            return value
-    options = _extract_options(widget)
-    option_id = _match_option_id(options, str(value)) if options else None
-    if option_id is not None:
-        return option_id
-    return str(value)
-
-
-def _get_widget_value_key(widget):
-    for key in ["field_id", "field_key", "key", "id"]:
-        value = widget.get(key)
-        if value:
-            return value
-    return None
-
-
-def _wrap_group_value(group_value):
-    if not isinstance(group_value, dict):
-        return group_value
-    return {k: {"value": v} for k, v in group_value.items()}
-
-
-def _build_group_value_from_definition(approval_code, group_widget_id, field_values, mapping_rules, approval_type):
-    form_schema = _fetch_approval_definition(approval_code)
-    if not form_schema:
-        return None
-    widgets = []
-    _collect_widgets(form_schema, widgets)
-    group_widget = next((w for w in widgets if w.get("id") == group_widget_id), None)
-    if not group_widget:
-        return None
-    child_widgets = _get_child_widgets(group_widget)
-    if not child_widgets:
-        return None
-    mapping = _build_label_mapping(child_widgets, mapping_rules)
-    if not mapping:
-        return None
-    if approval_type == "外出" and "destination" not in mapping and "reason" in mapping:
-        combined = f"{field_values.get('destination', '')} {field_values.get('reason', '')}".strip()
-        field_values = dict(field_values)
-        field_values["reason"] = combined
-    group_value = {}
-    for logical_key, widget in mapping.items():
-        if logical_key not in field_values:
-            continue
-        value = field_values.get(logical_key, "")
-        if value == "" and logical_key not in ["reason"]:
-            continue
-        value_key = _get_widget_value_key(widget)
-        if not value_key:
-            continue
-        group_value[value_key] = _format_widget_value(widget, logical_key, value)
-    return group_value or None
-
-
-def _build_flat_form_from_definition(approval_code, field_values, mapping_rules):
-    form_schema = _fetch_approval_definition(approval_code)
-    if not form_schema:
-        return None
-    widgets = []
-    _collect_widgets(form_schema, widgets)
-    leaf_widgets = []
-    for widget in widgets:
-        if not widget.get("id") or not widget.get("type"):
-            continue
-        if _get_child_widgets(widget):
-            continue
-        leaf_widgets.append(widget)
-    mapping = _build_label_mapping(leaf_widgets, mapping_rules)
-    if not mapping:
-        return None
-    form_list = []
-    for logical_key, widget in mapping.items():
-        if logical_key not in field_values:
-            continue
-        value = field_values.get(logical_key, "")
-        if value == "" and logical_key not in ["reason"]:
-            continue
-        widget_id = widget.get("id")
-        widget_type = widget.get("type", "input")
-        form_list.append({
-            "id": widget_id,
-            "type": widget_type,
-            "value": _format_widget_value(widget, logical_key, value)
-        })
-    return form_list or None
-
-
 def send_message(open_id, text):
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
@@ -269,25 +56,17 @@ def send_message(open_id, text):
         print(f"发送消息失败: {resp.msg}")
 
 
-def send_card_message(open_id, text, url, approval_type):
+def send_card_message(open_id, text, url, btn_label):
     card = {
         "config": {"wide_screen_mode": True},
         "elements": [
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": text}
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": f"前往提交{approval_type}申请"},
-                        "type": "primary",
-                        "url": url
-                    }
-                ]
-            }
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn_label},
+                "type": "primary",
+                "url": url
+            }]}
         ]
     }
     body = CreateMessageRequestBody.builder() \
@@ -302,10 +81,6 @@ def send_card_message(open_id, text, url, approval_type):
     resp = client.im.v1.message.create(request)
     if not resp.success():
         print(f"发送卡片消息失败: {resp.msg}")
-
-
-def build_approval_link(approval_code):
-    return f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}&from=bot"
 
 
 def analyze_message(history):
@@ -349,242 +124,114 @@ def analyze_message(history):
         return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
-def _get_user_department_leader(user_id):
+def build_form(approval_type, fields, token):
     """
-    获取用户的部门负责人
-    注意：需要开启 'contact:user.employee:readonly' 和 'contact:department.organize:readonly' 权限
+    根据缓存的字段结构构建表单。
+    请假/外出使用特殊控件格式（从真实实例验证的格式）。
+    其他类型用通用字段映射。
     """
-    try:
-        token = get_token()
-        # 1. 获取用户信息，找到 department_ids
-        res = httpx.get(
-            f"https://open.feishu.cn/open-apis/contact/v3/users/{user_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"user_id_type": "user_id"},
-            timeout=10
-        )
-        user_data = res.json().get("data", {}).get("user", {})
-        department_ids = user_data.get("department_ids", [])
-        
-        if not department_ids:
-            return None
-
-        # 2. 获取主部门详情，找到 leader_user_id
-        # 飞书用户可能有多个部门，通常取第一个作为主部门
-        main_dept_id = department_ids[0]
-        res = httpx.get(
-            f"https://open.feishu.cn/open-apis/contact/v3/departments/{main_dept_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"department_id_type": "department_id"},
-            timeout=10
-        )
-        dept_data = res.json().get("data", {}).get("department", {})
-        leader_id = dept_data.get("leader_user_id")
-        
-        # 如果 leader 就是用户自己，尝试找上级部门 (可选逻辑，暂不实现以保持简单)
-        if leader_id == user_id:
-             print(f"用户 {user_id} 是部门负责人，暂未处理上级查找逻辑")
-             return None
-             
-        return leader_id
-
-    except Exception as e:
-        print(f"获取部门负责人失败: {e}")
-        return None
-
-def revoke_instance(approval_code, instance_code, user_id):
-    try:
-        token = get_token()
-        res = httpx.post(
-            "https://open.feishu.cn/open-apis/approval/v4/instances/cancel",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "approval_code": approval_code,
-                "instance_code": instance_code,
-                "user_id": user_id
-            },
-            timeout=10
-        )
-        data = res.json()
-        if data.get("code") == 0:
-            print(f"审批实例已撤销(草稿模式): {instance_code}")
-            return True
-        print(f"撤销审批失败: {data}")
-        return False
-    except Exception as e:
-        print(f"撤销审批异常: {e}")
-        return False
-
-
-def create_approval_api(user_id, approval_type, fields, admin_comment, draft=False):
     approval_code = APPROVAL_CODES[approval_type]
 
     if approval_type == "请假":
-        import calendar
         start = fields.get("start_date", "")
         end = fields.get("end_date", start)
         days = str(fields.get("days", "1"))
         leave_type = fields.get("leave_type", "事假")
         reason = fields.get("reason", "")
-        leave_field_values = {
-            "start_date": start,
-            "end_date": end,
-            "days": days,
-            "leave_type": leave_type,
-            "reason": reason
-        }
-        leave_mapping_rules = APPROVAL_GROUP_MAPPING_RULES.get(approval_type, {})
-        group_widget_id = APPROVAL_GROUP_WIDGET_IDS.get(approval_type, "widgetLeaveGroupV2")
-        group_value = _build_group_value_from_definition(
-            approval_code,
-            group_widget_id,
-            leave_field_values,
-            leave_mapping_rules,
-            approval_type
-        )
-        leave_value_map = group_value if group_value else {
-            "start": f"{fields.get('start_date', '2026-01-01')}T00:00:00+08:00",
-            "end": f"{fields.get('end_date', '2026-01-01')}T00:00:00+08:00",
-            "interval": str(fields.get("days", 1)),
-            "name": fields.get("leave_type", "事假"),
-            "reason": fields.get("reason", "API提交"),
-            "unit": "DAY",
-            "timezoneOffset": -480
-        }
-        form_list = [{
-            "id": group_widget_id,
+        return [{
+            "id": "widgetLeaveGroupV2",
             "type": "leaveGroupV2",
-            "value": leave_value_map
+            "value": {
+                "end": f"{end}T00:00:00+08:00",
+                "start": f"{start}T00:00:00+08:00",
+                "interval": days,
+                "name": leave_type,
+                "reason": reason,
+                "unit": "DAY",
+                "timezoneOffset": -480
+            }
         }]
 
-    elif approval_type == "外出":
+    if approval_type == "外出":
         start = fields.get("start_date", "")
         end = fields.get("end_date", start)
-        reason = fields.get("reason", "")
         destination = fields.get("destination", "")
-        out_field_values = {
-            "start_date": start,
-            "end_date": end,
-            "destination": destination,
-            "reason": reason
-        }
-        out_mapping_rules = APPROVAL_GROUP_MAPPING_RULES.get(approval_type, {})
-        group_widget_id = APPROVAL_GROUP_WIDGET_IDS.get(approval_type, "widgetOutGroup")
-        group_value = _build_group_value_from_definition(
-            approval_code,
-            group_widget_id,
-            out_field_values,
-            out_mapping_rules,
-            approval_type
-        )
-        out_value_map = group_value if group_value else {
-            "end": f"{end}T00:00:00+08:00",
-            "start": f"{start}T00:00:00+08:00",
-            "reason": f"{destination} {reason}".strip()
-        }
-        form_list = [{
-            "id": group_widget_id,
+        reason = fields.get("reason", "")
+        return [{
+            "id": "widgetOutGroup",
             "type": "outGroup",
-            "value": [out_value_map]
+            "value": {
+                "end": f"{end}T00:00:00+08:00",
+                "start": f"{start}T00:00:00+08:00",
+                "reason": f"{destination} {reason}".strip()
+            }
         }]
 
-    elif approval_type == "采购申请":
-        purchase_mapping_rules = APPROVAL_FLAT_MAPPING_RULES.get(approval_type, {})
-        purchase_form_list = _build_flat_form_from_definition(
-            approval_code,
-            fields,
-            purchase_mapping_rules
-        )
-        if purchase_form_list:
-            form_list = purchase_form_list
-        else:
-            field_map = PURCHASE_FIELD_MAP
-            form_list = []
-            for logical_key, real_id in field_map.items():
-                value = str(fields.get(logical_key, ""))
-                form_list.append({"id": real_id, "type": "input", "value": value})
+    # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
+    fallback = FIELD_ID_FALLBACK.get(approval_type, {})
+    if fallback:
+        form_list = []
+        for logical_key, real_id in fallback.items():
+            value = str(fields.get(logical_key, ""))
+            form_list.append({"id": real_id, "type": "input", "value": value})
+        return form_list
 
-    elif approval_type == "用印申请":
-        seal_mapping_rules = APPROVAL_FLAT_MAPPING_RULES.get(approval_type, {})
-        seal_form_list = _build_flat_form_from_definition(
-            approval_code,
-            fields,
-            seal_mapping_rules
-        )
-        if seal_form_list:
-            form_list = seal_form_list
-        else:
-            field_map = SEAL_FIELD_MAP
-            form_list = []
-            for logical_key, real_id in field_map.items():
-                value = str(fields.get(logical_key, ""))
-                form_list.append({"id": real_id, "type": "input", "value": value})
+    # 没有兜底映射时，从缓存获取字段结构自动匹配
+    cached_fields = get_form_fields(approval_type, approval_code, token)
+    if not cached_fields:
+        print(f"无法获取{approval_type}的字段结构")
+        return None
 
-    else:
-        return False, "不支持API提交", {}
+    form_list = []
+    for field_id, field_info in cached_fields.items():
+        field_type = field_info.get("type", "input")
+        field_name = field_info.get("name", "")
+        # 跳过附件、图片、说明类字段
+        if field_type in ("attach", "attachV2", "image", "imageV2", "description", "attachmentV2"):
+            continue
+        # 在 fields 里按 field_id 或 field_name 匹配值
+        value = fields.get(field_id) or fields.get(field_name) or ""
+        form_list.append({
+            "id": field_id,
+            "type": field_type if field_type in ("input", "textarea", "date", "number") else "input",
+            "value": str(value)
+        })
 
-    def _post_form(payload_form_list):
-        form_data = json.dumps(payload_form_list, ensure_ascii=False)
-        print(f"提交表单[{approval_type}]: {form_data}")
-        token = get_token()
-        
-        # 尝试从配置中获取自由流程所需的节点 ID
-        config = FREE_PROCESS_CONFIG.get(approval_type)
-        approvers = None
-        if config and config.get("node_id"):
-            # 优先使用配置的固定审批人
-            approver_ids = config.get("approver_open_ids", [])
-            
-            # 如果配置为空，则动态获取部门负责人
-            if not approver_ids:
-                print(f"配置未指定审批人，尝试自动获取发起人({user_id})的主管...")
-                leader_id = _get_user_department_leader(user_id)
-                if leader_id:
-                    approver_ids = [leader_id]
-                    print(f"已自动获取主管 ID: {leader_id}")
-                else:
-                    print("无法获取主管信息，请检查权限或配置。")
+    return form_list
 
-            if approver_ids:
-                approvers = [{
-                    "key": config["node_id"],
-                    "value": approver_ids
-                }]
-                print(f"使用自由流程审批人配置: {approvers}")
-            else:
-                print("警告：自由流程未指定审批人，提交可能会失败 (unsupported approval for free process)")
 
-        payload = {
+def create_approval(user_id, approval_type, fields):
+    approval_code = APPROVAL_CODES[approval_type]
+    token = get_token()
+
+    form_list = build_form(approval_type, fields, token)
+    if form_list is None:
+        return False, "无法构建表单，请检查审批字段配置", {}
+
+    form_data = json.dumps(form_list, ensure_ascii=False)
+    print(f"提交表单[{approval_type}]: {form_data}")
+
+    res = httpx.post(
+        "https://open.feishu.cn/open-apis/approval/v4/instances",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
             "approval_code": approval_code,
             "user_id": user_id,
             "form": form_data
-        }
-        if approvers:
-            payload["node_approver_user_id_list"] = approvers
+        },
+        timeout=15
+    )
+    data = res.json()
+    print(f"创建审批响应: {data}")
 
-        res = httpx.post(
-            "https://open.feishu.cn/open-apis/approval/v4/instances",
-            headers={"Authorization": f"Bearer {token}"},
-            json=payload,
-            timeout=15
-        )
-        data = res.json()
-        print(f"创建审批响应: {data}")
-        return data
+    success = data.get("code") == 0
+    msg = data.get("msg", "")
 
-    data = _post_form(form_list)
-    if data.get("code") == 1390001 and "unsupported approval for free process" in str(data.get("msg", "")):
-        return False, "该审批定义为'自由流程'，API无法直接提交。请联系管理员获取'节点ID'，并在 approval_config.py 中配置 FREE_PROCESS_CONFIG。", {}
+    # 失败时清除缓存，下次重新获取
+    if not success:
+        invalidate_cache(approval_type)
 
-    if data.get("code") == 0 and draft:
-        instance_code = data.get("data", {}).get("instance_code")
-        if instance_code:
-            if revoke_instance(approval_code, instance_code, user_id):
-                return True, "已创建草稿（请点击下方链接编辑并提交）", data.get("data", {})
-            else:
-                return True, "审批已创建但撤销失败（可能已提交）", data.get("data", {})
-
-    return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
+    return success, msg, data.get("data", {})
 
 
 def format_fields_summary(fields):
@@ -639,38 +286,32 @@ def on_message(data):
 
         if approval_type in LINK_ONLY_TYPES:
             approval_code = APPROVAL_CODES[approval_type]
-            link = build_approval_link(approval_code)
+            link = f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}"
             tip = (
                 f"已为你整理好{approval_type}信息：\n{summary}\n\n"
                 f"行政意见: {admin_comment}\n\n"
-                f"请点击下方按钮，在飞书客户端中打开审批表单完成提交："
+                f"请点击下方按钮前往飞书审批页面完成提交："
             )
-            send_card_message(open_id, tip, link, approval_type)
+            send_card_message(open_id, tip, link, f"前往提交{approval_type}申请")
+            CONVERSATIONS[open_id] = []
+            return
+
+        success, msg, resp_data = create_approval(user_id, approval_type, fields)
+        if success:
+            instance_code = resp_data.get("instance_code", "")
+            reply = (
+                f"✅ 已为你提交{approval_type}申请！\n{summary}\n\n"
+                f"💡 行政意见: {admin_comment}\n"
+                f"等待主管审批即可。"
+            )
+            send_message(open_id, reply)
+            if instance_code:
+                link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
+                send_card_message(open_id, "点击查看审批详情：", link, "查看审批详情")
             CONVERSATIONS[open_id] = []
         else:
-            # 使用草稿模式：创建后立即撤销，生成带数据的编辑链接
-            success, msg, resp_data = create_approval_api(user_id, approval_type, fields, admin_comment, draft=True)
-            if success:
-                instance_code = resp_data.get("instance_code")
-                # 生成跳转链接
-                url = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
-                
-                card_text = (
-                    f"**{approval_type}草稿已生成**\n\n"
-                    f"{summary}\n\n"
-                    f"💡 **操作指南**：\n"
-                    f"1. 点击下方按钮打开详情页\n"
-                    f"2. 点击页面底部的 **“重新提交”** 按钮\n"
-                    f"3. 检查/修改内容，上传附件，然后提交"
-                )
-                send_card_message(open_id, card_text, url, approval_type)
-                
-                reply = f"已为你生成{approval_type}草稿，请点击卡片中的按钮进行最终确认和提交。"
-                send_message(open_id, reply)
-                CONVERSATIONS[open_id] = []
-            else:
-                print(f"创建审批失败: {msg}")
-                send_message(open_id, f"创建草稿失败：{msg}")
+            print(f"创建审批失败: {msg}")
+            send_message(open_id, f"提交失败：{msg}\n请稍后重试，或联系行政人员。")
 
     except Exception as e:
         print(f"处理消息出错: {e}")
@@ -679,17 +320,6 @@ def on_message(data):
 
 
 if __name__ == "__main__":
-    # 启动时读取已有请假审批实例的表单数据
-    try:
-        token = get_token()
-        r = httpx.get(
-            "https://open.feishu.cn/open-apis/approval/v4/instances/4C9BA264-1169-4821-80AF-397AED46D5E2",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        print("请假实例数据:", json.dumps(r.json(), ensure_ascii=False))
-    except Exception as e:
-        print(f"读取实例失败: {e}")
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()

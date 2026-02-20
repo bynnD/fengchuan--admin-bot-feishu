@@ -1,4 +1,5 @@
 # 审批类型配置文件
+# 只需维护这里，无需动 main.py
 
 APPROVAL_CODES = {
     "请假":   "5D58D53D-01BA-44C7-BF5E-712D0F4C7820",
@@ -8,10 +9,11 @@ APPROVAL_CODES = {
     "入职审批": "36060498-23B6-45AF-B5B0-1EDE2A60241E",
 }
 
-# 使用深链接方式（无法API直接提交）
+# 只用链接跳转、不能API直接提交的审批类型
+# 原因：含有证件照片等附件必填字段，只能在飞书客户端手动提交
 LINK_ONLY_TYPES = {"入职审批"}
 
-# 每种审批需要收集的字段（用于AI提取信息）
+# AI提取信息时的字段提示（告诉AI每种审批需要收集哪些字段）
 APPROVAL_FIELD_HINTS = {
     "请假":   "leave_type(年假/病假/事假/婚假/产假), start_date(YYYY-MM-DD), end_date(YYYY-MM-DD), days(数字), reason",
     "外出":   "destination(外出地点), start_date(YYYY-MM-DD), end_date(YYYY-MM-DD), reason",
@@ -20,92 +22,40 @@ APPROVAL_FIELD_HINTS = {
     "入职审批": "name(姓名), department(部门), position(职位), entry_date(YYYY-MM-DD)",
 }
 
-# 审批表单字段关键词匹配规则
-APPROVAL_GROUP_WIDGET_IDS = {
-    "请假": "widgetLeaveGroupV2",
-    "外出": "widgetOutGroup",
+# 字段中文显示名（用于机器人回复时展示给用户）
+FIELD_LABELS = {
+    "leave_type":      "假期类型",
+    "start_date":      "开始日期",
+    "end_date":        "结束日期",
+    "days":            "天数",
+    "reason":          "原因",
+    "destination":     "外出地点",
+    "seal_type":       "印章类型",
+    "usage_date":      "用印日期",
+    "document_name":   "文件名称",
+    "purchase_reason": "采购事由",
+    "purchase_type":   "采购类别",
+    "expected_date":   "期望交付时间",
+    "cost_detail":     "费用明细",
+    "name":            "姓名",
+    "department":      "部门",
+    "position":        "职位",
+    "entry_date":      "入职日期",
 }
 
-APPROVAL_GROUP_MAPPING_RULES = {
-    "请假": {
-        "start_date": ["开始"],
-        "end_date": ["结束"],
-        "days": ["时长", "天数"],
-        "leave_type": ["假期类型", "请假类型", "类型"],
-        "reason": ["原因", "事由", "备注"]
-    },
-    "外出": {
-        "start_date": ["开始"],
-        "end_date": ["结束"],
-        "destination": ["地点", "目的地"],
-        "reason": ["原因", "事由", "备注"]
-    }
-}
-
-APPROVAL_FLAT_MAPPING_RULES = {
+# 通用审批类型的字段逻辑名 -> 飞书真实字段ID 映射
+# 请假/外出使用特殊控件，不在这里配置
+# 用于：当字段缓存无法自动匹配时的兜底映射
+FIELD_ID_FALLBACK = {
     "采购申请": {
-        "purchase_reason": ["采购事由", "事由"],
-        "purchase_type": ["采购类别", "类别", "类型"],
-        "expected_date": ["期望交付", "交付时间", "期望时间"],
-        "cost_detail": ["费用明细", "费用", "金额"]
+        "purchase_reason": "widget16510608596030001",
+        "purchase_type":   "widget16510608666360001",
+        "expected_date":   "widget16510608919180001",
+        "cost_detail":     "widget16510609006710001",
     },
     "用印申请": {
-        "seal_type": ["印章类型", "用印类型", "印章"],
-        "usage_date": ["用印日期", "日期"],
-        "document_name": ["文件名称", "文件名"],
-        "reason": ["原因", "事由", "备注"]
-    }
-}
-
-# 字段中文显示名
-FIELD_LABELS = {
-    "leave_type":     "假期类型",
-    "start_date":     "开始日期",
-    "end_date":       "结束日期",
-    "days":           "天数",
-    "reason":         "原因",
-    "destination":    "外出地点",
-    "seal_type":      "印章类型",
-    "usage_date":     "用印日期",
-    "document_name":  "文件名称",
-    "purchase_reason": "采购事由",
-    "purchase_type":  "采购类别",
-    "expected_date":  "期望交付时间",
-    "cost_detail":    "费用明细",
-    "name":           "姓名",
-    "department":     "部门",
-    "position":       "职位",
-    "entry_date":     "入职日期",
-}
-
-# 自由流程配置（针对 API 无法直接提交的自由流程审批）
-# 如果遇到 "unsupported approval for free process" 错误，请在此配置节点 ID 和审批人
-FREE_PROCESS_CONFIG = {
-    "请假": {
-        # 节点 ID：需要在浏览器开发者工具中查看审批定义获取，或询问管理员
-        # 通常是一个长字符串，如 "46e6d96c8d..." 或 "START"
-        "node_id": "", 
-        # 审批人 OpenID：在该节点进行审批的人员 ID
-        # 如果为空，系统将尝试自动获取发起人的部门负责人（需开启通讯录权限）
-        "approver_open_ids": [] 
+        "seal_type":     "widget17375347703620001",
+        "reason":        "widget0",
+        "document_name": "widget3",
     },
-    "外出": {
-        "node_id": "",
-        "approver_open_ids": []
-    }
-}
-
-# 采购申请的真实字段ID映射（从API获取）
-PURCHASE_FIELD_MAP = {
-    "purchase_reason": "widget16510608596030001",
-    "purchase_type":   "widget16510608666360001",
-    "expected_date":   "widget16510608919180001",
-    "cost_detail":     "widget16510609006710001",
-}
-
-# 用印申请的真实字段ID映射
-SEAL_FIELD_MAP = {
-    "seal_type":      "widget17375347703620001",
-    "reason":         "widget0",
-    "document_name":  "widget3",
 }

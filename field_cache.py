@@ -1,0 +1,107 @@
+"""
+字段缓存模块
+- 首次运行时从飞书API获取审批字段结构，保存到 field_cache.json
+- 之后直接读本地缓存，不重复调API
+- 提交失败时调用 invalidate_cache() 清除对应缓存，下次重新获取
+"""
+
+import json
+import os
+import httpx
+
+CACHE_FILE = "/app/field_cache.json"
+
+_memory_cache = {}
+
+
+def _load_disk_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"读取缓存文件失败: {e}")
+    return {}
+
+
+def _save_disk_cache(cache):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存缓存文件失败: {e}")
+
+
+def _fetch_from_api(approval_code, token):
+    """从飞书API获取审批表单字段结构"""
+    try:
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        data = res.json()
+        if data.get("code") != 0:
+            print(f"获取审批定义失败({approval_code}): {data.get('msg')}")
+            return None
+
+        form_str = data.get("data", {}).get("form", "[]")
+        if isinstance(form_str, str):
+            form = json.loads(form_str)
+        else:
+            form = form_str
+
+        fields = {}
+        for item in form:
+            field_id = item.get("id")
+            field_name = item.get("name", field_id)
+            field_type = item.get("type", "input")
+            if field_id:
+                fields[field_id] = {"name": field_name, "type": field_type}
+
+        print(f"已获取字段结构({approval_code}): {list(fields.keys())}")
+        return fields
+
+    except Exception as e:
+        print(f"获取审批定义异常({approval_code}): {e}")
+        return None
+
+
+def get_form_fields(approval_type, approval_code, token):
+    """
+    获取指定审批类型的字段结构。
+    优先读内存缓存 -> 磁盘缓存 -> API获取。
+    """
+    # 1. 内存缓存
+    if approval_type in _memory_cache:
+        return _memory_cache[approval_type]
+
+    # 2. 磁盘缓存
+    disk_cache = _load_disk_cache()
+    if approval_type in disk_cache:
+        _memory_cache[approval_type] = disk_cache[approval_type]
+        print(f"从缓存加载字段结构: {approval_type}")
+        return disk_cache[approval_type]
+
+    # 3. 从API获取
+    print(f"首次获取字段结构: {approval_type}")
+    fields = _fetch_from_api(approval_code, token)
+    if fields:
+        disk_cache[approval_type] = fields
+        _save_disk_cache(disk_cache)
+        _memory_cache[approval_type] = fields
+        return fields
+
+    return None
+
+
+def invalidate_cache(approval_type):
+    """提交失败时清除该类型的缓存，下次重新从API获取"""
+    if approval_type in _memory_cache:
+        del _memory_cache[approval_type]
+
+    disk_cache = _load_disk_cache()
+    if approval_type in disk_cache:
+        del disk_cache[approval_type]
+        _save_disk_cache(disk_cache)
+        print(f"已清除字段缓存: {approval_type}，下次将重新获取")
