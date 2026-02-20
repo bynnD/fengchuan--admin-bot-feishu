@@ -443,16 +443,18 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
             approval_type
         )
         leave_value_map = group_value if group_value else {
-            "widgetLeaveGroupType": fields.get("leave_type", "事假"),
-            "widgetLeaveGroupStartTime": f"{fields.get('start_date', '2026-01-01')}T00:00:00+08:00",
-            "widgetLeaveGroupEndTime": f"{fields.get('end_date', '2026-01-01')}T00:00:00+08:00",
-            "widgetLeaveGroupInterval": float(fields.get("days", 1)),
-            "widgetLeaveGroupReason": fields.get("reason", "API提交")
+            "start": f"{fields.get('start_date', '2026-01-01')}T00:00:00+08:00",
+            "end": f"{fields.get('end_date', '2026-01-01')}T00:00:00+08:00",
+            "interval": str(fields.get("days", 1)),
+            "name": fields.get("leave_type", "事假"),
+            "reason": fields.get("reason", "API提交"),
+            "unit": "DAY",
+            "timezoneOffset": -480
         }
         form_list = [{
             "id": group_widget_id,
             "type": "leaveGroupV2",
-            "value": [leave_value_map]
+            "value": leave_value_map
         }]
 
     elif approval_type == "外出":
