@@ -9,8 +9,8 @@ APPROVAL_CODES = {
     "入职审批": "36060498-23B6-45AF-B5B0-1EDE2A60241E",
 }
 
-# 只用链接跳转、不能API直接提交的审批类型
-LINK_ONLY_TYPES = {"入职审批"}
+# 只用链接跳转、不能API直接提交的审批类型（leaveGroupV2/outGroup 等 API 不支持）
+LINK_ONLY_TYPES = {"入职审批", "请假", "外出"}
 
 # AI提取信息时的字段提示（告诉AI每种审批需要收集哪些字段）
 APPROVAL_FIELD_HINTS = {
@@ -44,7 +44,6 @@ FIELD_LABELS = {
 
 # 通用审批类型的字段逻辑名 -> 飞书真实字段ID 映射
 # 请假/外出使用特殊控件，不在这里配置
-# 用于：当字段缓存无法自动匹配时的兜底映射
 FIELD_ID_FALLBACK = {
     "采购申请": {
         "purchase_reason": "widget16510608596030001",
@@ -54,7 +53,11 @@ FIELD_ID_FALLBACK = {
     },
     "用印申请": {
         "seal_type":     "widget17375347703620001",
-        "reason":        "widget0",
+        "usage_date":    "widget17375347703620002",  # 用印日期，若提交失败请从审批定义中确认实际ID
         "document_name": "widget3",
+        "reason":        "widget0",
     },
 }
+
+# 日期类型字段：提交时需转为 RFC3339 格式
+DATE_FIELDS = {"expected_date", "usage_date"}

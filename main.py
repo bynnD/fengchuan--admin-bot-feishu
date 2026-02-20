@@ -5,7 +5,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, FIELD_ID_FALLBACK
+    LINK_ONLY_TYPES, FIELD_ID_FALLBACK, DATE_FIELDS
 )
 from rules_config import get_admin_comment
 from field_cache import get_form_fields, invalidate_cache
@@ -244,10 +244,26 @@ def build_form(approval_type, fields, token):
     # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
     if fallback:
+        cached = get_form_fields(approval_type, approval_code, token)
         form_list = []
         for logical_key, real_id in fallback.items():
-            value = str(fields.get(logical_key, ""))
-            form_list.append({"id": real_id, "type": "input", "value": value})
+            raw = fields.get(logical_key, "")
+            if not raw and logical_key != "reason":
+                continue
+            # 若缓存中有更准确的字段ID（按名称匹配），优先使用
+            field_id = real_id
+            if cached:
+                for fid, finfo in cached.items():
+                    if finfo.get("name") in (logical_key, FIELD_LABELS.get(logical_key, "")):
+                        field_id = fid
+                        break
+            if logical_key in DATE_FIELDS and raw:
+                value = f"{raw}T00:00:00+08:00" if "T" not in str(raw) else str(raw)
+                ftype = "date"
+            else:
+                value = str(raw)
+                ftype = "input"
+            form_list.append({"id": field_id, "type": ftype, "value": value})
         return form_list
 
     # 没有兜底映射时，从缓存获取字段结构自动匹配
