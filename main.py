@@ -452,7 +452,7 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
         form_list = [{
             "id": group_widget_id,
             "type": "leaveGroupV2",
-            "value": [_wrap_group_value(leave_value_map)]
+            "value": [leave_value_map]
         }]
 
     elif approval_type == "外出":
@@ -483,7 +483,7 @@ def create_approval_api(user_id, approval_type, fields, admin_comment, draft=Fal
         form_list = [{
             "id": group_widget_id,
             "type": "outGroup",
-            "value": [_wrap_group_value(out_value_map)]
+            "value": [out_value_map]
         }]
 
     elif approval_type == "采购申请":
