@@ -138,17 +138,56 @@ def analyze_message(history):
 def create_approval_api(user_id, approval_type, fields, admin_comment):
     approval_code = APPROVAL_CODES[approval_type]
 
-    if approval_type == "采购申请":
+    if approval_type == "请假":
+        import calendar
+        start = fields.get("start_date", "")
+        end = fields.get("end_date", start)
+        days = str(fields.get("days", "1"))
+        leave_type = fields.get("leave_type", "事假")
+        reason = fields.get("reason", "")
+        form_list = [{
+            "id": "widgetLeaveGroupV2",
+            "type": "leaveGroupV2",
+            "value": {
+                "end": f"{end}T00:00:00+08:00",
+                "start": f"{start}T00:00:00+08:00",
+                "interval": days,
+                "name": leave_type,
+                "reason": reason
+            }
+        }]
+
+    elif approval_type == "外出":
+        start = fields.get("start_date", "")
+        end = fields.get("end_date", start)
+        reason = fields.get("reason", "")
+        destination = fields.get("destination", "")
+        form_list = [{
+            "id": "widgetOutGroup",
+            "type": "outGroup",
+            "value": {
+                "end": f"{end}T00:00:00+08:00",
+                "start": f"{start}T00:00:00+08:00",
+                "reason": f"{destination} {reason}".strip()
+            }
+        }]
+
+    elif approval_type == "采购申请":
         field_map = PURCHASE_FIELD_MAP
+        form_list = []
+        for logical_key, real_id in field_map.items():
+            value = str(fields.get(logical_key, ""))
+            form_list.append({"id": real_id, "type": "input", "value": value})
+
     elif approval_type == "用印申请":
         field_map = SEAL_FIELD_MAP
+        form_list = []
+        for logical_key, real_id in field_map.items():
+            value = str(fields.get(logical_key, ""))
+            form_list.append({"id": real_id, "type": "input", "value": value})
+
     else:
         return False, "不支持API提交", {}
-
-    form_list = []
-    for logical_key, real_id in field_map.items():
-        value = str(fields.get(logical_key, ""))
-        form_list.append({"id": real_id, "type": "input", "value": value})
 
     form_data = json.dumps(form_list, ensure_ascii=False)
     print(f"提交表单[{approval_type}]: {form_data}")

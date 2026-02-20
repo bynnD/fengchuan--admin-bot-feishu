@@ -9,7 +9,7 @@ APPROVAL_CODES = {
 }
 
 # 使用深链接方式（无法API直接提交）
-LINK_ONLY_TYPES = {"请假", "外出", "入职审批"}
+LINK_ONLY_TYPES = {"入职审批"}
 
 # 每种审批需要收集的字段（用于AI提取信息）
 APPROVAL_FIELD_HINTS = {
