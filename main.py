@@ -321,14 +321,16 @@ if __name__ == "__main__":
     try:
         token = get_token()
         r = httpx.get(
-            "https://open.feishu.cn/open-apis/attendance/v1/leave_types",
+            "https://open.feishu.cn/open-apis/approval/v4/instances/4C9BA264-1169-4821-80AF-397AED46D5E2",
             headers={"Authorization": f"Bearer {token}"},
-            params={"status": 1},
             timeout=10
         )
-        print("假期类型列表:", json.dumps(r.json(), ensure_ascii=False))
+        data = r.json()
+        # 只打印form字段，避免日志太长
+        form_str = data.get("data", {}).get("form", "")
+        print("请假form原始数据:", form_str)
     except Exception as e:
-        print(f"获取假期类型失败: {e}")
+        print(f"读取失败: {e}")
 
 
     
