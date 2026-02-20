@@ -165,6 +165,20 @@ def _format_widget_value(widget, logical_key, value):
     return str(value)
 
 
+def _get_widget_value_key(widget):
+    for key in ["field_id", "field_key", "key", "id"]:
+        value = widget.get(key)
+        if value:
+            return value
+    return None
+
+
+def _wrap_group_value(group_value):
+    if not isinstance(group_value, dict):
+        return group_value
+    return {k: {"value": v} for k, v in group_value.items()}
+
+
 def _build_group_value_from_definition(approval_code, group_widget_id, field_values, mapping_rules, approval_type):
     form_schema = _fetch_approval_definition(approval_code)
     if not form_schema:
@@ -191,10 +205,10 @@ def _build_group_value_from_definition(approval_code, group_widget_id, field_val
         value = field_values.get(logical_key, "")
         if value == "" and logical_key not in ["reason"]:
             continue
-        widget_id = widget.get("id")
-        if not widget_id:
+        value_key = _get_widget_value_key(widget)
+        if not value_key:
             continue
-        group_value[widget_id] = _format_widget_value(widget, logical_key, value)
+        group_value[value_key] = _format_widget_value(widget, logical_key, value)
     return group_value or None
 
 
@@ -429,22 +443,38 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
     else:
         return False, "不支持API提交", {}
 
-    form_data = json.dumps(form_list, ensure_ascii=False)
-    print(f"提交表单[{approval_type}]: {form_data}")
+    def _post_form(payload_form_list):
+        form_data = json.dumps(payload_form_list, ensure_ascii=False)
+        print(f"提交表单[{approval_type}]: {form_data}")
+        token = get_token()
+        res = httpx.post(
+            "https://open.feishu.cn/open-apis/approval/v4/instances",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "approval_code": approval_code,
+                "user_id": user_id,
+                "form": form_data
+            },
+            timeout=15
+        )
+        data = res.json()
+        print(f"创建审批响应: {data}")
+        return data
 
-    token = get_token()
-    res = httpx.post(
-        "https://open.feishu.cn/open-apis/approval/v4/instances",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "approval_code": approval_code,
-            "user_id": user_id,
-            "form": form_data
-        },
-        timeout=15
-    )
-    data = res.json()
-    print(f"创建审批响应: {data}")
+    data = _post_form(form_list)
+    if data.get("code") != 0 and "group value not map" in str(data.get("msg", "")):
+        retry_form_list = []
+        for item in form_list:
+            if item.get("id") in [APPROVAL_GROUP_WIDGET_IDS.get("请假"), APPROVAL_GROUP_WIDGET_IDS.get("外出")]:
+                value = item.get("value")
+                if isinstance(value, dict):
+                    retry_item = dict(item)
+                    retry_item["value"] = _wrap_group_value(value)
+                    retry_form_list.append(retry_item)
+                    continue
+            retry_form_list.append(item)
+        if retry_form_list != form_list:
+            data = _post_form(retry_form_list)
     return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
 
