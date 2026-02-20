@@ -70,7 +70,16 @@ def _fetch_from_api(approval_code, token):
                     try:
                         parsed = json.loads(sub_items) if sub_items else []
                         if isinstance(parsed, dict):
-                            sub_items = parsed.get("children") or parsed.get("list") or parsed.get("fields") or []
+                            sub_items = (
+                                parsed.get("children") or parsed.get("list") or parsed.get("fields")
+                                or parsed.get("value") or []
+                            )
+                            # value1-1 等格式：取第一页结构作为子字段定义
+                            if not sub_items and parsed:
+                                for k in sorted(parsed.keys()):
+                                    if k.startswith("value") and isinstance(parsed[k], list) and parsed[k]:
+                                        sub_items = parsed[k]
+                                        break
                         else:
                             sub_items = parsed
                     except json.JSONDecodeError:
@@ -78,9 +87,11 @@ def _fetch_from_api(approval_code, token):
                 if not isinstance(sub_items, list):
                     sub_items = []
                 info["sub_fields"] = [
-                    {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name") or s.get("title") or s.get("label", "")}
-                    for s in sub_items if s.get("id")
+                    {"id": s.get("id") or s.get("widget_id") or s.get("field_id"), "type": s.get("type", "input"), "name": s.get("name") or s.get("title") or s.get("label", "")}
+                    for s in sub_items if (s.get("id") or s.get("widget_id") or s.get("field_id"))
                 ]
+                if not info["sub_fields"] and sub_items:
+                    print(f"fieldList {field_id} 解析到 {len(sub_items)} 项但无有效 id，原始 value 预览: {str(item.get('value', ''))[:200]}")
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):

@@ -64,7 +64,7 @@ def download_message_file(message_id, file_key, file_type="file"):
 
 
 def upload_approval_file(file_name, file_content):
-    """上传文件到飞书审批，返回 file code（用于附件字段）"""
+    """上传文件到飞书审批，返回 (file_code, None) 成功，(None, 错误信息) 失败"""
     try:
         token = get_token()
         res = httpx.post(
@@ -78,11 +78,14 @@ def upload_approval_file(file_name, file_content):
         if data.get("code") == 0:
             file_code = data.get("data", {}).get("code", "")
             print(f"文件上传成功: {file_name} -> {file_code}")
-            return file_code
-        print(f"文件上传失败: {data.get('msg')}")
+            return file_code, None
+        err_msg = data.get("msg", "未知错误")
+        err_code = data.get("code", "")
+        print(f"文件上传失败: code={err_code}, msg={err_msg}")
+        return None, err_msg
     except Exception as e:
         print(f"文件上传异常: {e}")
-    return None
+        return None, str(e)
 
 
 def send_message(open_id, text):
@@ -525,9 +528,10 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         send_message(open_id, "文件下载失败，请重新发送文件。")
         return
 
-    file_code = upload_approval_file(file_name, file_content)
+    file_code, upload_err = upload_approval_file(file_name, file_content)
     if not file_code:
-        send_message(open_id, "文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。")
+        err_detail = f"（{upload_err}）" if upload_err else ""
+        send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
         return
 
     doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
