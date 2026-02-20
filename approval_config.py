@@ -78,6 +78,23 @@ FIELD_LABELS = {
     "entry_date":     "入职日期",
 }
 
+# 自由流程配置（针对 API 无法直接提交的自由流程审批）
+# 如果遇到 "unsupported approval for free process" 错误，请在此配置节点 ID 和审批人
+FREE_PROCESS_CONFIG = {
+    "请假": {
+        # 节点 ID：需要在浏览器开发者工具中查看审批定义获取，或询问管理员
+        # 通常是一个长字符串，如 "46e6d96c8d..." 或 "START"
+        "node_id": "", 
+        # 审批人 OpenID：在该节点进行审批的人员 ID
+        # 如果为空，系统将尝试自动获取发起人的部门负责人（需开启通讯录权限）
+        "approver_open_ids": [] 
+    },
+    "外出": {
+        "node_id": "",
+        "approver_open_ids": []
+    }
+}
+
 # 采购申请的真实字段ID映射（从API获取）
 PURCHASE_FIELD_MAP = {
     "purchase_reason": "widget16510608596030001",

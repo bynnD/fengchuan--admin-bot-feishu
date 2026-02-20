@@ -6,7 +6,8 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
     LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP,
-    APPROVAL_GROUP_WIDGET_IDS, APPROVAL_GROUP_MAPPING_RULES, APPROVAL_FLAT_MAPPING_RULES
+    APPROVAL_GROUP_WIDGET_IDS, APPROVAL_GROUP_MAPPING_RULES, APPROVAL_FLAT_MAPPING_RULES,
+    FREE_PROCESS_CONFIG
 )
 from rules_config import get_admin_comment
 import datetime
@@ -57,7 +58,12 @@ def _fetch_approval_definition(approval_code):
         )
         data = res.json()
         if data.get("code") != 0:
+            if "user access token not support" in str(data.get("msg", "")):
+                print(f"获取审批定义失败({approval_code}): 权限不足或不支持的审批类型。请检查应用是否具备 'approval:approval' 权限，且审批定义非'自由流程'。")
+            else:
+                print(f"获取审批定义失败({approval_code}): {data}")
             return None
+        
         payload = data.get("data", {})
         approval = payload.get("approval", payload)
         form_schema = approval.get("form") or payload.get("form")
@@ -65,14 +71,6 @@ def _fetch_approval_definition(approval_code):
             return None
         if isinstance(form_schema, str):
             form_schema = json.loads(form_schema)
-        
-        # DEBUG: Save definition to file
-        try:
-            with open("last_approval_definition.json", "w", encoding="utf-8") as f:
-                json.dump(form_schema, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Failed to save definition: {e}")
-
         _approval_definition_cache["data"][approval_code] = form_schema
         _approval_definition_cache["expires_at"][approval_code] = now + 600
         return form_schema
@@ -348,7 +346,77 @@ def analyze_message(history):
         return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
-def create_approval_api(user_id, approval_type, fields, admin_comment):
+def _get_user_department_leader(user_id):
+    """
+    获取用户的部门负责人
+    注意：需要开启 'contact:user.employee:readonly' 和 'contact:department.organize:readonly' 权限
+    """
+    try:
+        token = get_token()
+        # 1. 获取用户信息，找到 department_ids
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/contact/v3/users/{user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"user_id_type": "user_id"},
+            timeout=10
+        )
+        user_data = res.json().get("data", {}).get("user", {})
+        department_ids = user_data.get("department_ids", [])
+        
+        if not department_ids:
+            return None
+
+        # 2. 获取主部门详情，找到 leader_user_id
+        # 飞书用户可能有多个部门，通常取第一个作为主部门
+        main_dept_id = department_ids[0]
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/contact/v3/departments/{main_dept_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"department_id_type": "department_id"},
+            timeout=10
+        )
+        dept_data = res.json().get("data", {}).get("department", {})
+        leader_id = dept_data.get("leader_user_id")
+        
+        # 如果 leader 就是用户自己，尝试找上级部门 (可选逻辑，暂不实现以保持简单)
+        if leader_id == user_id:
+             print(f"用户 {user_id} 是部门负责人，暂未处理上级查找逻辑")
+             return None
+             
+        return leader_id
+
+    except Exception as e:
+        print(f"获取部门负责人失败: {e}")
+        return None
+
+def revoke_instance(approval_code, instance_code, user_id):
+    """
+    撤销审批实例（用于模拟“草稿”状态）
+    """
+    try:
+        token = get_token()
+        res = httpx.post(
+            "https://open.feishu.cn/open-apis/approval/v4/instances/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "approval_code": approval_code,
+                "instance_code": instance_code,
+                "user_id": user_id
+            },
+            timeout=10
+        )
+        data = res.json()
+        if data.get("code") == 0:
+            print(f"审批实例已撤销(草稿模式): {instance_code}")
+            return True
+        print(f"撤销审批失败: {data}")
+        return False
+    except Exception as e:
+        print(f"撤销审批异常: {e}")
+        return False
+
+
+def create_approval_api(user_id, approval_type, fields, admin_comment, draft=False):
     approval_code = APPROVAL_CODES[approval_type]
 
     if approval_type == "请假":
@@ -455,14 +523,45 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         form_data = json.dumps(payload_form_list, ensure_ascii=False)
         print(f"提交表单[{approval_type}]: {form_data}")
         token = get_token()
+        
+        # 尝试从配置中获取自由流程所需的节点 ID
+        config = FREE_PROCESS_CONFIG.get(approval_type)
+        approvers = None
+        if config and config.get("node_id"):
+            # 优先使用配置的固定审批人
+            approver_ids = config.get("approver_open_ids", [])
+            
+            # 如果配置为空，则动态获取部门负责人
+            if not approver_ids:
+                print(f"配置未指定审批人，尝试自动获取发起人({user_id})的主管...")
+                leader_id = _get_user_department_leader(user_id)
+                if leader_id:
+                    approver_ids = [leader_id]
+                    print(f"已自动获取主管 ID: {leader_id}")
+                else:
+                    print("无法获取主管信息，请检查权限或配置。")
+
+            if approver_ids:
+                approvers = [{
+                    "key": config["node_id"],
+                    "value": approver_ids
+                }]
+                print(f"使用自由流程审批人配置: {approvers}")
+            else:
+                print("警告：自由流程未指定审批人，提交可能会失败 (unsupported approval for free process)")
+
+        payload = {
+            "approval_code": approval_code,
+            "user_id": user_id,
+            "form": form_data
+        }
+        if approvers:
+            payload["node_approver_user_id_list"] = approvers
+
         res = httpx.post(
             "https://open.feishu.cn/open-apis/approval/v4/instances",
             headers={"Authorization": f"Bearer {token}"},
-            json={
-                "approval_code": approval_code,
-                "user_id": user_id,
-                "form": form_data
-            },
+            json=payload,
             timeout=15
         )
         data = res.json()
@@ -470,19 +569,17 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         return data
 
     data = _post_form(form_list)
-    if data.get("code") != 0 and "group value not map" in str(data.get("msg", "")):
-        print(f"提交失败，尝试使用不同格式重试...")
-        # 尝试重试：将 value 放入 list 中（如果是明细类型）
-        # 或者尝试不使用 group，而是平铺？（通常不行）
-        # 目前先只记录详细日志，以便分析
-        pass
-    
-    # DEBUG: Save form_list to file
-    try:
-        with open("last_form_list.json", "w", encoding="utf-8") as f:
-            json.dump(form_list, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Failed to save form_list: {e}")
+    if data.get("code") == 1390001 and "unsupported approval for free process" in str(data.get("msg", "")):
+        return False, "该审批定义为'自由流程'，API无法直接提交。请联系管理员获取'节点ID'，并在 approval_config.py 中配置 FREE_PROCESS_CONFIG。", {}
+
+    if data.get("code") == 0 and draft:
+        instance_code = data.get("data", {}).get("instance_code")
+        if instance_code:
+            # 立即撤销，形成“草稿”状态
+            if revoke_instance(approval_code, instance_code, user_id):
+                return True, "已创建草稿（请点击下方链接编辑并提交）", data.get("data", {})
+            else:
+                return True, "审批已创建但撤销失败（可能已提交）", data.get("data", {})
 
     return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
@@ -548,18 +645,29 @@ def on_message(data):
             send_card_message(open_id, tip, link, approval_type)
             CONVERSATIONS[open_id] = []
         else:
-            success, msg, _ = create_approval_api(user_id, approval_type, fields, admin_comment)
+            # 使用草稿模式：创建后立即撤销，生成带数据的编辑链接
+            success, msg, resp_data = create_approval_api(user_id, approval_type, fields, admin_comment, draft=True)
             if success:
-                reply = (
-                    f"已为你提交{approval_type}申请！\n{summary}\n\n"
-                    f"行政意见: {admin_comment}\n"
-                    f"等待主管审批即可。"
+                instance_code = resp_data.get("instance_code")
+                # 生成跳转链接
+                url = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
+                
+                card_text = (
+                    f"**{approval_type}草稿已生成**\n\n"
+                    f"{summary}\n\n"
+                    f"💡 **操作指南**：\n"
+                    f"1. 点击下方按钮打开详情页\n"
+                    f"2. 点击页面底部的 **“重新提交”** 按钮\n"
+                    f"3. 检查/修改内容，上传附件，然后提交"
                 )
+                send_card_message(open_id, card_text, url, approval_type)
+                
+                reply = f"已为你生成{approval_type}草稿，请点击卡片中的按钮进行最终确认和提交。"
                 send_message(open_id, reply)
                 CONVERSATIONS[open_id] = []
             else:
                 print(f"创建审批失败: {msg}")
-                send_message(open_id, f"提交失败：{msg}")
+                send_message(open_id, f"创建草稿失败：{msg}")
 
     except Exception as e:
         print(f"处理消息出错: {e}")
