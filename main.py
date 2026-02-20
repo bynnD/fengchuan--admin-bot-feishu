@@ -157,33 +157,39 @@ def build_form(approval_type, fields, token):
         except:
             is_half_day = False
         
-        # 根据真实字段结构，leaveGroupV2 的 value 应该是一个对象，包含所有子字段的值
-        # 子字段包括：widgetLeaveGroupType, widgetLeaveGroupStartTime, widgetLeaveGroupEndTime,
-        # widgetLeaveGroupInterval, widgetLeaveGroupUnit, widgetLeaveGroupReason
+        # 根据真实字段结构，leaveGroupV2 的 value 是一个对象，键为子字段 ID
+        # 子字段：
+        #   widgetLeaveGroupType       (radioV2)  - 假期类型
+        #   widgetLeaveGroupStartTime  (date)     - 开始时间, 格式 "YYYY-MM-DD hh:mm"
+        #   widgetLeaveGroupEndTime    (date)     - 结束时间, 格式 "YYYY-MM-DD hh:mm"
+        #   widgetLeaveGroupInterval   (radioV2)  - 时长
+        #   widgetLeaveGroupUnit       (radioV2)  - 请假单位 DAY/HOUR
+        #   widgetLeaveGroupReason     (textarea) - 请假事由
+        #   widgetLeaveGroupFeedingArrivingLate (radioV2) - 上班晚到（分钟）
         
-        # 时间格式：根据字段定义是 "YYYY-MM-DD hh:mm"，但实际提交可能需要 ISO 8601 格式
-        # 先尝试 ISO 8601 格式
         if is_half_day:
-            start_time = f"{start_date}T12:00:00+08:00"
-            end_time = f"{end_date}T00:00:00+08:00"
+            start_time = f"{start_date} 12:00"
+            end_time = f"{end_date} 18:00"
         else:
-            start_time = f"{start_date}T00:00:00+08:00"
-            end_time = f"{end_date}T23:59:59+08:00"
+            start_time = f"{start_date} 00:00"
+            end_time = f"{end_date} 23:59"
         
-        # 构建 value 对象，键是子字段的 ID
         value_obj = {
-            "widgetLeaveGroupType": leave_type,  # 假期类型（radioV2 的值）
-            "widgetLeaveGroupStartTime": start_time,  # 开始时间
-            "widgetLeaveGroupEndTime": end_time,  # 结束时间
-            "widgetLeaveGroupInterval": days_str,  # 时长（radioV2 的值）
-            "widgetLeaveGroupUnit": "DAY",  # 请假单位：DAY 或 HOUR（radioV2 的值）
-            "widgetLeaveGroupReason": reason  # 请假事由（textarea 的值）
+            "widgetLeaveGroupType": leave_type,
+            "widgetLeaveGroupStartTime": start_time,
+            "widgetLeaveGroupEndTime": end_time,
+            "widgetLeaveGroupInterval": days_str,
+            "widgetLeaveGroupUnit": "DAY",
+            "widgetLeaveGroupReason": reason,
+            "widgetLeaveGroupFeedingArrivingLate": "0"
         }
+        
+        print(f"请假表单 value: {json.dumps(value_obj, ensure_ascii=False)}")
         
         return [{
             "id": leave_field_id,
             "type": "leaveGroupV2",
-            "value": value_obj  # value 必须是对象（map），键是子字段的 ID
+            "value": value_obj
         }]
 
     if approval_type == "外出":
