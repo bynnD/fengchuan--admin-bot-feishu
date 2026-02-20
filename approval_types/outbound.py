@@ -2,7 +2,7 @@
 
 NAME = "外出报备"
 APPROVAL_CODE = "FDBE8929-CDD4-42E4-8174-9B7724D0A69E"
-LINK_ONLY = True  # 报备单 API 不支持(1390013)，需在管理后台添加自动审批节点后才可改为 False
+LINK_ONLY = False  # 需在管理后台添加自动审批节点，否则 API 返回 1390013
 
 FIELD_HINTS = "destination(外出地点), start_date(YYYY-MM-DD), end_date(YYYY-MM-DD), reason(事由)"
 

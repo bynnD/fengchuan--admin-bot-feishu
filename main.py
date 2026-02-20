@@ -177,11 +177,22 @@ def build_form(approval_type, fields, token):
         raw = fields.get(logical_key) or fields.get(field_id) or fields.get(field_name) or ""
         if not raw and logical_key != "reason":
             raw = ""
-        if not raw and field_type in ("radioV2", "radio"):
+        if not raw and logical_key == "reason":
+            raw = "审批申请"
+        if field_type in ("radioV2", "radio"):
             opts = field_info.get("options", [])
             if opts and isinstance(opts, list):
-                first = opts[0] if opts else {}
-                raw = first.get("value", "")
+                raw_str = str(raw).strip()
+                for opt in opts:
+                    if isinstance(opt, dict):
+                        if opt.get("value") == raw_str or opt.get("text") == raw_str:
+                            raw = opt.get("value", raw_str)
+                            break
+                        if raw_str in (opt.get("text", ""), opt.get("value", "")):
+                            raw = opt.get("value", raw_str)
+                            break
+                if not raw:
+                    raw = opts[0].get("value", "") if opts and isinstance(opts[0], dict) else ""
         value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList") else "input"
         if logical_key in DATE_FIELDS and raw:
