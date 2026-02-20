@@ -371,16 +371,50 @@ def build_form(approval_type, fields, token):
     return form_list
 
 
+def _form_summary(form_list, cached):
+    """根据实际提交的表单和缓存的字段名生成摘要"""
+    lines = []
+    for item in form_list:
+        fid = item.get("id", "")
+        info = cached.get(fid, {})
+        name = info.get("name", fid)
+        ftype = item.get("type", "")
+        if ftype == "dateInterval":
+            val = item.get("value", {})
+            if isinstance(val, dict):
+                s = str(val.get("start", "")).split("T")[0]
+                e = str(val.get("end", "")).split("T")[0]
+                lines.append(f"· {name}: {s} 至 {e}")
+        elif ftype in ("attach", "attachV2", "image", "imageV2"):
+            continue
+        elif ftype == "fieldList":
+            val = item.get("value", [])
+            if val and isinstance(val, list) and isinstance(val[0], list):
+                lines.append(f"· {name}:")
+                for i, row in enumerate(val):
+                    parts = [f"{c.get('value','')}" for c in row if c.get("value")]
+                    if parts:
+                        lines.append(f"  {i+1}. {', '.join(parts)}")
+        else:
+            val = item.get("value", "")
+            if val:
+                lines.append(f"· {name}: {val}")
+    return "\n".join(lines)
+
+
 def create_approval(user_id, approval_type, fields):
     approval_code = APPROVAL_CODES[approval_type]
     token = get_token()
 
+    cached = get_form_fields(approval_type, approval_code, token)
     form_list = build_form(approval_type, fields, token)
     if form_list is None:
-        return False, "无法构建表单，请检查审批字段配置", {}
+        return False, "无法构建表单，请检查审批字段配置", {}, ""
 
     form_data = json.dumps(form_list, ensure_ascii=False)
     print(f"提交表单[{approval_type}]: {form_data}")
+
+    summary = _form_summary(form_list, cached or {})
 
     res = httpx.post(
         "https://open.feishu.cn/open-apis/approval/v4/instances",
@@ -398,11 +432,10 @@ def create_approval(user_id, approval_type, fields):
     success = data.get("code") == 0
     msg = data.get("msg", "")
 
-    # 失败时清除缓存，下次重新获取
     if not success:
         invalidate_cache(approval_type)
 
-    return success, msg, data.get("data", {})
+    return success, msg, data.get("data", {}), summary
 
 
 def format_fields_summary(fields, approval_type=None):
@@ -493,9 +526,8 @@ def _handle_image_message(open_id, user_id, message_id, content_json):
         return
 
     admin_comment = get_admin_comment("用印申请", doc_fields)
-    summary = format_fields_summary(doc_fields, "用印申请")
 
-    success, msg, resp_data = create_approval(user_id, "用印申请", doc_fields)
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请", doc_fields)
     if success:
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
@@ -504,7 +536,7 @@ def _handle_image_message(open_id, user_id, message_id, content_json):
             send_card_message(open_id, card_content, link, "查看工单")
         send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
     else:
-        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}\n\n已识别信息：\n{summary}")
+        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
 
     CONVERSATIONS[open_id] = []
 
@@ -588,18 +620,18 @@ def on_message(data):
                     send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
                     replies.append(f"· {approval_type}：已整理，请点击按钮提交")
                 else:
-                    success, msg, resp_data = create_approval(user_id, approval_type, fields)
+                    success, msg, resp_data, form_summary = create_approval(user_id, approval_type, fields)
                     if success:
                         instance_code = resp_data.get("instance_code", "")
-                        replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+                        replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
                         if instance_code:
                             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                            card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+                            card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
                     else:
                         print(f"创建审批失败[{approval_type}]: {msg}")
                         if "free process" in msg.lower() or "unsupported approval" in msg.lower():
-                            mark_free_process(approval_code)  # 下次预检直接走链接，避免重复 API 调用
+                            mark_free_process(approval_code)
                             link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
                             send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n该类型暂不支持自动创建。请点击下方按钮在飞书中发起：", link, f"打开{approval_type}审批表单")
                             replies.append(f"· {approval_type}：已整理信息，请点击卡片按钮发起")
