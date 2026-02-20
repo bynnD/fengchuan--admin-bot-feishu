@@ -74,7 +74,22 @@ def upload_approval_file(file_name, file_content):
             files={"content": (file_name, file_content)},
             timeout=30
         )
-        data = res.json()
+        raw_text = res.text.strip()
+        if raw_text.startswith("\ufeff"):
+            raw_text = raw_text[1:]
+        data = None
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as je:
+            # "Extra data" 常因响应含前缀(如 BOM、数字)或拼接多个 JSON，尝试从首个 { 解析
+            if "{" in raw_text:
+                try:
+                    data = json.loads(raw_text[raw_text.index("{"):])
+                except json.JSONDecodeError:
+                    pass
+        if data is None:
+            print(f"文件上传响应非JSON: status={res.status_code}, body前200字: {raw_text[:200]}")
+            return None, "接口返回格式异常，请稍后重试"
         if data.get("code") == 0:
             file_code = data.get("data", {}).get("code", "")
             print(f"文件上传成功: {file_name} -> {file_code}")
@@ -644,7 +659,7 @@ def _try_complete_seal(open_id, user_id, text):
     if success:
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
-            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            link = f"lark://applink.feishu.cn/client/approval?instanceCode={instance_code}"
             card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
             send_card_message(open_id, card_content, link, "查看工单")
         else:
@@ -768,7 +783,7 @@ def on_message(data):
                     if success:
                         instance_code = resp_data.get("instance_code", "")
                         if instance_code:
-                            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                            link = f"lark://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
                             # 已发卡片，不再重复发送文字详情

@@ -17,6 +17,9 @@ FIELD_LABELS = {
     "cost_detail":     "费用明细",
 }
 
+# 表单字段名可能为「物资明细」或「费用明细」，均映射到 cost_detail
+FIELD_NAME_ALIASES = {"物资明细": "cost_detail"}
+
 FIELD_ID_FALLBACK = {
     "purchase_reason": "widget16510608596030001",
     "purchase_type":   "widget16510608666360001",

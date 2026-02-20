@@ -88,10 +88,18 @@ def _fetch_from_api(approval_code, token):
                     sub_items = []
                 info["sub_fields"] = [
                     {"id": s.get("id") or s.get("widget_id") or s.get("field_id"), "type": s.get("type", "input"), "name": s.get("name") or s.get("title") or s.get("label", "")}
-                    for s in sub_items if (s.get("id") or s.get("widget_id") or s.get("field_id"))
+                    for s in sub_items if isinstance(s, dict) and (s.get("id") or s.get("widget_id") or s.get("field_id"))
                 ]
                 if not info["sub_fields"] and sub_items:
-                    print(f"fieldList {field_id} 解析到 {len(sub_items)} 项但无有效 id，原始 value 预览: {str(item.get('value', ''))[:200]}")
+                    if isinstance(sub_items[0], list) and sub_items[0]:
+                        first_row = sub_items[0]
+                        if isinstance(first_row[0], dict) and first_row[0].get("id"):
+                            info["sub_fields"] = [
+                                {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
+                                for s in first_row if isinstance(s, dict) and s.get("id")
+                            ]
+                    if not info["sub_fields"]:
+                        print(f"fieldList {field_id} 解析到 {len(sub_items)} 项但无有效 id，原始 value 预览: {str(item.get('value', ''))[:200]}")
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):
