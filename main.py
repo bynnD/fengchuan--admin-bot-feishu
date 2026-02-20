@@ -91,18 +91,21 @@ def analyze_message(history):
         f"你是一个行政助理，帮员工提交审批申请。今天是{today}。\n"
         f"可处理的审批类型：\n{approval_list}\n\n"
         f"各类型需要的字段：\n{field_hints}\n\n"
+        f"【关键】分析用户最新消息，可能包含一个或多个审批需求，分别识别并提取。"
+        f"例如「我要采购笔记本，还要给合同盖章」= 采购申请 + 用印申请。"
+        f"每个需求单独列出，每个需求的 fields 和 missing 独立。\n\n"
         f"重要规则：\n"
         f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
         f"2. 明天、后天、下周一等换算成具体日期(YYYY-MM-DD)\n"
         f"3. 两个小时、半天等时长，days填0.5，start_date和end_date填同一天\n"
         f"4. 去看病、身体不舒服等明显是病假，leave_type直接填病假\n"
         f"5. 只有真的无法推断的字段才放入missing\n"
-        f"6. reason可根据上下文推断，实在没有才列为missing\n\n"
+        f"6. reason可根据上下文推断，实在没有才列为missing\n"
+        f"7. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n\n"
         f"返回JSON：\n"
-        f"- approval_type: 审批类型（从列表选，无法判断填null）\n"
-        f"- fields: 已提取的字段键值对\n"
-        f"- missing: 真正缺少的字段名列表\n"
-        f"- unclear: 无法判断类型时用中文说明\n"
+        f"- requests: 数组，每项含 approval_type、fields、missing\n"
+        f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
+        f"- unclear: 无法判断时用中文说明（requests为空时必填）\n"
         f"只返回JSON。"
     )
     messages = [{"role": "system", "content": system_prompt}] + history
@@ -118,10 +121,15 @@ def analyze_message(history):
             timeout=30
         )
         res.raise_for_status()
-        return json.loads(res.json()["choices"][0]["message"]["content"])
+        raw = json.loads(res.json()["choices"][0]["message"]["content"])
+        if "requests" in raw:
+            return raw
+        if raw.get("approval_type"):
+            return {"requests": [{"approval_type": raw["approval_type"], "fields": raw.get("fields", {}), "missing": raw.get("missing", [])}], "unclear": raw.get("unclear", "")}
+        return {"requests": [], "unclear": raw.get("unclear", "无法识别审批类型。")}
     except Exception as e:
         print(f"AI分析失败: {e}")
-        return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
+        return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
 def _build_leave_form(fields, approval_code, token):
@@ -250,19 +258,20 @@ def build_form(approval_type, fields, token):
             raw = fields.get(logical_key, "")
             if not raw and logical_key != "reason":
                 continue
-            # 若缓存中有更准确的字段ID（按名称匹配），优先使用
             field_id = real_id
+            ftype = "input"
             if cached:
                 for fid, finfo in cached.items():
-                    if finfo.get("name") in (logical_key, FIELD_LABELS.get(logical_key, "")):
+                    label = FIELD_LABELS.get(logical_key, logical_key)
+                    if finfo.get("name") in (logical_key, label):
                         field_id = fid
+                        ftype = finfo.get("type", "input")
                         break
             if logical_key in DATE_FIELDS and raw:
                 value = f"{raw}T00:00:00+08:00" if "T" not in str(raw) else str(raw)
                 ftype = "date"
             else:
                 value = str(raw)
-                ftype = "input"
             form_list.append({"id": field_id, "type": ftype, "value": value})
         return form_list
 
@@ -352,57 +361,63 @@ def on_message(data):
             CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
 
         result = analyze_message(CONVERSATIONS[open_id])
-        approval_type = result.get("approval_type")
-        fields = result.get("fields", {})
-        missing = result.get("missing", [])
+        requests = result.get("requests", [])
         unclear = result.get("unclear", "")
 
-        if not approval_type:
+        if not requests:
             types = "、".join(APPROVAL_CODES.keys())
             reply = unclear if unclear else f"你好！我可以帮你提交以下审批：\n{types}\n\n请告诉我你需要办理哪种？"
             send_message(open_id, reply)
             CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
             return
 
-        if missing:
-            missing_text = "、".join([FIELD_LABELS.get(m, m) for m in missing])
-            reply = f"还需要以下信息才能提交{approval_type}申请：\n{missing_text}"
-            send_message(open_id, reply)
-            CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
+        complete = [r for r in requests if not r.get("missing")]
+        incomplete = [(r["approval_type"], r.get("missing", [])) for r in requests if r.get("missing")]
+
+        replies = []
+        for req in complete:
+            approval_type = req.get("approval_type")
+            fields = req.get("fields", {})
+            if not approval_type:
+                continue
+            admin_comment = get_admin_comment(approval_type, fields)
+            summary = format_fields_summary(fields)
+
+            if approval_type in LINK_ONLY_TYPES:
+                approval_code = APPROVAL_CODES[approval_type]
+                link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
+                tip = (
+                    f"【{approval_type}】\n{summary}\n\n"
+                    f"行政意见: {admin_comment}\n\n"
+                    f"请点击下方按钮，在飞书中打开审批表单并提交："
+                )
+                send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
+                replies.append(f"· {approval_type}：已整理，请点击按钮提交")
+            else:
+                success, msg, resp_data = create_approval(user_id, approval_type, fields)
+                if success:
+                    instance_code = resp_data.get("instance_code", "")
+                    replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+                    if instance_code:
+                        link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
+                        send_card_message(open_id, f"【{approval_type}】点击查看审批详情：", link, "查看审批详情")
+                else:
+                    print(f"创建审批失败[{approval_type}]: {msg}")
+                    replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
+
+        if incomplete:
+            parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]
+            replies.append("请补充以下信息：\n" + "\n".join(parts))
+
+        if not complete:
+            send_message(open_id, "\n".join(replies))
+            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请补充信息"})
             return
 
-        admin_comment = get_admin_comment(approval_type, fields)
-        summary = format_fields_summary(fields)
-
-        if approval_type in LINK_ONLY_TYPES:
-            approval_code = APPROVAL_CODES[approval_type]
-            # 使用飞书 applink 协议，在飞书客户端内直接打开审批发起页面
-            link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
-            tip = (
-                f"已为你整理好{approval_type}信息：\n{summary}\n\n"
-                f"行政意见: {admin_comment}\n\n"
-                f"请点击下方按钮，在飞书中打开审批表单并提交："
-            )
-            send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
+        header = f"✅ 已处理 {len(complete)} 个申请：\n\n" if len(complete) > 1 else ""
+        send_message(open_id, header + "\n\n".join(replies))
+        if not incomplete:
             CONVERSATIONS[open_id] = []
-            return
-
-        success, msg, resp_data = create_approval(user_id, approval_type, fields)
-        if success:
-            instance_code = resp_data.get("instance_code", "")
-            reply = (
-                f"✅ 已为你提交{approval_type}申请！\n{summary}\n\n"
-                f"💡 行政意见: {admin_comment}\n"
-                f"等待主管审批即可。"
-            )
-            send_message(open_id, reply)
-            if instance_code:
-                link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
-                send_card_message(open_id, "点击查看审批详情：", link, "查看审批详情")
-            CONVERSATIONS[open_id] = []
-        else:
-            print(f"创建审批失败: {msg}")
-            send_message(open_id, f"提交失败：{msg}\n请稍后重试，或联系行政人员。")
 
     except Exception as e:
         print(f"处理消息出错: {e}")
