@@ -135,23 +135,14 @@ def build_form(approval_type, fields, token):
     if approval_type == "请假":
         # 先获取真实的字段结构，找到 leaveGroupV2 控件的真实 ID
         cached_fields = get_form_fields(approval_type, approval_code, token)
+        leave_field_id = "widgetLeaveGroupV2"
         if cached_fields:
             # 查找 leaveGroupV2 类型的字段
-            leave_field_id = None
             for field_id, field_info in cached_fields.items():
                 if field_info.get("type") == "leaveGroupV2":
                     leave_field_id = field_id
+                    print(f"找到请假控件ID: {leave_field_id}")
                     break
-            
-            if leave_field_id:
-                print(f"找到请假控件ID: {leave_field_id}")
-            else:
-                # 如果找不到，使用默认ID
-                leave_field_id = "widgetLeaveGroupV2"
-                print(f"未找到 leaveGroupV2 字段，使用默认ID: {leave_field_id}")
-        else:
-            leave_field_id = "widgetLeaveGroupV2"
-            print(f"无法获取字段结构，使用默认ID: {leave_field_id}")
         
         start_date = fields.get("start_date", "")
         end_date = fields.get("end_date", start_date)
@@ -159,33 +150,40 @@ def build_form(approval_type, fields, token):
         days_str = str(days)
         leave_type = fields.get("leave_type", "事假")
         reason = fields.get("reason", "")
-        # 半天假从中午12点开始，整天从00:00开始（来自真实实例格式）
+        
+        # 半天假从中午12点开始，整天从00:00开始
         try:
             is_half_day = float(days) <= 0.5
         except:
             is_half_day = False
-        start_time = f"{start_date}T12:00:00+08:00" if is_half_day else f"{start_date}T00:00:00+08:00"
-        # 结束时间：如果是整天，应该是当天的23:59:59，如果是半天，应该是当天的00:00:00
+        
+        # 根据真实字段结构，leaveGroupV2 的 value 应该是一个对象，包含所有子字段的值
+        # 子字段包括：widgetLeaveGroupType, widgetLeaveGroupStartTime, widgetLeaveGroupEndTime,
+        # widgetLeaveGroupInterval, widgetLeaveGroupUnit, widgetLeaveGroupReason
+        
+        # 时间格式：根据字段定义是 "YYYY-MM-DD hh:mm"，但实际提交可能需要 ISO 8601 格式
+        # 先尝试 ISO 8601 格式
         if is_half_day:
+            start_time = f"{start_date}T12:00:00+08:00"
             end_time = f"{end_date}T00:00:00+08:00"
         else:
+            start_time = f"{start_date}T00:00:00+08:00"
             end_time = f"{end_date}T23:59:59+08:00"
         
-        # 根据飞书 API，leaveGroupV2 的 value 应该是一个对象（map）
-        # 注意：根据错误信息 "group value not map"，value 必须是对象格式
+        # 构建 value 对象，键是子字段的 ID
         value_obj = {
-            "end": end_time,
-            "interval": days_str,
-            "name": leave_type,
-            "reason": reason,
-            "start": start_time,
-            "timezoneOffset": -480,
-            "unit": "DAY"
+            "widgetLeaveGroupType": leave_type,  # 假期类型（radioV2 的值）
+            "widgetLeaveGroupStartTime": start_time,  # 开始时间
+            "widgetLeaveGroupEndTime": end_time,  # 结束时间
+            "widgetLeaveGroupInterval": days_str,  # 时长（radioV2 的值）
+            "widgetLeaveGroupUnit": "DAY",  # 请假单位：DAY 或 HOUR（radioV2 的值）
+            "widgetLeaveGroupReason": reason  # 请假事由（textarea 的值）
         }
+        
         return [{
             "id": leave_field_id,
             "type": "leaveGroupV2",
-            "value": value_obj  # value 必须是对象（map），不能是数组或字符串
+            "value": value_obj  # value 必须是对象（map），键是子字段的 ID
         }]
 
     if approval_type == "外出":
