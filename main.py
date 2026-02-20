@@ -102,7 +102,9 @@ def analyze_message(history):
         f"2. 明天、后天、下周一等换算成具体日期(YYYY-MM-DD)\n"
         f"3. 只有真的无法推断的字段才放入missing\n"
         f"4. reason可根据上下文推断，实在没有才列为missing\n"
-        f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n\n"
+        f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n"
+        f"6. 采购的cost_detail是费用明细列表，格式为[{{\"名称\":\"物品\",\"数量\":\"1\",\"规格\":\"型号\",\"金额\":\"1000\"}}]，"
+        f"用户必须提供每项的名称、数量、规格、金额，缺少任何一项就把cost_detail列入missing\n\n"
         f"返回JSON：\n"
         f"- requests: 数组，每项含 approval_type、fields、missing\n"
         f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
@@ -133,16 +135,52 @@ def analyze_message(history):
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
+_FIELDLIST_ALIAS = {
+    "名称": ["name", "item_name", "物品名称", "物品", "品名"],
+    "数量": ["quantity", "qty", "count", "num"],
+    "规格": ["spec", "specification", "model", "规格型号", "型号"],
+    "金额": ["amount", "price", "cost", "单价", "总价", "费用"],
+}
+
+
+def _match_sub_field(sf_name, item):
+    """根据子字段名称从 AI 输出的 dict 中匹配值"""
+    if sf_name in item:
+        return str(item[sf_name])
+    for alias_name, aliases in _FIELDLIST_ALIAS.items():
+        if sf_name == alias_name or sf_name in aliases:
+            for key in [alias_name] + aliases:
+                if key in item:
+                    return str(item[key])
+    for key in item:
+        if sf_name and (sf_name in key or key in sf_name):
+            return str(item[key])
+    return ""
+
+
 def _format_field_value(logical_key, raw_value, field_type, field_info=None):
     """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。"""
     if field_type == "fieldList":
-        if isinstance(raw_value, list):
-            return raw_value
         sub_fields = (field_info or {}).get("sub_fields", [])
-        if sub_fields and raw_value:
+        if isinstance(raw_value, list) and raw_value:
+            if sub_fields:
+                rows = []
+                for item in raw_value:
+                    if isinstance(item, dict):
+                        row = []
+                        for sf in sub_fields:
+                            val = _match_sub_field(sf.get("name", ""), item)
+                            row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
+                        rows.append(row)
+                    elif isinstance(item, list):
+                        rows.append(item)
+                return rows if rows else []
+            if all(isinstance(r, list) for r in raw_value):
+                return raw_value
+        if isinstance(raw_value, str) and raw_value and sub_fields:
             row = []
             for i, sf in enumerate(sub_fields):
-                val = str(raw_value) if i == 0 else ""
+                val = raw_value if i == 0 else ""
                 row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
             return [row]
         return []
@@ -173,6 +211,7 @@ def build_form(approval_type, fields, token):
     name_to_key = {v: k for k, v in FIELD_LABELS.items()}
     name_to_key.update({k: k for k in FIELD_LABELS})
 
+    used_keys = set()
     form_list = []
     for field_id, field_info in cached.items():
         field_type = field_info.get("type", "input")
@@ -187,6 +226,7 @@ def build_form(approval_type, fields, token):
                 start_val = str(datetime.date.today())
             if not end_val:
                 end_val = start_val
+            used_keys.update(["start_date", "end_date", "开始日期", "结束日期"])
             form_list.append({
                 "id": field_id,
                 "type": "dateInterval",
@@ -196,30 +236,36 @@ def build_form(approval_type, fields, token):
             })
             continue
 
-        logical_key = FIELD_LABELS_REVERSE.get(field_name, name_to_key.get(field_name, field_name))
-        if not logical_key and field_id in fallback.values():
+        logical_key = FIELD_LABELS_REVERSE.get(field_name) or name_to_key.get(field_name)
+        if not logical_key:
             for k, v in fallback.items():
                 if v == field_id:
                     logical_key = k
                     break
+        if not logical_key:
+            logical_key = field_name
+
         raw = fields.get(logical_key) or fields.get(field_id) or fields.get(field_name) or ""
-        if not raw and logical_key != "reason":
-            raw = ""
+        if raw:
+            used_keys.add(logical_key)
         if not raw and logical_key == "reason":
             raw = "审批申请"
         if field_type in ("radioV2", "radio"):
             opts = field_info.get("options", [])
             if opts and isinstance(opts, list):
                 raw_str = str(raw).strip()
+                matched = False
                 for opt in opts:
                     if isinstance(opt, dict):
                         if opt.get("value") == raw_str or opt.get("text") == raw_str:
                             raw = opt.get("value", raw_str)
+                            matched = True
                             break
-                        if raw_str in (opt.get("text", ""), opt.get("value", "")):
+                        if raw_str and raw_str in (opt.get("text", ""), opt.get("value", "")):
                             raw = opt.get("value", raw_str)
+                            matched = True
                             break
-                if not raw:
+                if not matched and not raw:
                     raw = opts[0].get("value", "") if opts and isinstance(opts[0], dict) else ""
         value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
@@ -228,6 +274,13 @@ def build_form(approval_type, fields, token):
             value = _format_field_value(logical_key, raw, "date")
 
         form_list.append({"id": field_id, "type": ftype, "value": value})
+
+    unused_texts = [str(v) for k, v in fields.items() if k not in used_keys and v]
+    if unused_texts:
+        for item in form_list:
+            if item.get("type") in ("textarea", "input") and not item.get("value"):
+                item["value"] = "；".join(unused_texts)
+                break
 
     return form_list
 
@@ -271,7 +324,6 @@ def format_fields_summary(fields, approval_type=None):
     order = FIELD_ORDER.get(approval_type) if approval_type else None
     if order:
         items = [(k, fields.get(k, "")) for k in order if k in fields]
-        # 补充 order 中未列出的字段
         for k, v in fields.items():
             if k not in order:
                 items.append((k, v))
@@ -282,7 +334,17 @@ def format_fields_summary(fields, approval_type=None):
         if v == "" and k != "reason":
             continue
         label = FIELD_LABELS.get(k, k)
-        lines.append(f"· {label}: {v}")
+        if isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    parts = [f"{ik}:{iv}" for ik, iv in item.items() if iv]
+                    lines.append(f"  {i+1}. {', '.join(parts)}")
+                else:
+                    lines.append(f"  {i+1}. {item}")
+            if lines:
+                lines.insert(len(lines) - len(v), f"· {label}:")
+        else:
+            lines.append(f"· {label}: {v}")
     return "\n".join(lines)
 
 
@@ -364,7 +426,7 @@ def on_message(data):
                         instance_code = resp_data.get("instance_code", "")
                         replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
                         if instance_code:
-                            link = f"https://applink.feishu.cn/client/approval?tab=detail&instanceCode={instance_code}"
+                            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
                     else:
