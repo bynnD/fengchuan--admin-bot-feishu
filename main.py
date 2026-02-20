@@ -581,8 +581,8 @@ def _try_complete_seal(open_id, user_id, text):
     opts = _get_seal_form_options()
     company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
     seal_hint = f"（选项：{'/'.join(opts.get('seal_type', ['公章','合同章','法人章','财务章']))}）"
-    usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带'])），默认盖章）"
-    lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否'])），默认否）"
+    usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带']))}，默认盖章）"
+    lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否']))}，默认否）"
 
     prompt = (
         f"用户为用印申请补充了以下信息：\n{text}\n\n"
@@ -643,7 +643,8 @@ def _try_complete_seal(open_id, user_id, text):
             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
             card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
             send_card_message(open_id, card_content, link, "查看工单")
-        send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+        else:
+            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
     else:
         send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
 
@@ -766,7 +767,7 @@ def on_message(data):
                             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
-                            replies.append(f"· {approval_type}：✅ 已提交")
+                            # 已发卡片，不再重复发送文字详情
                         else:
                             replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
                     else:
@@ -789,7 +790,9 @@ def on_message(data):
             return
 
         header = f"✅ 已处理 {len(complete)} 个申请：\n\n" if len(complete) > 1 else ""
-        send_message(open_id, header + "\n\n".join(replies))
+        body = header + "\n\n".join(replies)
+        if body.strip():
+            send_message(open_id, body)
         if not incomplete:
             CONVERSATIONS[open_id] = []
 
