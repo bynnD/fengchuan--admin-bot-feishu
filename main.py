@@ -231,6 +231,11 @@ def format_fields_summary(fields):
     return "\n".join(lines)
 
 
+def _on_message_read(_data):
+    """消息已读事件，无需处理，仅避免 processor not found 报错"""
+    pass
+
+
 def on_message(data):
     event_id = data.header.event_id
     if event_id in PROCESSED_EVENTS:
@@ -319,6 +324,7 @@ if __name__ == "__main__":
        
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
+        .register_p2_im_message_message_read_v1(_on_message_read) \
         .build()
     ws_client = lark.ws.Client(
         FEISHU_APP_ID,
