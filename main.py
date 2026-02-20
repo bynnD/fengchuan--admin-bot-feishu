@@ -5,7 +5,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP
+    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELDb_MAP
 )
 from rules_config import get_admin_comment
 import datetime
@@ -76,7 +76,7 @@ def send_link_message(open_id, text, url):
         print(f"发送链接消息失败: {resp.msg}")
 
 def build_approval_link(approval_code):
-    return f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}"
+    return f"https://applink.feishu.cn/client/approval/newinstance?approval_code={approval_code}"
 def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
     field_hints = "\n".join([f"{k}: {v}" for k, v in APPROVAL_FIELD_HINTS.items()])
