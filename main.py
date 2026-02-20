@@ -133,19 +133,30 @@ def build_form(approval_type, fields, token):
     approval_code = APPROVAL_CODES[approval_type]
 
     if approval_type == "请假":
-        end = fields.get("end_date", fields.get("start_date", ""))
-        days = str(fields.get("days", "1"))
+        start_date = fields.get("start_date", "")
+        end_date = fields.get("end_date", start_date)
+        days = fields.get("days", 1)
+        days_str = str(days)
         leave_type = fields.get("leave_type", "事假")
         reason = fields.get("reason", "")
-        # value格式来自真实审批实例，只有这4个key
+        # 半天假从中午12点开始，整天从00:00开始（来自真实实例格式）
+        try:
+            is_half_day = float(days) <= 0.5
+        except:
+            is_half_day = False
+        start_time = f"{start_date}T12:00:00+08:00" if is_half_day else f"{start_date}T00:00:00+08:00"
+        end_time = f"{end_date}T00:00:00+08:00"
         return [{
             "id": "widgetLeaveGroupV2",
             "type": "leaveGroupV2",
             "value": {
-                "end": f"{end}T00:00:00+08:00",
-                "interval": days,
+                "end": end_time,
+                "interval": days_str,
                 "name": leave_type,
-                "reason": reason
+                "reason": reason,
+                "start": start_time,
+                "timezoneOffset": -480,
+                "unit": "DAY"
             }
         }]
 
@@ -318,22 +329,6 @@ def on_message(data):
 
 
 if __name__ == "__main__":
-    try:
-        token = get_token()
-        r = httpx.get(
-            "https://open.feishu.cn/open-apis/approval/v4/instances/4C9BA264-1169-4821-80AF-397AED46D5E2",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        data = r.json()
-        # 只打印form字段，避免日志太长
-        form_str = data.get("data", {}).get("form", "")
-        print("请假form原始数据:", form_str)
-    except Exception as e:
-        print(f"读取失败: {e}")
-
-
-    
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
