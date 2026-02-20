@@ -147,7 +147,7 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         reason = fields.get("reason", "")
         form_list = [{
             "id": "widgetLeaveGroupV2",
-            "type": "leaveGroupV2",
+            "type": "group",
             "value": {
                 "end": f"{end}T00:00:00+08:00",
                 "start": f"{start}T00:00:00+08:00",
@@ -164,7 +164,7 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         destination = fields.get("destination", "")
         form_list = [{
             "id": "widgetOutGroup",
-            "type": "outGroup",
+            "type": "group",
             "value": {
                 "end": f"{end}T00:00:00+08:00",
                 "start": f"{start}T00:00:00+08:00",
