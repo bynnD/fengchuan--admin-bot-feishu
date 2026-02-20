@@ -20,6 +20,7 @@ FIELD_ID_FALLBACK = {
     "cost_detail":     "widget16510609006710001",
 }
 
+FIELD_ORDER = ["purchase_reason", "purchase_type", "expected_date", "cost_detail"]
 DATE_FIELDS = {"expected_date"}
 
 

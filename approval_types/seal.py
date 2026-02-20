@@ -20,6 +20,7 @@ FIELD_ID_FALLBACK = {
     "reason":        "widget0",
 }
 
+FIELD_ORDER = ["seal_type", "usage_date", "document_name", "reason"]
 DATE_FIELDS = {"usage_date"}
 
 

@@ -12,15 +12,17 @@ _TYPES = [seal, purchase, outbound]
 APPROVAL_CODES = {t.NAME: t.APPROVAL_CODE for t in _TYPES}
 APPROVAL_FIELD_HINTS = {t.NAME: t.FIELD_HINTS for t in _TYPES}
 LINK_ONLY_TYPES = {t.NAME for t in _TYPES if getattr(t, "LINK_ONLY", False)}
-CREATE_LINK_IDS = {t.NAME: t.CREATE_LINK_ID for t in _TYPES if getattr(t, "CREATE_LINK_ID", None)}
 
 FIELD_LABELS = {}
 FIELD_ID_FALLBACK = {}
+FIELD_ORDER = {}
 DATE_FIELDS = set()
 for t in _TYPES:
     FIELD_LABELS.update(t.FIELD_LABELS)
     if getattr(t, "FIELD_ID_FALLBACK", None):
         FIELD_ID_FALLBACK[t.NAME] = t.FIELD_ID_FALLBACK
+    if getattr(t, "FIELD_ORDER", None):
+        FIELD_ORDER[t.NAME] = t.FIELD_ORDER
     DATE_FIELDS.update(getattr(t, "DATE_FIELDS", set()))
 
 FIELD_LABELS_REVERSE = {v: k for k, v in FIELD_LABELS.items()}

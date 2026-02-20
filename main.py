@@ -5,7 +5,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, CREATE_LINK_IDS, FIELD_ID_FALLBACK, DATE_FIELDS, FIELD_LABELS_REVERSE,
+    LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     get_admin_comment
 )
 from field_cache import get_form_fields, invalidate_cache
@@ -223,9 +223,21 @@ def create_approval(user_id, approval_type, fields):
     return success, msg, data.get("data", {})
 
 
-def format_fields_summary(fields):
+def format_fields_summary(fields, approval_type=None):
+    """按工单字段顺序展示，无 FIELD_ORDER 时按 fields 原有顺序"""
+    order = FIELD_ORDER.get(approval_type) if approval_type else None
+    if order:
+        items = [(k, fields.get(k, "")) for k in order if k in fields]
+        # 补充 order 中未列出的字段
+        for k, v in fields.items():
+            if k not in order:
+                items.append((k, v))
+    else:
+        items = list(fields.items())
     lines = []
-    for k, v in fields.items():
+    for k, v in items:
+        if v == "" and k != "reason":
+            continue
         label = FIELD_LABELS.get(k, k)
         lines.append(f"· {label}: {v}")
     return "\n".join(lines)
@@ -276,19 +288,17 @@ def on_message(data):
             if not approval_type:
                 continue
             admin_comment = get_admin_comment(approval_type, fields)
-            summary = format_fields_summary(fields)
+            summary = format_fields_summary(fields, approval_type)
 
             if approval_type in LINK_ONLY_TYPES:
                 approval_code = APPROVAL_CODES[approval_type]
-                create_id = CREATE_LINK_IDS.get(approval_type)
-                if create_id:
-                    link = f"https://www.feishu.cn/approval/admin/createApproval?id={create_id}&definitionCode={approval_code}"
-                else:
-                    link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
+                # 飞书 AppLink：员工发起工单，需在飞书客户端内点击（浏览器打开会显示「此页面无效」）
+                link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
                 tip = (
                     f"【{approval_type}】\n{summary}\n\n"
                     f"行政意见: {admin_comment}\n\n"
-                    f"请点击下方按钮，在飞书中打开审批表单并提交："
+                    f"请点击下方按钮发起工单（需在飞书客户端内打开）。"
+                    f"若链接无效，请到 飞书 → 审批 → 发起审批 → 选择「{approval_type}」手动填写。"
                 )
                 send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
                 replies.append(f"· {approval_type}：已整理，请点击按钮提交")
@@ -299,10 +309,15 @@ def on_message(data):
                     replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
                     if instance_code:
                         link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
-                        send_card_message(open_id, f"【{approval_type}】点击查看审批详情：", link, "查看审批详情")
+                        # 卡片按工单字段展示，提供查看链接
+                        card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+                        send_card_message(open_id, card_content, link, "查看工单")
                 else:
                     print(f"创建审批失败[{approval_type}]: {msg}")
-                    replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
+                    if "free process" in msg.lower() or "unsupported approval" in msg.lower():
+                        replies.append(f"· {approval_type}：❌ 该审批类型（报备单）暂不支持 API 自动创建，请到飞书审批中手动发起。")
+                    else:
+                        replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
 
         if incomplete:
             parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]

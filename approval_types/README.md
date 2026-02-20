@@ -14,6 +14,7 @@ LINK_ONLY = False  # True 表示只能用链接跳转，API 不支持
 FIELD_HINTS = "字段1(说明), 字段2(说明), ..."
 FIELD_LABELS = {"字段1": "中文名", "字段2": "中文名", ...}
 FIELD_ID_FALLBACK = {}  # 可选，字段ID映射，空则用缓存自动匹配
+FIELD_ORDER = []       # 可选，卡片展示顺序（按工单字段）
 DATE_FIELDS = set()    # 可选，日期类型字段名
 
 def get_admin_comment(fields):
