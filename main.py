@@ -124,13 +124,122 @@ def analyze_message(history):
         return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
+def _build_leave_form(fields, approval_code, token):
+    """
+    构建请假表单。leaveGroupV2 的 value 是嵌套 map：
+    每个子字段的值本身也是一个 {id, type, value} 对象。
+    """
+    cached_fields = get_form_fields("请假", approval_code, token)
+    leave_field_id = "widgetLeaveGroupV2"
+    if cached_fields:
+        for fid, finfo in cached_fields.items():
+            if finfo.get("type") == "leaveGroupV2":
+                leave_field_id = fid
+                break
+
+    start_date = fields.get("start_date", "")
+    end_date = fields.get("end_date", start_date)
+    days = fields.get("days", 1)
+    leave_type = fields.get("leave_type", "事假")
+    reason = fields.get("reason", "")
+
+    try:
+        is_half_day = float(days) <= 0.5
+    except (ValueError, TypeError):
+        is_half_day = False
+
+    if is_half_day:
+        start_time = f"{start_date}T12:00:00+08:00"
+        end_time = f"{end_date}T18:00:00+08:00"
+    else:
+        start_time = f"{start_date}T00:00:00+08:00"
+        end_time = f"{end_date}T23:59:00+08:00"
+
+    # 每个子字段值是一个 map，包含 id/type/value
+    value_map = {
+        "widgetLeaveGroupType": {
+            "id": "widgetLeaveGroupType",
+            "type": "radioV2",
+            "value": leave_type
+        },
+        "widgetLeaveGroupStartTime": {
+            "id": "widgetLeaveGroupStartTime",
+            "type": "date",
+            "value": start_time
+        },
+        "widgetLeaveGroupEndTime": {
+            "id": "widgetLeaveGroupEndTime",
+            "type": "date",
+            "value": end_time
+        },
+        "widgetLeaveGroupInterval": {
+            "id": "widgetLeaveGroupInterval",
+            "type": "radioV2",
+            "value": str(days)
+        },
+        "widgetLeaveGroupUnit": {
+            "id": "widgetLeaveGroupUnit",
+            "type": "radioV2",
+            "value": "DAY"
+        },
+        "widgetLeaveGroupReason": {
+            "id": "widgetLeaveGroupReason",
+            "type": "textarea",
+            "value": reason
+        },
+        "widgetLeaveGroupFeedingArrivingLate": {
+            "id": "widgetLeaveGroupFeedingArrivingLate",
+            "type": "radioV2",
+            "value": "0"
+        }
+    }
+
+    print(f"请假表单 value_map: {json.dumps(value_map, ensure_ascii=False)}")
+
+    return [{
+        "id": leave_field_id,
+        "type": "leaveGroupV2",
+        "value": value_map
+    }]
+
+
+def _build_out_form(fields, approval_code, token):
+    """构建外出表单。outGroup 使用类似的嵌套 map 格式。"""
+    cached_fields = get_form_fields("外出", approval_code, token)
+    out_field_id = "widgetOutGroup"
+    if cached_fields:
+        for fid, finfo in cached_fields.items():
+            if finfo.get("type") == "outGroup":
+                out_field_id = fid
+                break
+
+    start = fields.get("start_date", "")
+    end = fields.get("end_date", start)
+    destination = fields.get("destination", "")
+    reason = fields.get("reason", "")
+
+    value_map = {
+        "start": f"{start}T00:00:00+08:00",
+        "end": f"{end}T00:00:00+08:00",
+        "reason": f"{destination} {reason}".strip()
+    }
+
+    return [{
+        "id": out_field_id,
+        "type": "outGroup",
+        "value": value_map
+    }]
+
+
 def build_form(approval_type, fields, token):
-    """
-    根据缓存的字段结构构建表单。
-    注意：请假(leaveGroupV2)、外出(outGroup) 等控件类型不支持 API 创建，
-    已在 LINK_ONLY_TYPES 中配置为跳转模式，不会走到此函数。
-    """
+    """根据审批类型构建表单数据。"""
     approval_code = APPROVAL_CODES[approval_type]
+
+    if approval_type == "请假":
+        return _build_leave_form(fields, approval_code, token)
+
+    if approval_type == "外出":
+        return _build_out_form(fields, approval_code, token)
 
     # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
