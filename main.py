@@ -45,80 +45,44 @@ def get_token():
     return _token_cache["token"]
 
 
-def download_image(message_id, image_key):
-    """从飞书下载图片，返回 base64 编码"""
+def download_message_file(message_id, file_key, file_type="file"):
+    """从飞书消息下载文件，返回二进制内容"""
     try:
         token = get_token()
         res = httpx.get(
-            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}",
-            params={"type": "image"},
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+            params={"type": file_type},
             headers={"Authorization": f"Bearer {token}"},
-            timeout=15
+            timeout=30
         )
         if res.status_code == 200:
-            return base64.b64encode(res.content).decode("utf-8")
-        print(f"下载图片失败: status={res.status_code}")
+            return res.content
+        print(f"下载文件失败: status={res.status_code}")
     except Exception as e:
-        print(f"下载图片异常: {e}")
+        print(f"下载文件异常: {e}")
     return None
 
 
-def ocr_image(image_base64):
-    """调用飞书 OCR 识别图片文字"""
+def upload_approval_file(file_name, file_content):
+    """上传文件到飞书审批，返回 file code（用于附件字段）"""
     try:
         token = get_token()
         res = httpx.post(
-            "https://open.feishu.cn/open-apis/optical_char_recognition/v1/image/basic_recognize",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"image": image_base64},
-            timeout=15
+            "https://open.feishu.cn/open-apis/approval/openapi/v2/file/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"name": file_name, "type": "attachment"},
+            files={"content": (file_name, file_content)},
+            timeout=30
         )
         data = res.json()
         if data.get("code") == 0:
-            lines = data.get("data", {}).get("text_list", [])
-            return "\n".join(lines)
-        print(f"OCR 失败: {data.get('msg')}")
+            file_code = data.get("data", {}).get("code", "")
+            print(f"文件上传成功: {file_name} -> {file_code}")
+            return file_code
+        print(f"文件上传失败: {data.get('msg')}")
     except Exception as e:
-        print(f"OCR 异常: {e}")
+        print(f"文件上传异常: {e}")
     return None
-
-
-def analyze_document_for_seal(ocr_text):
-    """根据 OCR 文字提取文档相关字段（文件名称、文件类型、文件数量）"""
-    doc_type_options = (
-        "主营业务相关(流量服务协议、顾问合同等), "
-        "非业务相关(知识产权、项目申报、认证等), "
-        "资产服务类(采购合同、租赁合同、承包合同等), "
-        "工商财务类(银行材料、审计材料、签章等), "
-        "人事类(收入证明、在职证明等)"
-    )
-    prompt = (
-        f"你是行政助理，根据以下文档OCR文字，提取文件信息。\n\n"
-        f"文档内容：\n{ocr_text[:2000]}\n\n"
-        f"请返回JSON，包含：\n"
-        f"- document_name: 文件名称/标题（从文档首页识别）\n"
-        f"- document_type: 文件类型，从以下选项中选最匹配的：{doc_type_options}\n"
-        f"- document_count: 文件份数（默认\"1\"）\n"
-        f"只返回JSON。"
-    )
-    try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=30
-        )
-        content = res.json()["choices"][0]["message"]["content"].strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        return json.loads(content)
-    except Exception as e:
-        print(f"文档分析失败: {e}")
-        return {}
 
 
 def send_message(open_id, text):
@@ -182,7 +146,10 @@ def analyze_message(history):
         f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n"
         f"6. 采购的cost_detail是费用明细列表(必填)，每项必须含名称、规格、数量、金额、是否有库存(是/否)。"
         f"多个物品就多项，格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\",\"是否有库存\":\"否\"}}]。"
-        f"缺少任何一项信息就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')\n\n"
+        f"缺少任何一项信息就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')\n"
+        f"7. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
+        f"document_name/document_type不需要用户说，会从上传文件自动获取。"
+        f"如果用户还没上传文件，在unclear中提示'请上传需要盖章的文件'\n\n"
         f"返回JSON：\n"
         f"- requests: 数组，每项含 approval_type、fields、missing\n"
         f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
@@ -285,14 +252,15 @@ def _to_rfc3339(date_val):
     return s
 
 
-def build_form(approval_type, fields, token):
-    """根据审批类型构建表单数据。按缓存中的表单顺序，使用真实控件类型。"""
+def build_form(approval_type, fields, token, file_codes=None):
+    """根据审批类型构建表单数据。file_codes: {field_id: [code1, ...]} 附件字段。"""
     approval_code = APPROVAL_CODES[approval_type]
     cached = get_form_fields(approval_type, approval_code, token)
     if not cached:
         print(f"无法获取{approval_type}的字段结构")
         return None
 
+    file_codes = file_codes or {}
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
     name_to_key = {v: k for k, v in FIELD_LABELS.items()}
     name_to_key.update({k: k for k in FIELD_LABELS})
@@ -302,7 +270,11 @@ def build_form(approval_type, fields, token):
     for field_id, field_info in cached.items():
         field_type = field_info.get("type", "input")
         field_name = field_info.get("name", "")
-        if field_type in ("attach", "attachV2", "image", "imageV2", "description", "attachmentV2"):
+        if field_type in ("description",):
+            continue
+        if field_type in ("attach", "attachV2", "image", "imageV2", "attachmentV2"):
+            if field_id in file_codes:
+                form_list.append({"id": field_id, "type": field_type, "value": file_codes[field_id]})
             continue
 
         if field_type == "dateInterval":
@@ -404,12 +376,12 @@ def _form_summary(form_list, cached):
     return "\n".join(lines)
 
 
-def create_approval(user_id, approval_type, fields):
+def create_approval(user_id, approval_type, fields, file_codes=None):
     approval_code = APPROVAL_CODES[approval_type]
     token = get_token()
 
     cached = get_form_fields(approval_type, approval_code, token)
-    form_list = build_form(approval_type, fields, token)
+    form_list = build_form(approval_type, fields, token, file_codes=file_codes)
     if form_list is None:
         return False, "无法构建表单，请检查审批字段配置", {}, ""
 
@@ -476,58 +448,54 @@ def _on_message_read(_data):
 
 PENDING_SEAL = {}
 
+ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
-def _handle_image_message(open_id, user_id, message_id, content_json):
-    """处理图片消息：下载→OCR→提取文件字段→等用户补充其余字段"""
-    image_key = content_json.get("image_key", "")
-    if not image_key:
-        send_message(open_id, "无法获取图片，请重新发送。")
+
+def _handle_file_message(open_id, user_id, message_id, content_json):
+    """处理文件消息：下载文件→上传审批附件→提取文件名→等用户补充其余字段"""
+    file_key = content_json.get("file_key", "")
+    file_name = content_json.get("file_name", "未知文件")
+    if not file_key:
+        send_message(open_id, "无法获取文件，请重新发送。")
         return
 
-    send_message(open_id, "正在识别文档内容，请稍候...")
+    send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
 
-    image_b64 = download_image(message_id, image_key)
-    if not image_b64:
-        send_message(open_id, "图片下载失败，请重试或直接用文字描述您的用印需求。")
+    file_content = download_message_file(message_id, file_key, "file")
+    if not file_content:
+        send_message(open_id, "文件下载失败，请重新发送文件。")
         return
 
-    ocr_text = ocr_image(image_b64)
-    if not ocr_text:
-        send_message(open_id, "文档识别失败，请直接用文字描述您的用印需求，例如：\n"
-                     "「帮我给XX合同盖公章，微驰公司」")
-        return
+    file_code = upload_approval_file(file_name, file_content)
+    if not file_code:
+        send_message(open_id, "文件上传失败，请重试。工单仍可创建，但附件需手动上传。")
 
-    print(f"OCR结果: {ocr_text[:300]}...")
+    doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
 
-    doc_fields = analyze_document_for_seal(ocr_text)
-    print(f"文档分析结果: {doc_fields}")
+    doc_fields = {
+        "document_name": doc_name,
+        "document_count": "1",
+    }
 
-    doc_fields.setdefault("document_count", "1")
-
-    file_summary_parts = []
-    if doc_fields.get("document_name"):
-        file_summary_parts.append(f"· 文件名称: {doc_fields['document_name']}")
-    if doc_fields.get("document_type"):
-        file_summary_parts.append(f"· 文件类型: {doc_fields['document_type']}")
-    if doc_fields.get("document_count"):
-        file_summary_parts.append(f"· 文件数量: {doc_fields['document_count']}")
-
-    PENDING_SEAL[open_id] = {"doc_fields": doc_fields, "user_id": user_id}
+    PENDING_SEAL[open_id] = {
+        "doc_fields": doc_fields,
+        "file_code": file_code,
+        "user_id": user_id,
+    }
 
     CONVERSATIONS.setdefault(open_id, [])
     CONVERSATIONS[open_id].append({
         "role": "assistant",
-        "content": f"[已识别文档] document_name={doc_fields.get('document_name','')}, "
-                   f"document_type={doc_fields.get('document_type','')}"
+        "content": f"[已接收文件] 文件名称={doc_name}"
     })
 
-    file_info = "\n".join(file_summary_parts) if file_summary_parts else "（未能识别文件信息）"
     msg = (
-        f"已从文档中识别到：\n{file_info}\n\n"
+        f"已接收文件：{file_name}\n"
+        f"· 文件名称: {doc_name}\n\n"
         f"请补充以下信息（一条消息说完即可）：\n"
         f"1. 用印公司\n"
         f"2. 印章类型（公章/合同章/法人章/财务章）\n"
-        f"3. 用印事由\n"
+        f"3. 文件用途/用印事由\n"
         f"4. 盖章还是外带（默认盖章）\n"
         f"5. 律师是否已审核（默认否）"
     )
@@ -535,19 +503,20 @@ def _handle_image_message(open_id, user_id, message_id, content_json):
 
 
 def _try_complete_seal(open_id, user_id, text):
-    """用户发送补充信息后，合并文档字段+用户字段，创建用印申请"""
+    """用户发送补充信息后，合并文件字段+用户字段，创建用印申请"""
     pending = PENDING_SEAL.get(open_id)
     if not pending:
         return False
 
     doc_fields = pending["doc_fields"]
+    file_code = pending.get("file_code")
 
     prompt = (
         f"用户为用印申请补充了以下信息：\n{text}\n\n"
         f"请提取并返回JSON，包含：\n"
         f"- company: 用印公司\n"
         f"- seal_type: 印章类型(公章/合同章/法人章/财务章)\n"
-        f"- reason: 用印事由\n"
+        f"- reason: 文件用途/用印事由\n"
         f"- usage_method: 盖章或外带(默认盖章)\n"
         f"- lawyer_reviewed: 律师是否已审核(是或否,默认否)\n"
         f"- remarks: 备注(如果有)\n"
@@ -582,16 +551,18 @@ def _try_complete_seal(open_id, user_id, text):
     for key in ["company", "seal_type", "reason"]:
         if not all_fields.get(key):
             missing.append(FIELD_LABELS.get(key, key))
-    if not all_fields.get("document_name"):
-        missing.append("文件名称")
 
     if missing:
         send_message(open_id, f"还缺少：{'、'.join(missing)}\n请补充。")
         PENDING_SEAL[open_id]["doc_fields"] = all_fields
         return True
 
+    file_codes = {}
+    if file_code:
+        file_codes[ATTACHMENT_FIELD_ID] = [file_code]
+
     admin_comment = get_admin_comment("用印申请", all_fields)
-    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields)
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=file_codes)
 
     if success:
         instance_code = resp_data.get("instance_code", "")
@@ -623,13 +594,18 @@ def on_message(data):
         message_id = event.message.message_id
         content_json = json.loads(event.message.content)
 
+        if msg_type == "file":
+            _handle_file_message(open_id, user_id, message_id, content_json)
+            return
+
         if msg_type == "image":
-            _handle_image_message(open_id, user_id, message_id, content_json)
+            send_message(open_id, "如需用印申请，请发送原始文件（Word/PDF），而非图片截图。\n"
+                         "其他审批请用文字描述。")
             return
 
         text = content_json.get("text", "").strip()
         if not text:
-            send_message(open_id, "请发送文字消息描述您的审批需求，或发送文档图片进行用印申请。")
+            send_message(open_id, "请发送文字消息描述您的审批需求。\n如需用印，请先上传需要盖章的文件。")
             return
 
         if open_id in PENDING_SEAL:
