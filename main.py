@@ -76,8 +76,7 @@ def send_link_message(open_id, text, url):
         print(f"发送链接消息失败: {resp.msg}")
 
 def build_approval_link(approval_code):
-    return f"https://applink.feishu.cn/client/approval/instance/create?approval_code={approval_code}"
-
+    return f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}"
 def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
     field_hints = "\n".join([f"{k}: {v}" for k, v in APPROVAL_FIELD_HINTS.items()])
