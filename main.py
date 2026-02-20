@@ -83,23 +83,23 @@ def ocr_image(image_base64):
     return None
 
 
-def analyze_document_for_seal(ocr_text, user_text=""):
-    """根据 OCR 文字和用户描述，用 AI 提取用印申请字段"""
-    prompt = (
-        f"你是行政助理，根据以下文档内容和用户说明，提取用印申请所需的信息。\n\n"
-        f"文档OCR文字：\n{ocr_text}\n\n"
+def analyze_document_for_seal(ocr_text):
+    """根据 OCR 文字提取文档相关字段（文件名称、文件类型、文件数量）"""
+    doc_type_options = (
+        "主营业务相关(流量服务协议、顾问合同等), "
+        "非业务相关(知识产权、项目申报、认证等), "
+        "资产服务类(采购合同、租赁合同、承包合同等), "
+        "工商财务类(银行材料、审计材料、签章等), "
+        "人事类(收入证明、在职证明等)"
     )
-    if user_text:
-        prompt += f"用户说明：{user_text}\n\n"
-    prompt += (
-        f"请从文档中识别并返回JSON，包含以下字段（能识别多少填多少）：\n"
-        f"- company: 用印公司名称\n"
-        f"- seal_type: 需要的印章类型(公章/合同章/法人章/财务章)\n"
-        f"- document_name: 文件名称/标题\n"
-        f"- document_type: 文件类型(合同/协议/报告/证明等)\n"
-        f"- reason: 用印事由(简要说明文件用途)\n"
-        f"- document_count: 文件份数(默认1)\n"
-        f"只返回JSON，不要其他文字。"
+    prompt = (
+        f"你是行政助理，根据以下文档OCR文字，提取文件信息。\n\n"
+        f"文档内容：\n{ocr_text[:2000]}\n\n"
+        f"请返回JSON，包含：\n"
+        f"- document_name: 文件名称/标题（从文档首页识别）\n"
+        f"- document_type: 文件类型，从以下选项中选最匹配的：{doc_type_options}\n"
+        f"- document_count: 文件份数（默认\"1\"）\n"
+        f"只返回JSON。"
     )
     try:
         res = httpx.post(
@@ -180,8 +180,9 @@ def analyze_message(history):
         f"3. 只有真的无法推断的字段才放入missing\n"
         f"4. reason可根据上下文推断，实在没有才列为missing\n"
         f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n"
-        f"6. 采购的cost_detail是费用明细列表，格式为[{{\"名称\":\"物品\",\"数量\":\"1\",\"规格\":\"型号\",\"金额\":\"1000\"}}]，"
-        f"用户必须提供每项的名称、数量、规格、金额，缺少任何一项就把cost_detail列入missing\n\n"
+        f"6. 采购的cost_detail是费用明细列表(必填)，每项必须含名称、规格、数量、金额、是否有库存(是/否)。"
+        f"多个物品就多项，格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\",\"是否有库存\":\"否\"}}]。"
+        f"缺少任何一项信息就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')\n\n"
         f"返回JSON：\n"
         f"- requests: 数组，每项含 approval_type、fields、missing\n"
         f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
@@ -219,9 +220,10 @@ def analyze_message(history):
 
 _FIELDLIST_ALIAS = {
     "名称": ["name", "item_name", "物品名称", "物品", "品名"],
-    "数量": ["quantity", "qty", "count", "num"],
     "规格": ["spec", "specification", "model", "规格型号", "型号"],
+    "数量": ["quantity", "qty", "count", "num"],
     "金额": ["amount", "price", "cost", "单价", "总价", "费用"],
+    "是否有库存": ["has_stock", "in_stock", "库存", "stock"],
 }
 
 
@@ -472,8 +474,11 @@ def _on_message_read(_data):
     pass
 
 
+PENDING_SEAL = {}
+
+
 def _handle_image_message(open_id, user_id, message_id, content_json):
-    """处理图片消息：下载→OCR→分析→创建用印申请"""
+    """处理图片消息：下载→OCR→提取文件字段→等用户补充其余字段"""
     image_key = content_json.get("image_key", "")
     if not image_key:
         send_message(open_id, "无法获取图片，请重新发送。")
@@ -492,42 +497,102 @@ def _handle_image_message(open_id, user_id, message_id, content_json):
                      "「帮我给XX合同盖公章，微驰公司」")
         return
 
-    print(f"OCR结果: {ocr_text[:200]}...")
+    print(f"OCR结果: {ocr_text[:300]}...")
 
-    prev_texts = [m["content"] for m in CONVERSATIONS.get(open_id, []) if m["role"] == "user"]
-    user_context = "；".join(prev_texts[-3:]) if prev_texts else ""
-
-    doc_fields = analyze_document_for_seal(ocr_text, user_context)
+    doc_fields = analyze_document_for_seal(ocr_text)
     print(f"文档分析结果: {doc_fields}")
 
-    if not doc_fields:
-        send_message(open_id, "无法从文档中提取信息，请用文字补充：\n"
-                     "用印公司、印章类型、文件名称、用印事由")
-        return
-
-    doc_fields.setdefault("usage_method", "盖章")
     doc_fields.setdefault("document_count", "1")
-    doc_fields.setdefault("lawyer_reviewed", "否")
+
+    file_summary_parts = []
+    if doc_fields.get("document_name"):
+        file_summary_parts.append(f"· 文件名称: {doc_fields['document_name']}")
+    if doc_fields.get("document_type"):
+        file_summary_parts.append(f"· 文件类型: {doc_fields['document_type']}")
+    if doc_fields.get("document_count"):
+        file_summary_parts.append(f"· 文件数量: {doc_fields['document_count']}")
+
+    PENDING_SEAL[open_id] = {"doc_fields": doc_fields, "user_id": user_id}
+
+    CONVERSATIONS.setdefault(open_id, [])
+    CONVERSATIONS[open_id].append({
+        "role": "assistant",
+        "content": f"[已识别文档] document_name={doc_fields.get('document_name','')}, "
+                   f"document_type={doc_fields.get('document_type','')}"
+    })
+
+    file_info = "\n".join(file_summary_parts) if file_summary_parts else "（未能识别文件信息）"
+    msg = (
+        f"已从文档中识别到：\n{file_info}\n\n"
+        f"请补充以下信息（一条消息说完即可）：\n"
+        f"1. 用印公司\n"
+        f"2. 印章类型（公章/合同章/法人章/财务章）\n"
+        f"3. 用印事由\n"
+        f"4. 盖章还是外带（默认盖章）\n"
+        f"5. 律师是否已审核（默认否）"
+    )
+    send_message(open_id, msg)
+
+
+def _try_complete_seal(open_id, user_id, text):
+    """用户发送补充信息后，合并文档字段+用户字段，创建用印申请"""
+    pending = PENDING_SEAL.get(open_id)
+    if not pending:
+        return False
+
+    doc_fields = pending["doc_fields"]
+
+    prompt = (
+        f"用户为用印申请补充了以下信息：\n{text}\n\n"
+        f"请提取并返回JSON，包含：\n"
+        f"- company: 用印公司\n"
+        f"- seal_type: 印章类型(公章/合同章/法人章/财务章)\n"
+        f"- reason: 用印事由\n"
+        f"- usage_method: 盖章或外带(默认盖章)\n"
+        f"- lawyer_reviewed: 律师是否已审核(是或否,默认否)\n"
+        f"- remarks: 备注(如果有)\n"
+        f"只返回JSON。"
+    )
+    try:
+        res = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        user_fields = json.loads(content)
+    except Exception as e:
+        print(f"解析用印补充信息失败: {e}")
+        send_message(open_id, "无法理解您的输入，请重新描述用印公司、印章类型和用印事由。")
+        return True
+
+    all_fields = {**doc_fields, **user_fields}
+    all_fields.setdefault("usage_method", "盖章")
+    all_fields.setdefault("document_count", "1")
+    all_fields.setdefault("lawyer_reviewed", "否")
 
     missing = []
-    for key in ["company", "seal_type", "document_name", "reason"]:
-        if not doc_fields.get(key):
-            label = FIELD_LABELS.get(key, key)
-            missing.append(label)
+    for key in ["company", "seal_type", "reason"]:
+        if not all_fields.get(key):
+            missing.append(FIELD_LABELS.get(key, key))
+    if not all_fields.get("document_name"):
+        missing.append("文件名称")
 
     if missing:
-        summary = format_fields_summary(doc_fields, "用印申请")
-        msg = (f"已从文档中识别到以下信息：\n{summary}\n\n"
-               f"还缺少：{'、'.join(missing)}\n请补充。")
-        send_message(open_id, msg)
-        CONVERSATIONS.setdefault(open_id, [])
-        CONVERSATIONS[open_id].append({"role": "assistant", "content": f"[文档识别] {json.dumps(doc_fields, ensure_ascii=False)}"})
-        CONVERSATIONS[open_id].append({"role": "assistant", "content": f"请补充：{'、'.join(missing)}"})
-        return
+        send_message(open_id, f"还缺少：{'、'.join(missing)}\n请补充。")
+        PENDING_SEAL[open_id]["doc_fields"] = all_fields
+        return True
 
-    admin_comment = get_admin_comment("用印申请", doc_fields)
+    admin_comment = get_admin_comment("用印申请", all_fields)
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields)
 
-    success, msg, resp_data, summary = create_approval(user_id, "用印申请", doc_fields)
     if success:
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
@@ -538,7 +603,9 @@ def _handle_image_message(open_id, user_id, message_id, content_json):
     else:
         send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
 
+    del PENDING_SEAL[open_id]
     CONVERSATIONS[open_id] = []
+    return True
 
 
 def on_message(data):
@@ -564,6 +631,10 @@ def on_message(data):
         if not text:
             send_message(open_id, "请发送文字消息描述您的审批需求，或发送文档图片进行用印申请。")
             return
+
+        if open_id in PENDING_SEAL:
+            if _try_complete_seal(open_id, user_id, text):
+                return
 
         if open_id not in CONVERSATIONS:
             CONVERSATIONS[open_id] = []

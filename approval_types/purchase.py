@@ -4,7 +4,11 @@ NAME = "采购申请"
 APPROVAL_CODE = "6CF86C28-26AA-4E8B-ABF4-82DFAE86028C"
 LINK_ONLY = False
 
-FIELD_HINTS = "purchase_reason(采购事由), purchase_type(采购类别), expected_date(期望交付时间YYYY-MM-DD), cost_detail(费用明细列表,每项含:名称/数量/规格/金额)"
+FIELD_HINTS = (
+    "purchase_reason(采购事由), purchase_type(采购类别), expected_date(期望交付时间YYYY-MM-DD), "
+    "cost_detail(费用明细列表,必填,每项必须包含:名称/规格/数量/金额/是否有库存(是或否),"
+    "多个物品就多项,如[{\"名称\":\"笔记本\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\",\"是否有库存\":\"否\"}])"
+)
 
 FIELD_LABELS = {
     "purchase_reason": "采购事由",
