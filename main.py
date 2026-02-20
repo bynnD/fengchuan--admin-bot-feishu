@@ -6,6 +6,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import get_admin_comment
 import datetime
+import time
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
@@ -15,13 +16,15 @@ PROCESSED_EVENTS = set()
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
 
+# 存储每种审批的真实字段ID：{approval_type: {field_id: field_name}}
+APPROVAL_REAL_FIELDS = {}
+
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
     .app_secret(FEISHU_APP_SECRET) \
     .build()
 
 def get_token():
-    import time
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
         return _token_cache["token"]
@@ -34,6 +37,29 @@ def get_token():
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
+
+def get_approval_form_fields(approval_type, approval_code):
+    token = get_token()
+    res = httpx.get(
+        f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10
+    )
+    data = res.json()
+    if data.get("code") != 0:
+        print(f"获取审批定义失败[{approval_type}]: {data}")
+        return {}
+    form_str = data.get("data", {}).get("form", "[]")
+    form = json.loads(form_str)
+    fields = {}
+    for item in form:
+        field_id = item.get("id")
+        field_name = item.get("name", field_id)
+        field_type = item.get("type", "")
+        if field_id:
+            fields[field_id] = {"name": field_name, "type": field_type}
+    print(f"审批[{approval_type}]真实字段: {json.dumps(fields, ensure_ascii=False)}")
+    return fields
 
 def send_message(open_id, text):
     body = CreateMessageRequestBody.builder() \
@@ -63,7 +89,7 @@ def analyze_message(history):
         f"3. '两个小时'、'半天'等时长，days填0.5或按实际换算，start_date和end_date填同一天\n"
         f"4. '去看病'、'身体不舒服'等明显是病假，leave_type直接填'病假'\n"
         f"5. 只有真的无法推断的字段才放入missing\n"
-        f"6. reason如果用户没说可以根据上下文推断，实在没有才列为missing\n\n"
+        f"6. reason如果没说可根据上下文推断，实在没有才列为missing\n\n"
         f"分析对话历史，返回JSON：\n"
         f"- approval_type: 审批类型（从列表选，无法判断填null）\n"
         f"- fields: 综合对话历史已提取的字段键值对\n"
@@ -92,12 +118,26 @@ def analyze_message(history):
 
 def create_approval(user_id, approval_type, fields, admin_comment):
     approval_code = APPROVAL_CODES[approval_type]
-    all_fields = dict(fields)
-    all_fields["admin_comment"] = admin_comment
-    form_data = json.dumps(
-        [{"id": k, "type": "input", "value": str(v)} for k, v in all_fields.items()],
-        ensure_ascii=False
-    )
+    real_fields = APPROVAL_REAL_FIELDS.get(approval_type, {})
+
+    # 用真实字段ID构建表单
+    form_list = []
+    for field_id, field_info in real_fields.items():
+        field_type = field_info.get("type", "input")
+        field_name = field_info.get("name", field_id)
+        # 跳过附件和说明类字段
+        if field_type in ("attach", "attachV2", "description"):
+            continue
+        # 用字段名匹配用户提供的值
+        value = fields.get(field_id) or fields.get(field_name) or ""
+        # 行政意见字段特殊处理
+        if "行政" in field_name or "admin" in field_id.lower():
+            value = admin_comment
+        form_list.append({"id": field_id, "type": "input", "value": str(value)})
+
+    form_data = json.dumps(form_list, ensure_ascii=False)
+    print(f"提交表单: {form_data}")
+
     token = get_token()
     res = httpx.post(
         "https://open.feishu.cn/open-apis/approval/v4/instances",
@@ -177,6 +217,11 @@ def on_message(data):
             send_message(open_id, "系统出现异常，请稍后再试。")
 
 if __name__ == "__main__":
+    # 启动时自动获取所有审批的真实字段
+    print("正在获取审批表单字段...")
+    for name, code in APPROVAL_CODES.items():
+        APPROVAL_REAL_FIELDS[name] = get_approval_form_fields(name, code)
+
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
