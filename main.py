@@ -52,20 +52,29 @@ def send_message(open_id, text):
     if not resp.success():
         print(f"发送消息失败: {resp.msg}")
 
-def send_link_message(open_id, text, url):
-    content = {
-        "zh_cn": {
-            "title": "审批申请",
-            "content": [[
-                {"tag": "text", "text": text + "\n\n"},
-                {"tag": "a", "text": "👉 点击这里前往飞书审批页面提交", "href": url}
-            ]]
-        }
+def send_link_message(open_id, text, url, approval_type):
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": text}
+            },
+            {
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": f"前往提交{approval_type}申请"},
+                    "type": "primary",
+                    "url": url
+                }]
+            }
+        ]
     }
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
-        .msg_type("post") \
-        .content(json.dumps(content, ensure_ascii=False)) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
         .build()
     request = CreateMessageRequest.builder() \
         .receive_id_type("open_id") \
@@ -73,7 +82,7 @@ def send_link_message(open_id, text, url):
         .build()
     resp = client.im.v1.message.create(request)
     if not resp.success():
-        print(f"发送链接消息失败: {resp.msg}")
+        print(f"发送卡片消息失败: {resp.msg}")
 
 def build_approval_link(approval_code):
     return f"https://applink.feishu.cn/client/approval/newinstance?approval_code={approval_code}"
