@@ -345,8 +345,18 @@ def build_form(approval_type, fields, token, file_codes=None):
     return form_list
 
 
+def _value_to_text(val, options):
+    """将 radioV2/radio 的 value 转为可读的 text"""
+    if not options or not val:
+        return val
+    for opt in options:
+        if isinstance(opt, dict) and opt.get("value") == val:
+            return opt.get("text", val)
+    return val
+
+
 def _form_summary(form_list, cached):
-    """根据实际提交的表单和缓存的字段名生成摘要"""
+    """根据实际提交的表单和缓存的字段名生成摘要，radioV2 显示 text 而非 value"""
     lines = []
     for item in form_list:
         fid = item.get("id", "")
@@ -361,6 +371,11 @@ def _form_summary(form_list, cached):
                 lines.append(f"· {name}: {s} 至 {e}")
         elif ftype in ("attach", "attachV2", "image", "imageV2"):
             continue
+        elif ftype in ("radioV2", "radio"):
+            val = item.get("value", "")
+            if val:
+                display = _value_to_text(val, info.get("options", []))
+                lines.append(f"· {name}: {display}")
         elif ftype == "fieldList":
             val = item.get("value", [])
             if val and isinstance(val, list) and isinstance(val[0], list):
@@ -629,6 +644,25 @@ def on_message(data):
             CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
             return
 
+        for req in requests:
+            at = req.get("approval_type", "")
+            miss = req.get("missing", [])
+            fields_check = req.get("fields", {})
+            if at == "用印申请" and open_id not in PENDING_SEAL:
+                send_message(open_id, "请补充以下信息：\n"
+                             f"用印申请还缺少：上传用章文件\n"
+                             f"请先上传需要盖章的文件（Word/PDF），我会自动提取文件名称。")
+                CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
+                requests = [r for r in requests if r.get("approval_type") != "用印申请"]
+                if not requests:
+                    return
+            if at == "采购申请":
+                cd = fields_check.get("cost_detail")
+                if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
+                    if "cost_detail" not in miss:
+                        miss.append("cost_detail")
+                        req["missing"] = miss
+
         complete = [r for r in requests if not r.get("missing")]
         incomplete = [(r["approval_type"], r.get("missing", [])) for r in requests if r.get("missing")]
 
@@ -670,11 +704,13 @@ def on_message(data):
                     success, msg, resp_data, form_summary = create_approval(user_id, approval_type, fields)
                     if success:
                         instance_code = resp_data.get("instance_code", "")
-                        replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
                         if instance_code:
                             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
+                            replies.append(f"· {approval_type}：✅ 已提交")
+                        else:
+                            replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
                     else:
                         print(f"创建审批失败[{approval_type}]: {msg}")
                         if "free process" in msg.lower() or "unsupported approval" in msg.lower():
