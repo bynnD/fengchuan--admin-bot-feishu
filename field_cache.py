@@ -65,14 +65,20 @@ def _fetch_from_api(approval_code, token):
                 continue
             info = {"name": field_name, "type": field_type}
             if field_type == "fieldList":
-                sub_items = item.get("value", [])
+                sub_items = item.get("value") or item.get("option") or item.get("children") or []
                 if isinstance(sub_items, str):
                     try:
-                        sub_items = json.loads(sub_items) if sub_items else []
+                        parsed = json.loads(sub_items) if sub_items else []
+                        if isinstance(parsed, dict):
+                            sub_items = parsed.get("children") or parsed.get("list") or parsed.get("fields") or []
+                        else:
+                            sub_items = parsed
                     except json.JSONDecodeError:
                         sub_items = []
+                if not isinstance(sub_items, list):
+                    sub_items = []
                 info["sub_fields"] = [
-                    {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
+                    {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name") or s.get("title") or s.get("label", "")}
                     for s in sub_items if s.get("id")
                 ]
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):

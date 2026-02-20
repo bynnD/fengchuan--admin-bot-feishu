@@ -6,7 +6,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
-    IMAGE_SUPPORT_TYPES, get_admin_comment
+    IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment
 )
 import base64
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
@@ -272,13 +272,14 @@ def build_form(approval_type, fields, token, file_codes=None):
         field_name = field_info.get("name", "")
         if field_type in ("description",):
             continue
-        if field_type in ("attach", "attachV2", "image", "imageV2", "attachmentV2"):
+        if field_type in ("attach", "attachV2", "image", "imageV2", "attachmentV2", "attachment", "file"):
             files = file_codes.get(field_id)
             if not files and file_codes:
-                # 用印申请等：传入的 file_codes 可能用固定 ID，实际表单的附件字段 ID 可能不同（如 widget3）
+                # 用印申请等：传入的 file_codes 可能用固定 ID，实际表单的附件字段 ID 可能不同
                 files = next(iter(file_codes.values()), None)
             if files:
-                form_list.append({"id": field_id, "type": field_type, "value": files})
+                # 飞书附件字段 value 需为文件 code 数组
+                form_list.append({"id": field_id, "type": field_type, "value": files if isinstance(files, list) else [files]})
             continue
 
         if field_type == "dateInterval":
@@ -331,6 +332,11 @@ def build_form(approval_type, fields, token, file_codes=None):
                             break
                 if not matched:
                     raw = opts[0].get("value", "") if isinstance(opts[0], dict) else ""
+        # fieldList 无 sub_fields 时使用配置的 fallback（如采购费用明细）
+        if field_type == "fieldList" and not (field_info.get("sub_fields")):
+            fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
+            if fallback_subs:
+                field_info = {**field_info, "sub_fields": fallback_subs}
         value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
         if logical_key in DATE_FIELDS and raw:
@@ -469,6 +475,40 @@ PENDING_SEAL = {}
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
+# 用印申请需从模版读取选项的字段
+SEAL_OPTION_FIELDS = {
+    "company": "widget17375357884790001",
+    "usage_method": "widget17375347703620001",
+    "seal_type": "widget15754438920110001",
+    "lawyer_reviewed": "widget17375349618880001",
+}
+
+
+def _get_seal_form_options():
+    """从工单模版读取用印申请的选项，返回 {逻辑键: [选项文本列表]}"""
+    token = get_token()
+    cached = get_form_fields("用印申请", APPROVAL_CODES["用印申请"], token)
+    if not cached:
+        return {}
+    result = {}
+    for logical_key, field_id in SEAL_OPTION_FIELDS.items():
+        info = cached.get(field_id, {})
+        opts = info.get("options", [])
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts) if opts else []
+            except json.JSONDecodeError:
+                opts = []
+        texts = []
+        for o in opts:
+            if isinstance(o, dict):
+                t = o.get("text") or o.get("value", "")
+                if t:
+                    texts.append(str(t))
+        if texts:
+            result[logical_key] = texts
+    return result
+
 
 def _handle_file_message(open_id, user_id, message_id, content_json):
     """处理文件消息：下载文件→上传审批附件→提取文件名→等用户补充其余字段"""
@@ -487,7 +527,8 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
     file_code = upload_approval_file(file_name, file_content)
     if not file_code:
-        send_message(open_id, "文件上传失败，请重试。工单仍可创建，但附件需手动上传。")
+        send_message(open_id, "文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。")
+        return
 
     doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
 
@@ -508,17 +549,24 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         "content": f"[已接收文件] 文件名称={doc_name}"
     })
 
-    msg = (
-        f"已接收文件：{file_name}\n"
-        f"· 文件名称: {doc_name}\n\n"
-        f"请补充以下信息（一条消息说完即可）：\n"
-        f"1. 用印公司\n"
-        f"2. 印章类型（公章/合同章/法人章/财务章）\n"
-        f"3. 文件用途/用印事由\n"
-        f"4. 盖章还是外带（默认盖章）\n"
-        f"5. 律师是否已审核（默认否）"
-    )
-    send_message(open_id, msg)
+    opts = _get_seal_form_options()
+    company_opts = opts.get("company", [])
+    seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
+    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+
+    lines = [
+        f"已接收文件：{file_name}",
+        f"· 文件名称: {doc_name}",
+        "",
+        "请补充以下信息（一条消息说完即可）：",
+        f"1. 用印公司：{'、'.join(company_opts) if company_opts else '请输入'}",
+        f"2. 印章类型：{'、'.join(seal_opts)}",
+        f"3. 文件用途/用印事由：（请描述）",
+        f"4. 盖章还是外带：{'、'.join(usage_opts)}（默认盖章）",
+        f"5. 律师是否已审核：{'、'.join(lawyer_opts)}（默认否）",
+    ]
+    send_message(open_id, "\n".join(lines))
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -530,16 +578,22 @@ def _try_complete_seal(open_id, user_id, text):
     doc_fields = pending["doc_fields"]
     file_code = pending.get("file_code")
 
+    opts = _get_seal_form_options()
+    company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
+    seal_hint = f"（选项：{'/'.join(opts.get('seal_type', ['公章','合同章','法人章','财务章']))}）"
+    usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带'])），默认盖章）"
+    lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否'])），默认否）"
+
     prompt = (
         f"用户为用印申请补充了以下信息：\n{text}\n\n"
         f"请提取并返回JSON，包含：\n"
-        f"- company: 用印公司\n"
-        f"- seal_type: 印章类型(公章/合同章/法人章/财务章)\n"
+        f"- company: 用印公司{company_hint}\n"
+        f"- seal_type: 印章类型{seal_hint}\n"
         f"- reason: 文件用途/用印事由\n"
-        f"- usage_method: 盖章或外带(默认盖章)\n"
-        f"- lawyer_reviewed: 律师是否已审核(是或否,默认否)\n"
+        f"- usage_method: 盖章或外带{usage_hint}\n"
+        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}\n"
         f"- remarks: 备注(如果有)\n"
-        f"只返回JSON。"
+        f"只返回JSON。若用户未提及某选项字段，使用默认值。"
     )
     try:
         res = httpx.post(

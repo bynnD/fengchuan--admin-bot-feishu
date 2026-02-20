@@ -24,6 +24,17 @@ FIELD_ID_FALLBACK = {
     "cost_detail":     "widget16510609006710001",
 }
 
+# 费用明细子字段：当 API 未返回 sub_fields 时使用。若仍无明细，请从飞书审批定义中查看实际子字段 ID 并更新
+FIELDLIST_SUBFIELDS_FALLBACK = {
+    "cost_detail": [
+        {"id": "widget16510609006710002", "name": "名称", "type": "input"},
+        {"id": "widget16510609006710003", "name": "规格", "type": "input"},
+        {"id": "widget16510609006710004", "name": "数量", "type": "input"},
+        {"id": "widget16510609006710005", "name": "金额", "type": "input"},
+        {"id": "widget16510609006710006", "name": "是否有库存", "type": "input"},
+    ],
+}
+
 FIELD_ORDER = ["purchase_reason", "purchase_type", "expected_date", "cost_detail"]
 DATE_FIELDS = {"expected_date"}
 

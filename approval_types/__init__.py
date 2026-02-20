@@ -17,6 +17,7 @@ FIELD_LABELS = {}
 FIELD_ID_FALLBACK = {}
 FIELD_ORDER = {}
 DATE_FIELDS = set()
+FIELDLIST_SUBFIELDS_FALLBACK = {}
 for t in _TYPES:
     FIELD_LABELS.update(t.FIELD_LABELS)
     if getattr(t, "FIELD_ID_FALLBACK", None):
@@ -24,6 +25,8 @@ for t in _TYPES:
     if getattr(t, "FIELD_ORDER", None):
         FIELD_ORDER[t.NAME] = t.FIELD_ORDER
     DATE_FIELDS.update(getattr(t, "DATE_FIELDS", set()))
+    if getattr(t, "FIELDLIST_SUBFIELDS_FALLBACK", None):
+        FIELDLIST_SUBFIELDS_FALLBACK[t.NAME] = t.FIELDLIST_SUBFIELDS_FALLBACK
 
 FIELD_LABELS_REVERSE = {v: k for k, v in FIELD_LABELS.items()}
 IMAGE_SUPPORT_TYPES = {t.NAME for t in _TYPES if getattr(t, "SUPPORTS_IMAGE", False)}
