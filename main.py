@@ -133,22 +133,19 @@ def build_form(approval_type, fields, token):
     approval_code = APPROVAL_CODES[approval_type]
 
     if approval_type == "请假":
-        start = fields.get("start_date", "")
-        end = fields.get("end_date", start)
+        end = fields.get("end_date", fields.get("start_date", ""))
         days = str(fields.get("days", "1"))
         leave_type = fields.get("leave_type", "事假")
         reason = fields.get("reason", "")
+        # value格式来自真实审批实例，只有这4个key
         return [{
             "id": "widgetLeaveGroupV2",
             "type": "leaveGroupV2",
             "value": {
                 "end": f"{end}T00:00:00+08:00",
-                "start": f"{start}T00:00:00+08:00",
                 "interval": days,
                 "name": leave_type,
-                "reason": reason,
-                "unit": "DAY",
-                "timezoneOffset": -480
+                "reason": reason
             }
         }]
 
@@ -157,6 +154,7 @@ def build_form(approval_type, fields, token):
         end = fields.get("end_date", start)
         destination = fields.get("destination", "")
         reason = fields.get("reason", "")
+        # value格式来自真实审批实例
         return [{
             "id": "widgetOutGroup",
             "type": "outGroup",
