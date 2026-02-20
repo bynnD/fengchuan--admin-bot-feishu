@@ -5,7 +5,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, FIELD_ID_FALLBACK, DATE_FIELDS, FIELD_LABELS_REVERSE,
+    LINK_ONLY_TYPES, CREATE_LINK_IDS, FIELD_ID_FALLBACK, DATE_FIELDS, FIELD_LABELS_REVERSE,
     get_admin_comment
 )
 from field_cache import get_form_fields, invalidate_cache
@@ -280,7 +280,11 @@ def on_message(data):
 
             if approval_type in LINK_ONLY_TYPES:
                 approval_code = APPROVAL_CODES[approval_type]
-                link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
+                create_id = CREATE_LINK_IDS.get(approval_type)
+                if create_id:
+                    link = f"https://www.feishu.cn/approval/admin/createApproval?id={create_id}&definitionCode={approval_code}"
+                else:
+                    link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
                 tip = (
                     f"【{approval_type}】\n{summary}\n\n"
                     f"行政意见: {admin_comment}\n\n"

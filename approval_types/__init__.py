@@ -12,6 +12,7 @@ _TYPES = [seal, purchase, outbound]
 APPROVAL_CODES = {t.NAME: t.APPROVAL_CODE for t in _TYPES}
 APPROVAL_FIELD_HINTS = {t.NAME: t.FIELD_HINTS for t in _TYPES}
 LINK_ONLY_TYPES = {t.NAME for t in _TYPES if getattr(t, "LINK_ONLY", False)}
+CREATE_LINK_IDS = {t.NAME: t.CREATE_LINK_ID for t in _TYPES if getattr(t, "CREATE_LINK_ID", None)}
 
 FIELD_LABELS = {}
 FIELD_ID_FALLBACK = {}
