@@ -329,19 +329,7 @@ def on_message(data):
 
 
 if __name__ == "__main__":
-    
-    try:
-        token = get_token()
-        # 获取审批定义，查看leaveGroupV2控件里配置了哪些假期类型
-        r = httpx.get(
-            "https://open.feishu.cn/open-apis/approval/v4/approvals/5D58D53D-01BA-44C7-BF5E-712D0F4C7820",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        print("请假审批定义:", json.dumps(r.json(), ensure_ascii=False))
-    except Exception as e:
-        print(f"读取失败: {e}")
-    
+       
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
