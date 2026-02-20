@@ -130,13 +130,19 @@ def analyze_message(history):
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
-def _format_field_value(logical_key, raw_value, field_type):
-    """根据控件类型格式化值。fieldList 需传数组。"""
+def _format_field_value(logical_key, raw_value, field_type, field_info=None):
+    """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。"""
     if field_type == "fieldList":
         if isinstance(raw_value, list):
             return raw_value
-        # 简单字符串转为单行明细
-        return [{"value": str(raw_value)}] if raw_value else []
+        sub_fields = (field_info or {}).get("sub_fields", [])
+        if sub_fields and raw_value:
+            row = []
+            for i, sf in enumerate(sub_fields):
+                val = str(raw_value) if i == 0 else ""
+                row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
+            return [row]
+        return []
     if logical_key in DATE_FIELDS and raw_value:
         return f"{raw_value}T00:00:00+08:00" if "T" not in str(raw_value) else str(raw_value)
     return str(raw_value) if raw_value else ""
@@ -171,8 +177,12 @@ def build_form(approval_type, fields, token):
         raw = fields.get(logical_key) or fields.get(field_id) or fields.get(field_name) or ""
         if not raw and logical_key != "reason":
             raw = ""
-
-        value = _format_field_value(logical_key, raw, field_type)
+        if not raw and field_type in ("radioV2", "radio"):
+            opts = field_info.get("options", [])
+            if opts and isinstance(opts, list):
+                first = opts[0] if opts else {}
+                raw = first.get("value", "")
+        value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList") else "input"
         if logical_key in DATE_FIELDS and raw:
             ftype = "date"

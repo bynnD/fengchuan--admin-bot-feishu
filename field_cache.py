@@ -61,8 +61,29 @@ def _fetch_from_api(approval_code, token):
             field_id = item.get("id")
             field_name = item.get("name", field_id)
             field_type = item.get("type", "input")
-            if field_id:
-                fields[field_id] = {"name": field_name, "type": field_type}
+            if not field_id:
+                continue
+            info = {"name": field_name, "type": field_type}
+            if field_type == "fieldList":
+                sub_items = item.get("value", [])
+                if isinstance(sub_items, str):
+                    try:
+                        sub_items = json.loads(sub_items) if sub_items else []
+                    except json.JSONDecodeError:
+                        sub_items = []
+                info["sub_fields"] = [
+                    {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
+                    for s in sub_items if s.get("id")
+                ]
+            if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
+                opts = item.get("option", [])
+                if isinstance(opts, str):
+                    try:
+                        opts = json.loads(opts) if opts else []
+                    except json.JSONDecodeError:
+                        opts = []
+                info["options"] = opts
+            fields[field_id] = info
 
         print(f"已获取字段结构({approval_code}): {list(fields.keys())}")
         return fields
