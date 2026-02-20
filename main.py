@@ -318,6 +318,20 @@ def on_message(data):
 
 
 if __name__ == "__main__":
+    try:
+        token = get_token()
+        r = httpx.get(
+            "https://open.feishu.cn/open-apis/attendance/v1/leave_types",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"status": 1},
+            timeout=10
+        )
+        print("假期类型列表:", json.dumps(r.json(), ensure_ascii=False))
+    except Exception as e:
+        print(f"获取假期类型失败: {e}")
+
+
+    
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
