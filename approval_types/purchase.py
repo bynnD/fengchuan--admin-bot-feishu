@@ -16,7 +16,7 @@ FIELD_LABELS = {
 FIELD_ID_FALLBACK = {
     "purchase_reason": "widget16510608596030001",
     "purchase_type":   "widget16510608666360001",
-    "expected_date":   "widget16510608919180001",
+    "expected_date":   "widget16510608918180001",
     "cost_detail":     "widget16510609006710001",
 }
 

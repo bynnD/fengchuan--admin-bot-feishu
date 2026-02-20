@@ -8,7 +8,7 @@ from approval_types import (
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     get_admin_comment
 )
-from field_cache import get_form_fields, invalidate_cache
+from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
 import time
 
@@ -130,61 +130,55 @@ def analyze_message(history):
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
+def _format_field_value(logical_key, raw_value, field_type):
+    """根据控件类型格式化值。fieldList 需传数组。"""
+    if field_type == "fieldList":
+        if isinstance(raw_value, list):
+            return raw_value
+        # 简单字符串转为单行明细
+        return [{"value": str(raw_value)}] if raw_value else []
+    if logical_key in DATE_FIELDS and raw_value:
+        return f"{raw_value}T00:00:00+08:00" if "T" not in str(raw_value) else str(raw_value)
+    return str(raw_value) if raw_value else ""
+
+
 def build_form(approval_type, fields, token):
-    """根据审批类型构建表单数据。"""
+    """根据审批类型构建表单数据。按缓存中的表单顺序，使用真实控件类型。"""
     approval_code = APPROVAL_CODES[approval_type]
-
-    # 优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
-    fallback = FIELD_ID_FALLBACK.get(approval_type, {})
-    if fallback:
-        cached = get_form_fields(approval_type, approval_code, token)
-        form_list = []
-        for logical_key, real_id in fallback.items():
-            raw = fields.get(logical_key, "")
-            if not raw and logical_key != "reason":
-                continue
-            field_id = real_id
-            ftype = "input"
-            if cached:
-                for fid, finfo in cached.items():
-                    label = FIELD_LABELS.get(logical_key, logical_key)
-                    if finfo.get("name") in (logical_key, label):
-                        field_id = fid
-                        ftype = finfo.get("type", "input")
-                        break
-            if logical_key in DATE_FIELDS and raw:
-                value = f"{raw}T00:00:00+08:00" if "T" not in str(raw) else str(raw)
-                ftype = "date"
-            else:
-                value = str(raw)
-            form_list.append({"id": field_id, "type": ftype, "value": value})
-        return form_list
-
-    # 没有兜底映射时，从缓存获取字段结构自动匹配
-    cached_fields = get_form_fields(approval_type, approval_code, token)
-    if not cached_fields:
+    cached = get_form_fields(approval_type, approval_code, token)
+    if not cached:
         print(f"无法获取{approval_type}的字段结构")
         return None
 
+    fallback = FIELD_ID_FALLBACK.get(approval_type, {})
+    # 逻辑 key -> 中文名 映射，用于按名称匹配
+    name_to_key = {v: k for k, v in FIELD_LABELS.items()}
+    name_to_key.update({k: k for k in FIELD_LABELS})
+
     form_list = []
-    for field_id, field_info in cached_fields.items():
+    for field_id, field_info in cached.items():
         field_type = field_info.get("type", "input")
         field_name = field_info.get("name", "")
-        # 跳过附件、图片、说明类字段
         if field_type in ("attach", "attachV2", "image", "imageV2", "description", "attachmentV2"):
             continue
-        # 在 fields 里按 field_id、field_name 或逻辑 key 匹配值
-        logical_key = FIELD_LABELS_REVERSE.get(field_name, field_name)
-        value = fields.get(field_id) or fields.get(field_name) or fields.get(logical_key) or ""
-        if logical_key in DATE_FIELDS and value:
-            value = f"{value}T00:00:00+08:00" if "T" not in str(value) else str(value)
-        else:
-            value = str(value)
-        form_list.append({
-            "id": field_id,
-            "type": field_type if field_type in ("input", "textarea", "date", "number", "radioV2") else "input",
-            "value": value
-        })
+
+        logical_key = FIELD_LABELS_REVERSE.get(field_name, name_to_key.get(field_name, field_name))
+        if not logical_key and field_id in fallback.values():
+            for k, v in fallback.items():
+                if v == field_id:
+                    logical_key = k
+                    break
+        raw = fields.get(logical_key) or fields.get(field_id) or fields.get(field_name) or ""
+        if not raw and logical_key != "reason":
+            raw = ""
+
+        value = _format_field_value(logical_key, raw, field_type)
+        ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList") else "input"
+        if logical_key in DATE_FIELDS and raw:
+            ftype = "date"
+            value = _format_field_value(logical_key, raw, "date")
+
+        form_list.append({"id": field_id, "type": ftype, "value": value})
 
     return form_list
 
@@ -303,21 +297,36 @@ def on_message(data):
                 send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
                 replies.append(f"· {approval_type}：已整理，请点击按钮提交")
             else:
-                success, msg, resp_data = create_approval(user_id, approval_type, fields)
-                if success:
-                    instance_code = resp_data.get("instance_code", "")
-                    replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
-                    if instance_code:
-                        link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
-                        # 卡片按工单字段展示，提供查看链接
-                        card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-                        send_card_message(open_id, card_content, link, "查看工单")
+                # 预检：报备单(无审批节点) API 不支持，直接走链接流程
+                approval_code = APPROVAL_CODES[approval_type]
+                token = get_token()
+                if is_free_process(approval_code, token):
+                    link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
+                    tip = (
+                        f"【{approval_type}】\n{summary}\n\n"
+                        f"行政意见: {admin_comment}\n\n"
+                        f"该类型暂不支持自动创建，请点击下方按钮在飞书中发起（需在飞书客户端内打开）："
+                    )
+                    send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
+                    replies.append(f"· {approval_type}：已整理，请点击按钮提交")
                 else:
-                    print(f"创建审批失败[{approval_type}]: {msg}")
-                    if "free process" in msg.lower() or "unsupported approval" in msg.lower():
-                        replies.append(f"· {approval_type}：❌ 该审批类型（报备单）暂不支持 API 自动创建，请到飞书审批中手动发起。")
+                    success, msg, resp_data = create_approval(user_id, approval_type, fields)
+                    if success:
+                        instance_code = resp_data.get("instance_code", "")
+                        replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+                        if instance_code:
+                            link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
+                            card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+                            send_card_message(open_id, card_content, link, "查看工单")
                     else:
-                        replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
+                        print(f"创建审批失败[{approval_type}]: {msg}")
+                        if "free process" in msg.lower() or "unsupported approval" in msg.lower():
+                            mark_free_process(approval_code)  # 下次预检直接走链接，避免重复 API 调用
+                            link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
+                            send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n该类型暂不支持自动创建。请点击下方按钮在飞书中发起：", link, f"打开{approval_type}审批表单")
+                            replies.append(f"· {approval_type}：已整理信息，请点击卡片按钮发起")
+                        else:
+                            replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
 
         if incomplete:
             parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]
@@ -344,6 +353,7 @@ if __name__ == "__main__":
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .register_p2_im_message_message_read_v1(_on_message_read) \
+        .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_on_message_read) \
         .build()
     ws_client = lark.ws.Client(
         FEISHU_APP_ID,

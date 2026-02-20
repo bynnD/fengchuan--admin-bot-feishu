@@ -2,6 +2,20 @@
 
 每个工单类型一个文件，便于维护。
 
+## 飞书 API 支持条件
+
+新增审批前需确认以下条件，否则需设置 `LINK_ONLY = True`：
+
+**1. 流程类型**：审批定义必须有至少一个审批节点
+- 固定流程、自由流程 → 支持 API 创建
+- 报备单 / 仅报备不审批（0 审批节点）→ 不支持，返回 1390013
+
+**2. 表单控件**：不能包含以下控件类型
+- `address`（地址）、`outGroup`（外出控件组）、`leaveGroup`（请假控件组）
+- `tripGroup`（出差控件组）、`workGroup`（加班控件组）、`remedyGroup`（补卡控件组）
+
+支持：`input`、`textarea`、`date`、`radio`、`radioV2`、`number`、`amount`、`contact`、`department` 等基础控件。
+
 ## 新增工单类型
 
 1. 在本目录新建 `xxx.py`，参考现有文件结构：

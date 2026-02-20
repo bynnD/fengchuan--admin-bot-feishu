@@ -16,6 +16,7 @@ CACHE_FILE = os.path.join(
 )
 
 _memory_cache = {}
+_free_process_cache = {}  # approval_code -> bool，缓存是否为报备单
 
 
 def _load_disk_cache():
@@ -99,6 +100,11 @@ def get_form_fields(approval_type, approval_code, token):
     return None
 
 
+def mark_free_process(approval_code):
+    """创建失败 1390013 时标记为报备单，下次预检直接返回 True"""
+    _free_process_cache[approval_code] = True
+
+
 def invalidate_cache(approval_type):
     """提交失败时清除该类型的缓存，下次重新从API获取"""
     if approval_type in _memory_cache:
@@ -109,3 +115,53 @@ def invalidate_cache(approval_type):
         del disk_cache[approval_type]
         _save_disk_cache(disk_cache)
         print(f"已清除字段缓存: {approval_type}，下次将重新获取")
+
+
+def _fetch_approval_definition_full(approval_code, token):
+    """获取审批定义完整数据（含流程节点）"""
+    try:
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        data = res.json()
+        if data.get("code") != 0:
+            return None
+        return data.get("data", {})
+    except Exception as e:
+        print(f"获取审批定义异常({approval_code}): {e}")
+        return None
+
+
+def is_free_process(approval_code, token):
+    """
+    判断审批是否为报备单（仅报备不审批）。
+    报备单无审批节点，API 不支持创建，返回 1390013。
+    结果缓存于内存，避免重复请求。
+    """
+    if approval_code in _free_process_cache:
+        return _free_process_cache[approval_code]
+
+    definition = _fetch_approval_definition_full(approval_code, token)
+    if not definition:
+        _free_process_cache[approval_code] = False  # 获取失败时按非报备处理，让 create 尝试
+        return False
+
+    # node_list 可能为 JSON 字符串
+    node_list = definition.get("node_list")
+    if node_list is None:
+        _free_process_cache[approval_code] = False  # 字段缺失时按非报备处理
+        return False
+    if isinstance(node_list, str):
+        try:
+            node_list = json.loads(node_list) if node_list else []
+        except json.JSONDecodeError:
+            node_list = []
+
+    # 无审批节点或节点为空 → 报备单
+    is_free = len(node_list) == 0
+    _free_process_cache[approval_code] = is_free
+    if is_free:
+        print(f"预检: {approval_code} 为报备单(无审批节点)，将走链接流程")
+    return is_free
