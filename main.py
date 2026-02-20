@@ -317,10 +317,11 @@ def create_approval(user_id, approval_type, fields, admin_comment):
         msg = "" if ok else data.get("msg", str(data))
         return Resp(ok, msg)
     except Exception as e:
+        err_msg = str(e)
         class Resp: 
             def success(self): return False
             @property
-            def msg(self): return str(e)
+            def msg(self): return err_msg
         return Resp()
 
 def format_success_message(approval_type, fields, admin_comment):
@@ -440,6 +441,12 @@ def register_if_available(builder, method_name, func):
         return method(func)
     return builder
 
+def register_any(builder, method_names, func):
+    current = builder
+    for name in method_names:
+        current = register_if_available(current, name, func)
+    return current
+
 if __name__ == "__main__":
     if not validate_env():
         raise SystemExit(1)
@@ -447,19 +454,19 @@ if __name__ == "__main__":
     handler_builder = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message)
 
-    handler_builder = register_if_available(
+    handler_builder = register_any(
         handler_builder,
-        "register_p2_im_message_read_v1",
+        ["register_p2_im_message_read_v1", "register_im_message_read_v1"],
         on_message_read
     )
-    handler_builder = register_if_available(
+    handler_builder = register_any(
         handler_builder,
-        "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
+        ["register_p2_im_chat_access_event_bot_p2p_chat_entered_v1", "register_im_chat_access_event_bot_p2p_chat_entered_v1"],
         on_chat_access_event
     )
-    handler_builder = register_if_available(
+    handler_builder = register_any(
         handler_builder,
-        "register_p2_im_message_reaction_created_v1",
+        ["register_p2_im_message_reaction_created_v1", "register_im_message_reaction_created_v1"],
         on_reaction_created
     )
 
