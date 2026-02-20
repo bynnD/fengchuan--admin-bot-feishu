@@ -250,6 +250,17 @@ def on_message(data):
 
 
 if __name__ == "__main__":
+    # 启动时读取已有请假审批实例的表单数据
+    try:
+        token = get_token()
+        r = httpx.get(
+            "https://open.feishu.cn/open-apis/approval/v4/instances/7602425135743651018",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        print("请假实例数据:", json.dumps(r.json(), ensure_ascii=False))
+    except Exception as e:
+        print(f"读取实例失败: {e}")
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
