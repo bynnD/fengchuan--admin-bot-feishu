@@ -11,6 +11,9 @@ from approval_types import (
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
 import time
+import traceback
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
@@ -148,6 +151,16 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
     return str(raw_value) if raw_value else ""
 
 
+def _to_datetime_str(date_val):
+    """将日期值转为 'YYYY-MM-DD HH:MM:SS' 格式（dateInterval 需要）"""
+    s = str(date_val).strip()
+    if len(s) == 10:
+        return f"{s} 00:00:00"
+    if "T" in s:
+        return s.replace("T", " ").split("+")[0]
+    return s
+
+
 def build_form(approval_type, fields, token):
     """根据审批类型构建表单数据。按缓存中的表单顺序，使用真实控件类型。"""
     approval_code = APPROVAL_CODES[approval_type]
@@ -157,7 +170,6 @@ def build_form(approval_type, fields, token):
         return None
 
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
-    # 逻辑 key -> 中文名 映射，用于按名称匹配
     name_to_key = {v: k for k, v in FIELD_LABELS.items()}
     name_to_key.update({k: k for k in FIELD_LABELS})
 
@@ -166,6 +178,22 @@ def build_form(approval_type, fields, token):
         field_type = field_info.get("type", "input")
         field_name = field_info.get("name", "")
         if field_type in ("attach", "attachV2", "image", "imageV2", "description", "attachmentV2"):
+            continue
+
+        if field_type == "dateInterval":
+            start_val = fields.get("start_date") or fields.get("开始日期") or ""
+            end_val = fields.get("end_date") or fields.get("结束日期") or ""
+            if not start_val:
+                start_val = str(datetime.date.today())
+            if not end_val:
+                end_val = start_val
+            form_list.append({
+                "id": field_id,
+                "type": "dateInterval",
+                "start": _to_datetime_str(start_val),
+                "end": _to_datetime_str(end_val),
+                "interval": "1.0"
+            })
             continue
 
         logical_key = FIELD_LABELS_REVERSE.get(field_name, name_to_key.get(field_name, field_name))
@@ -194,7 +222,7 @@ def build_form(approval_type, fields, token):
                 if not raw:
                     raw = opts[0].get("value", "") if opts and isinstance(opts[0], dict) else ""
         value = _format_field_value(logical_key, raw, field_type, field_info)
-        ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList") else "input"
+        ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
         if logical_key in DATE_FIELDS and raw:
             ftype = "date"
             value = _format_field_value(logical_key, raw, "date")
@@ -336,7 +364,7 @@ def on_message(data):
                         instance_code = resp_data.get("instance_code", "")
                         replies.append(f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
                         if instance_code:
-                            link = f"https://www.feishu.cn/approval/instance/detail?instance_code={instance_code}"
+                            link = f"https://applink.feishu.cn/client/approval?tab=detail&instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
                             send_card_message(open_id, card_content, link, "查看工单")
                     else:
@@ -365,12 +393,31 @@ def on_message(data):
 
     except Exception as e:
         print(f"处理消息出错: {e}")
+        traceback.print_exc()
         if open_id:
             send_message(open_id, "系统出现异常，请稍后再试。")
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    print(f"健康检查服务已启动 :{port}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
-       
+    threading.Thread(target=_start_health_server, daemon=True).start()
+
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .register_p2_im_message_message_read_v1(_on_message_read) \
