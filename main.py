@@ -138,4 +138,115 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         return False, "不支持API提交", {}
 
     form_list = []
-    for logical_key, real_id in field_map.items(
+    for logical_key, real_id in field_map.items():
+        value = str(fields.get(logical_key, ""))
+        form_list.append({"id": real_id, "type": "input", "value": value})
+
+    form_data = json.dumps(form_list, ensure_ascii=False)
+    print(f"提交表单[{approval_type}]: {form_data}")
+
+    token = get_token()
+    res = httpx.post(
+        "https://open.feishu.cn/open-apis/approval/v4/instances",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "approval_code": approval_code,
+            "user_id": user_id,
+            "form": form_data
+        },
+        timeout=15
+    )
+    data = res.json()
+    print(f"创建审批响应: {data}")
+    return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
+
+def format_fields_summary(approval_type, fields):
+    lines = []
+    for k, v in fields.items():
+        label = FIELD_LABELS.get(k, k)
+        lines.append(f"· {label}: {v}")
+    return "\n".join(lines)
+
+def on_message(data):
+    event_id = data.header.event_id
+    if event_id in PROCESSED_EVENTS:
+        return
+    PROCESSED_EVENTS.add(event_id)
+
+    open_id = None
+    try:
+        event = data.event
+        open_id = event.sender.sender_id.open_id
+        user_id = event.sender.sender_id.user_id
+        text = json.loads(event.message.content).get("text", "").strip()
+
+        if open_id not in CONVERSATIONS:
+            CONVERSATIONS[open_id] = []
+        CONVERSATIONS[open_id].append({"role": "user", "content": text})
+        if len(CONVERSATIONS[open_id]) > 10:
+            CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+
+        result = analyze_message(CONVERSATIONS[open_id])
+        approval_type = result.get("approval_type")
+        fields = result.get("fields", {})
+        missing = result.get("missing", [])
+        unclear = result.get("unclear", "")
+
+        if not approval_type:
+            types = "、".join(APPROVAL_CODES.keys())
+            reply = unclear if unclear else f"你好！我可以帮你提交以下审批：\n{types}\n\n请告诉我你需要办理哪种？"
+            send_message(open_id, reply)
+            CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
+            return
+
+        if missing:
+            missing_text = "、".join([FIELD_LABELS.get(m, m) for m in missing])
+            reply = f"还需要以下信息才能提交{approval_type}申请：\n{missing_text}"
+            send_message(open_id, reply)
+            CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
+            return
+
+        admin_comment = get_admin_comment(approval_type, fields)
+        summary = format_fields_summary(approval_type, fields)
+
+        if approval_type in LINK_ONLY_TYPES:
+            approval_code = APPROVAL_CODES[approval_type]
+            link = build_approval_link(approval_code)
+            tip = (
+                f"已为你整理好{approval_type}信息：\n{summary}\n\n"
+                f"💡 行政意见: {admin_comment}\n\n"
+                f"由于该审批包含特殊控件，需要你点击下方按钮前往飞书审批页面完成提交："
+            )
+            send_link_message(open_id, tip, link, approval_type)
+            CONVERSATIONS[open_id] = []
+        else:
+            success, msg, _ = create_approval_api(user_id, approval_type, fields, admin_comment)
+            if success:
+                reply = (
+                    f"✅ 已为你提交{approval_type}申请！\n{summary}\n\n"
+                    f"💡 行政意见: {admin_comment}\n"
+                    f"等待主管审批即可。"
+                )
+                send_message(open_id, reply)
+                CONVERSATIONS[open_id] = []
+            else:
+                print(f"创建审批失败: {msg}")
+                send_message(open_id, f"提交失败：{msg}")
+
+    except Exception as e:
+        print(f"处理消息出错: {e}")
+        if open_id:
+            send_message(open_id, "系统出现异常，请稍后再试。")
+
+if __name__ == "__main__":
+    handler = lark.EventDispatcherHandler.builder("", "") \
+        .register_p2_im_message_receive_v1(on_message) \
+        .build()
+    ws_client = lark.ws.Client(
+        FEISHU_APP_ID,
+        FEISHU_APP_SECRET,
+        event_handler=handler,
+        log_level=lark.LogLevel.INFO
+    )
+    print("🚀 飞书审批机器人已启动...")
+    ws_client.start()
