@@ -2,8 +2,8 @@ import os
 import json
 import httpx
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import *
-from lark_oapi.api.approval.v4 import *
+from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.approval.v4 import CreateInstanceRequest, CreateInstanceRequestBody
 from approval_config import APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import get_admin_comment
 
