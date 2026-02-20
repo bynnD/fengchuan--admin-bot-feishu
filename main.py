@@ -5,7 +5,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_config import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP
+    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP,
+    APPROVAL_GROUP_WIDGET_IDS, APPROVAL_GROUP_MAPPING_RULES, APPROVAL_FLAT_MAPPING_RULES
 )
 from rules_config import get_admin_comment
 import datetime
@@ -18,6 +19,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 PROCESSED_EVENTS = set()
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
+_approval_definition_cache = {"data": {}, "expires_at": {}}
 
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
@@ -38,6 +40,195 @@ def get_token():
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
+
+
+def _fetch_approval_definition(approval_code):
+    now = time.time()
+    cached = _approval_definition_cache["data"].get(approval_code)
+    expires_at = _approval_definition_cache["expires_at"].get(approval_code, 0)
+    if cached is not None and now < expires_at:
+        return cached
+    try:
+        token = get_token()
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        data = res.json()
+        if data.get("code") != 0:
+            return None
+        payload = data.get("data", {})
+        approval = payload.get("approval", payload)
+        form_schema = approval.get("form") or payload.get("form")
+        if not form_schema:
+            return None
+        if isinstance(form_schema, str):
+            form_schema = json.loads(form_schema)
+        _approval_definition_cache["data"][approval_code] = form_schema
+        _approval_definition_cache["expires_at"][approval_code] = now + 600
+        return form_schema
+    except Exception:
+        return None
+
+
+def _normalize_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ["text", "content", "name", "label", "title", "value"]:
+            if key in value:
+                return _normalize_text(value[key])
+        return ""
+    if isinstance(value, list):
+        return " ".join([_normalize_text(v) for v in value if _normalize_text(v)])
+    return str(value)
+
+
+def _collect_widgets(node, widgets):
+    if isinstance(node, dict):
+        if "id" in node and "type" in node:
+            widgets.append(node)
+        for v in node.values():
+            _collect_widgets(v, widgets)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_widgets(item, widgets)
+
+
+def _extract_widget_label(widget):
+    for key in ["name", "label", "title", "text", "display_name", "desc", "placeholder"]:
+        if key in widget:
+            label = _normalize_text(widget.get(key)).strip()
+            if label:
+                return label
+    return ""
+
+
+def _get_child_widgets(group_widget):
+    for key in ["children", "sub_widgets", "widgets", "items", "fields", "controls", "elements"]:
+        val = group_widget.get(key)
+        if isinstance(val, list) and any(isinstance(i, dict) and "id" in i for i in val):
+            return val
+    widgets = []
+    _collect_widgets(group_widget, widgets)
+    group_id = group_widget.get("id")
+    return [w for w in widgets if w is not group_widget and w.get("id") != group_id]
+
+
+def _build_label_mapping(child_widgets, mapping_rules):
+    mapping = {}
+    for widget in child_widgets:
+        label = _extract_widget_label(widget)
+        if not label:
+            continue
+        for logical_key, keywords in mapping_rules.items():
+            if logical_key in mapping:
+                continue
+            if any(k in label for k in keywords):
+                mapping[logical_key] = widget
+    return mapping
+
+
+def _extract_options(widget):
+    for key in ["options", "option", "select_options", "values", "items"]:
+        val = widget.get(key)
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return val
+    return []
+
+
+def _match_option_id(options, desired):
+    for opt in options:
+        label = _normalize_text(
+            opt.get("name") or opt.get("label") or opt.get("text") or opt.get("value") or opt.get("title")
+        )
+        if not label:
+            continue
+        if desired == label or desired in label:
+            return opt.get("id") or opt.get("value") or opt.get("key")
+    return None
+
+
+def _format_widget_value(widget, logical_key, value):
+    if value is None:
+        return ""
+    widget_type = str(widget.get("type", "")).lower()
+    if logical_key in ["start_date", "end_date"] or logical_key.endswith("_date") or widget_type in ["date", "datetime", "date_time"]:
+        return f"{value}T00:00:00+08:00"
+    if logical_key == "days":
+        return str(value)
+    options = _extract_options(widget)
+    option_id = _match_option_id(options, str(value)) if options else None
+    if option_id is not None:
+        return option_id
+    return str(value)
+
+
+def _build_group_value_from_definition(approval_code, group_widget_id, field_values, mapping_rules, approval_type):
+    form_schema = _fetch_approval_definition(approval_code)
+    if not form_schema:
+        return None
+    widgets = []
+    _collect_widgets(form_schema, widgets)
+    group_widget = next((w for w in widgets if w.get("id") == group_widget_id), None)
+    if not group_widget:
+        return None
+    child_widgets = _get_child_widgets(group_widget)
+    if not child_widgets:
+        return None
+    mapping = _build_label_mapping(child_widgets, mapping_rules)
+    if not mapping:
+        return None
+    if approval_type == "外出" and "destination" not in mapping and "reason" in mapping:
+        combined = f"{field_values.get('destination', '')} {field_values.get('reason', '')}".strip()
+        field_values = dict(field_values)
+        field_values["reason"] = combined
+    group_value = {}
+    for logical_key, widget in mapping.items():
+        if logical_key not in field_values:
+            continue
+        value = field_values.get(logical_key, "")
+        if value == "" and logical_key not in ["reason"]:
+            continue
+        widget_id = widget.get("id")
+        if not widget_id:
+            continue
+        group_value[widget_id] = _format_widget_value(widget, logical_key, value)
+    return group_value or None
+
+
+def _build_flat_form_from_definition(approval_code, field_values, mapping_rules):
+    form_schema = _fetch_approval_definition(approval_code)
+    if not form_schema:
+        return None
+    widgets = []
+    _collect_widgets(form_schema, widgets)
+    leaf_widgets = []
+    for widget in widgets:
+        if not widget.get("id") or not widget.get("type"):
+            continue
+        if _get_child_widgets(widget):
+            continue
+        leaf_widgets.append(widget)
+    mapping = _build_label_mapping(leaf_widgets, mapping_rules)
+    if not mapping:
+        return None
+    form_list = []
+    for logical_key, widget in mapping.items():
+        if logical_key not in field_values:
+            continue
+        value = field_values.get(logical_key, "")
+        if value == "" and logical_key not in ["reason"]:
+            continue
+        widget_id = widget.get("id")
+        widget_type = widget.get("type", "input")
+        form_list.append({
+            "id": widget_id,
+            "type": widget_type,
+            "value": _format_widget_value(widget, logical_key, value)
+        })
+    return form_list or None
 
 
 def send_message(open_id, text):
@@ -145,10 +336,26 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         days = str(fields.get("days", "1"))
         leave_type = fields.get("leave_type", "事假")
         reason = fields.get("reason", "")
+        leave_field_values = {
+            "start_date": start,
+            "end_date": end,
+            "days": days,
+            "leave_type": leave_type,
+            "reason": reason
+        }
+        leave_mapping_rules = APPROVAL_GROUP_MAPPING_RULES.get(approval_type, {})
+        group_widget_id = APPROVAL_GROUP_WIDGET_IDS.get(approval_type, "widgetLeaveGroupV2")
+        group_value = _build_group_value_from_definition(
+            approval_code,
+            group_widget_id,
+            leave_field_values,
+            leave_mapping_rules,
+            approval_type
+        )
         form_list = [{
-            "id": "widgetLeaveGroupV2",
-            "type": "group",
-            "value": {
+            "id": group_widget_id,
+            "type": "leaveGroupV2",
+            "value": group_value if group_value else {
                 "end": f"{end}T00:00:00+08:00",
                 "start": f"{start}T00:00:00+08:00",
                 "interval": days,
@@ -162,10 +369,25 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         end = fields.get("end_date", start)
         reason = fields.get("reason", "")
         destination = fields.get("destination", "")
+        out_field_values = {
+            "start_date": start,
+            "end_date": end,
+            "destination": destination,
+            "reason": reason
+        }
+        out_mapping_rules = APPROVAL_GROUP_MAPPING_RULES.get(approval_type, {})
+        group_widget_id = APPROVAL_GROUP_WIDGET_IDS.get(approval_type, "widgetOutGroup")
+        group_value = _build_group_value_from_definition(
+            approval_code,
+            group_widget_id,
+            out_field_values,
+            out_mapping_rules,
+            approval_type
+        )
         form_list = [{
-            "id": "widgetOutGroup",
-            "type": "group",
-            "value": {
+            "id": group_widget_id,
+            "type": "outGroup",
+            "value": group_value if group_value else {
                 "end": f"{end}T00:00:00+08:00",
                 "start": f"{start}T00:00:00+08:00",
                 "reason": f"{destination} {reason}".strip()
@@ -173,18 +395,36 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
         }]
 
     elif approval_type == "采购申请":
-        field_map = PURCHASE_FIELD_MAP
-        form_list = []
-        for logical_key, real_id in field_map.items():
-            value = str(fields.get(logical_key, ""))
-            form_list.append({"id": real_id, "type": "input", "value": value})
+        purchase_mapping_rules = APPROVAL_FLAT_MAPPING_RULES.get(approval_type, {})
+        purchase_form_list = _build_flat_form_from_definition(
+            approval_code,
+            fields,
+            purchase_mapping_rules
+        )
+        if purchase_form_list:
+            form_list = purchase_form_list
+        else:
+            field_map = PURCHASE_FIELD_MAP
+            form_list = []
+            for logical_key, real_id in field_map.items():
+                value = str(fields.get(logical_key, ""))
+                form_list.append({"id": real_id, "type": "input", "value": value})
 
     elif approval_type == "用印申请":
-        field_map = SEAL_FIELD_MAP
-        form_list = []
-        for logical_key, real_id in field_map.items():
-            value = str(fields.get(logical_key, ""))
-            form_list.append({"id": real_id, "type": "input", "value": value})
+        seal_mapping_rules = APPROVAL_FLAT_MAPPING_RULES.get(approval_type, {})
+        seal_form_list = _build_flat_form_from_definition(
+            approval_code,
+            fields,
+            seal_mapping_rules
+        )
+        if seal_form_list:
+            form_list = seal_form_list
+        else:
+            field_map = SEAL_FIELD_MAP
+            form_list = []
+            for logical_key, real_id in field_map.items():
+                value = str(fields.get(logical_key, ""))
+                form_list.append({"id": real_id, "type": "input", "value": value})
 
     else:
         return False, "不支持API提交", {}

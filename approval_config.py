@@ -20,6 +20,43 @@ APPROVAL_FIELD_HINTS = {
     "入职审批": "name(姓名), department(部门), position(职位), entry_date(YYYY-MM-DD)",
 }
 
+# 审批表单字段关键词匹配规则
+APPROVAL_GROUP_WIDGET_IDS = {
+    "请假": "widgetLeaveGroupV2",
+    "外出": "widgetOutGroup",
+}
+
+APPROVAL_GROUP_MAPPING_RULES = {
+    "请假": {
+        "start_date": ["开始"],
+        "end_date": ["结束"],
+        "days": ["时长", "天数"],
+        "leave_type": ["假期类型", "请假类型", "类型"],
+        "reason": ["原因", "事由", "备注"]
+    },
+    "外出": {
+        "start_date": ["开始"],
+        "end_date": ["结束"],
+        "destination": ["地点", "目的地"],
+        "reason": ["原因", "事由", "备注"]
+    }
+}
+
+APPROVAL_FLAT_MAPPING_RULES = {
+    "采购申请": {
+        "purchase_reason": ["采购事由", "事由"],
+        "purchase_type": ["采购类别", "类别", "类型"],
+        "expected_date": ["期望交付", "交付时间", "期望时间"],
+        "cost_detail": ["费用明细", "费用", "金额"]
+    },
+    "用印申请": {
+        "seal_type": ["印章类型", "用印类型", "印章"],
+        "usage_date": ["用印日期", "日期"],
+        "document_name": ["文件名称", "文件名"],
+        "reason": ["原因", "事由", "备注"]
+    }
+}
+
 # 字段中文显示名
 FIELD_LABELS = {
     "leave_type":     "假期类型",
