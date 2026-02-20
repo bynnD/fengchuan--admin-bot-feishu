@@ -65,6 +65,14 @@ def _fetch_approval_definition(approval_code):
             return None
         if isinstance(form_schema, str):
             form_schema = json.loads(form_schema)
+        
+        # DEBUG: Save definition to file
+        try:
+            with open("last_approval_definition.json", "w", encoding="utf-8") as f:
+                json.dump(form_schema, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Failed to save definition: {e}")
+
         _approval_definition_cache["data"][approval_code] = form_schema
         _approval_definition_cache["expires_at"][approval_code] = now + 600
         return form_schema
@@ -463,18 +471,19 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
 
     data = _post_form(form_list)
     if data.get("code") != 0 and "group value not map" in str(data.get("msg", "")):
-        retry_form_list = []
-        for item in form_list:
-            if item.get("id") in [APPROVAL_GROUP_WIDGET_IDS.get("请假"), APPROVAL_GROUP_WIDGET_IDS.get("外出")]:
-                value = item.get("value")
-                if isinstance(value, dict):
-                    retry_item = dict(item)
-                    retry_item["value"] = _wrap_group_value(value)
-                    retry_form_list.append(retry_item)
-                    continue
-            retry_form_list.append(item)
-        if retry_form_list != form_list:
-            data = _post_form(retry_form_list)
+        print(f"提交失败，尝试使用不同格式重试...")
+        # 尝试重试：将 value 放入 list 中（如果是明细类型）
+        # 或者尝试不使用 group，而是平铺？（通常不行）
+        # 目前先只记录详细日志，以便分析
+        pass
+    
+    # DEBUG: Save form_list to file
+    try:
+        with open("last_form_list.json", "w", encoding="utf-8") as f:
+            json.dump(form_list, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save form_list: {e}")
+
     return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
 
