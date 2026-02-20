@@ -447,6 +447,29 @@ def register_any(builder, method_names, func):
         current = register_if_available(current, name, func)
     return current
 
+def register_event_type(builder, method_names, event_type, func):
+    current = builder
+    for name in method_names:
+        method = getattr(current, name, None)
+        if not method:
+            continue
+        try:
+            current = method(event_type, func)
+            continue
+        except TypeError:
+            try:
+                current = method(event_type=event_type, func=func)
+                continue
+            except Exception:
+                try:
+                    current = method(func)
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return current
+
 if __name__ == "__main__":
     if not validate_env():
         raise SystemExit(1)
@@ -456,7 +479,7 @@ if __name__ == "__main__":
 
     handler_builder = register_any(
         handler_builder,
-        ["register_p2_im_message_read_v1", "register_im_message_read_v1"],
+        ["register_p2_im_message_read_v1", "register_im_message_read_v1", "register_im_message_message_read_v1"],
         on_message_read
     )
     handler_builder = register_any(
@@ -468,6 +491,13 @@ if __name__ == "__main__":
         handler_builder,
         ["register_p2_im_message_reaction_created_v1", "register_im_message_reaction_created_v1"],
         on_reaction_created
+    )
+
+    handler_builder = register_event_type(
+        handler_builder,
+        ["register_event_callback", "register_event_handler", "register_callback", "register_event"],
+        "im.message.message_read_v1",
+        on_message_read
     )
 
     handler = handler_builder.build()
