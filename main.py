@@ -3,9 +3,9 @@ import json
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-from lark_oapi.api.approval.v4 import CreateInstanceRequest, CreateInstanceRequestBody
 from approval_config import APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS
 from rules_config import get_admin_comment
+import datetime
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
@@ -13,11 +13,27 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 PROCESSED_EVENTS = set()
 CONVERSATIONS = {}
+_token_cache = {"token": None, "expires_at": 0}
 
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
     .app_secret(FEISHU_APP_SECRET) \
     .build()
+
+def get_token():
+    import time
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
+        return _token_cache["token"]
+    res = httpx.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+        timeout=10
+    )
+    data = res.json()
+    _token_cache["token"] = data["tenant_access_token"]
+    _token_cache["expires_at"] = now + data.get("expire", 7200)
+    return _token_cache["token"]
 
 def send_message(open_id, text):
     body = CreateMessageRequestBody.builder() \
@@ -36,8 +52,9 @@ def send_message(open_id, text):
 def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
     field_hints = "\n".join([f"{k}: {v}" for k, v in APPROVAL_FIELD_HINTS.items()])
+    today = datetime.date.today()
     system_prompt = (
-        f"你是一个行政助理，帮员工提交审批申请。今天是{__import__('datetime').date.today()}。\n"
+        f"你是一个行政助理，帮员工提交审批申请。今天是{today}。\n"
         f"可处理的审批类型：\n{approval_list}\n\n"
         f"各类型需要的字段：\n{field_hints}\n\n"
         f"重要规则：\n"
@@ -68,7 +85,6 @@ def analyze_message(history):
         )
         res.raise_for_status()
         data = res.json()
-        print(f"DeepSeek响应: {data}")
         return json.loads(data["choices"][0]["message"]["content"])
     except Exception as e:
         print(f"AI分析失败: {e}")
@@ -82,15 +98,20 @@ def create_approval(user_id, approval_type, fields, admin_comment):
         [{"id": k, "type": "input", "value": str(v)} for k, v in all_fields.items()],
         ensure_ascii=False
     )
-    body = CreateInstanceRequestBody.builder() \
-        .approval_code(approval_code) \
-        .user_id(user_id) \
-        .form(form_data) \
-        .build()
-    request = CreateInstanceRequest.builder() \
-        .request_body(body) \
-        .build()
-    return client.approval.v4.instance.create(request)
+    token = get_token()
+    res = httpx.post(
+        "https://open.feishu.cn/open-apis/approval/v4/instances",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "approval_code": approval_code,
+            "user_id": user_id,
+            "form": form_data
+        },
+        timeout=15
+    )
+    data = res.json()
+    print(f"创建审批响应: {data}")
+    return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
 def format_success_message(approval_type, fields, admin_comment):
     lines = [f"✅ 已为你提交{approval_type}申请！"]
@@ -141,14 +162,14 @@ def on_message(data):
             return
 
         admin_comment = get_admin_comment(approval_type, fields)
-        resp = create_approval(user_id, approval_type, fields, admin_comment)
-        if resp.success():
+        success, msg, result_data = create_approval(user_id, approval_type, fields, admin_comment)
+        if success:
             reply = format_success_message(approval_type, fields, admin_comment)
             send_message(open_id, reply)
             CONVERSATIONS[open_id] = []
         else:
-            print(f"创建审批失败: {resp.msg}")
-            send_message(open_id, f"提交失败，错误信息：{resp.msg}")
+            print(f"创建审批失败: {msg}")
+            send_message(open_id, f"提交失败，错误信息：{msg}")
 
     except Exception as e:
         print(f"处理消息出错: {e}")
