@@ -58,9 +58,6 @@ def _fetch_from_api(approval_code, token):
             field_type = item.get("type", "input")
             if field_id:
                 fields[field_id] = {"name": field_name, "type": field_type}
-                # 如果是 leaveGroupV2 类型，打印完整结构以便调试
-                if field_type == "leaveGroupV2":
-                    print(f"找到 leaveGroupV2 字段: {field_id}, 完整结构: {json.dumps(item, ensure_ascii=False, indent=2)}")
 
         print(f"已获取字段结构({approval_code}): {list(fields.keys())}")
         return fields

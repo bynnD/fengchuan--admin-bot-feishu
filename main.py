@@ -127,88 +127,10 @@ def analyze_message(history):
 def build_form(approval_type, fields, token):
     """
     根据缓存的字段结构构建表单。
-    请假/外出使用特殊控件格式（从真实实例验证的格式）。
-    其他类型用通用字段映射。
+    注意：请假(leaveGroupV2)、外出(outGroup) 等控件类型不支持 API 创建，
+    已在 LINK_ONLY_TYPES 中配置为跳转模式，不会走到此函数。
     """
     approval_code = APPROVAL_CODES[approval_type]
-
-    if approval_type == "请假":
-        # 先获取真实的字段结构，找到 leaveGroupV2 控件的真实 ID
-        cached_fields = get_form_fields(approval_type, approval_code, token)
-        leave_field_id = "widgetLeaveGroupV2"
-        if cached_fields:
-            # 查找 leaveGroupV2 类型的字段
-            for field_id, field_info in cached_fields.items():
-                if field_info.get("type") == "leaveGroupV2":
-                    leave_field_id = field_id
-                    print(f"找到请假控件ID: {leave_field_id}")
-                    break
-        
-        start_date = fields.get("start_date", "")
-        end_date = fields.get("end_date", start_date)
-        days = fields.get("days", 1)
-        days_str = str(days)
-        leave_type = fields.get("leave_type", "事假")
-        reason = fields.get("reason", "")
-        
-        # 半天假从中午12点开始，整天从00:00开始
-        try:
-            is_half_day = float(days) <= 0.5
-        except:
-            is_half_day = False
-        
-        # 根据真实字段结构，leaveGroupV2 的 value 是一个对象，键为子字段 ID
-        # 子字段：
-        #   widgetLeaveGroupType       (radioV2)  - 假期类型
-        #   widgetLeaveGroupStartTime  (date)     - 开始时间, 格式 "YYYY-MM-DD hh:mm"
-        #   widgetLeaveGroupEndTime    (date)     - 结束时间, 格式 "YYYY-MM-DD hh:mm"
-        #   widgetLeaveGroupInterval   (radioV2)  - 时长
-        #   widgetLeaveGroupUnit       (radioV2)  - 请假单位 DAY/HOUR
-        #   widgetLeaveGroupReason     (textarea) - 请假事由
-        #   widgetLeaveGroupFeedingArrivingLate (radioV2) - 上班晚到（分钟）
-        
-        if is_half_day:
-            start_time = f"{start_date} 12:00"
-            end_time = f"{end_date} 18:00"
-        else:
-            start_time = f"{start_date} 00:00"
-            end_time = f"{end_date} 23:59"
-        
-        value_obj = {
-            "widgetLeaveGroupType": leave_type,
-            "widgetLeaveGroupStartTime": start_time,
-            "widgetLeaveGroupEndTime": end_time,
-            "widgetLeaveGroupInterval": days_str,
-            "widgetLeaveGroupUnit": "DAY",
-            "widgetLeaveGroupReason": reason,
-            "widgetLeaveGroupFeedingArrivingLate": "0"
-        }
-        
-        value_str = json.dumps(value_obj, ensure_ascii=False)
-        print(f"请假表单 value: {value_str}")
-        
-        return [{
-            "id": leave_field_id,
-            "type": "leaveGroupV2",
-            "value": value_str
-        }]
-
-    if approval_type == "外出":
-        start = fields.get("start_date", "")
-        end = fields.get("end_date", start)
-        destination = fields.get("destination", "")
-        reason = fields.get("reason", "")
-        # value格式来自真实审批实例
-        out_value = {
-            "end": f"{end}T00:00:00+08:00",
-            "start": f"{start}T00:00:00+08:00",
-            "reason": f"{destination} {reason}".strip()
-        }
-        return [{
-            "id": "widgetOutGroup",
-            "type": "outGroup",
-            "value": json.dumps(out_value, ensure_ascii=False)
-        }]
 
     # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
@@ -329,13 +251,14 @@ def on_message(data):
 
         if approval_type in LINK_ONLY_TYPES:
             approval_code = APPROVAL_CODES[approval_type]
-            link = f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}"
+            # 使用飞书 applink 协议，在飞书客户端内直接打开审批发起页面
+            link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
             tip = (
                 f"已为你整理好{approval_type}信息：\n{summary}\n\n"
                 f"行政意见: {admin_comment}\n\n"
-                f"请点击下方按钮前往飞书审批页面完成提交："
+                f"请点击下方按钮，在飞书中打开审批表单并提交："
             )
-            send_card_message(open_id, tip, link, f"前往提交{approval_type}申请")
+            send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
             CONVERSATIONS[open_id] = []
             return
 

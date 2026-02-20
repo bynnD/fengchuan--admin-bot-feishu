@@ -10,8 +10,11 @@ APPROVAL_CODES = {
 }
 
 # 只用链接跳转、不能API直接提交的审批类型
-# 原因：含有证件照片等附件必填字段，只能在飞书客户端手动提交
-LINK_ONLY_TYPES = {"入职审批"}
+# 原因：
+#   - 入职审批：含有证件照片等附件必填字段，只能在飞书客户端手动提交
+#   - 请假/外出：使用 leaveGroupV2/outGroup 控件，飞书开放平台 API 明确不支持创建
+#     (官方文档: 请假控件组 leaveGroup、外出控件组 outGroup 属于不支持开放平台创建的类型)
+LINK_ONLY_TYPES = {"入职审批", "请假", "外出"}
 
 # AI提取信息时的字段提示（告诉AI每种审批需要收集哪些字段）
 APPROVAL_FIELD_HINTS = {
