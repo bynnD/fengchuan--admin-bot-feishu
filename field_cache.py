@@ -9,7 +9,11 @@ import json
 import os
 import httpx
 
-CACHE_FILE = "/app/field_cache.json"
+# 优先使用 /app（Docker），否则用项目目录
+CACHE_FILE = os.path.join(
+    "/app" if os.path.exists("/app") else os.path.dirname(os.path.abspath(__file__)),
+    "field_cache.json"
+)
 
 _memory_cache = {}
 

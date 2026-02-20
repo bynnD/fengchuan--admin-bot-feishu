@@ -3,11 +3,11 @@ import json
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-from approval_config import (
+from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
-    LINK_ONLY_TYPES, FIELD_ID_FALLBACK, DATE_FIELDS
+    LINK_ONLY_TYPES, FIELD_ID_FALLBACK, DATE_FIELDS, FIELD_LABELS_REVERSE,
+    get_admin_comment
 )
-from rules_config import get_admin_comment
 from field_cache import get_form_fields, invalidate_cache
 import datetime
 import time
@@ -97,11 +97,9 @@ def analyze_message(history):
         f"重要规则：\n"
         f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
         f"2. 明天、后天、下周一等换算成具体日期(YYYY-MM-DD)\n"
-        f"3. 两个小时、半天等时长，days填0.5，start_date和end_date填同一天\n"
-        f"4. 去看病、身体不舒服等明显是病假，leave_type直接填病假\n"
-        f"5. 只有真的无法推断的字段才放入missing\n"
-        f"6. reason可根据上下文推断，实在没有才列为missing\n"
-        f"7. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n\n"
+        f"3. 只有真的无法推断的字段才放入missing\n"
+        f"4. reason可根据上下文推断，实在没有才列为missing\n"
+        f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n\n"
         f"返回JSON：\n"
         f"- requests: 数组，每项含 approval_type、fields、missing\n"
         f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
@@ -132,124 +130,11 @@ def analyze_message(history):
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
-def _build_leave_form(fields, approval_code, token):
-    """
-    构建请假表单。leaveGroupV2 的 value 是嵌套 map：
-    每个子字段的值本身也是一个 {id, type, value} 对象。
-    """
-    cached_fields = get_form_fields("请假", approval_code, token)
-    leave_field_id = "widgetLeaveGroupV2"
-    if cached_fields:
-        for fid, finfo in cached_fields.items():
-            if finfo.get("type") == "leaveGroupV2":
-                leave_field_id = fid
-                break
-
-    start_date = fields.get("start_date", "")
-    end_date = fields.get("end_date", start_date)
-    days = fields.get("days", 1)
-    leave_type = fields.get("leave_type", "事假")
-    reason = fields.get("reason", "")
-
-    try:
-        is_half_day = float(days) <= 0.5
-    except (ValueError, TypeError):
-        is_half_day = False
-
-    if is_half_day:
-        start_time = f"{start_date}T12:00:00+08:00"
-        end_time = f"{end_date}T18:00:00+08:00"
-    else:
-        start_time = f"{start_date}T00:00:00+08:00"
-        end_time = f"{end_date}T23:59:00+08:00"
-
-    # 每个子字段值是一个 map，包含 id/type/value
-    value_map = {
-        "widgetLeaveGroupType": {
-            "id": "widgetLeaveGroupType",
-            "type": "radioV2",
-            "value": leave_type
-        },
-        "widgetLeaveGroupStartTime": {
-            "id": "widgetLeaveGroupStartTime",
-            "type": "date",
-            "value": start_time
-        },
-        "widgetLeaveGroupEndTime": {
-            "id": "widgetLeaveGroupEndTime",
-            "type": "date",
-            "value": end_time
-        },
-        "widgetLeaveGroupInterval": {
-            "id": "widgetLeaveGroupInterval",
-            "type": "radioV2",
-            "value": str(days)
-        },
-        "widgetLeaveGroupUnit": {
-            "id": "widgetLeaveGroupUnit",
-            "type": "radioV2",
-            "value": "DAY"
-        },
-        "widgetLeaveGroupReason": {
-            "id": "widgetLeaveGroupReason",
-            "type": "textarea",
-            "value": reason
-        },
-        "widgetLeaveGroupFeedingArrivingLate": {
-            "id": "widgetLeaveGroupFeedingArrivingLate",
-            "type": "radioV2",
-            "value": "0"
-        }
-    }
-
-    print(f"请假表单 value_map: {json.dumps(value_map, ensure_ascii=False)}")
-
-    return [{
-        "id": leave_field_id,
-        "type": "leaveGroupV2",
-        "value": value_map
-    }]
-
-
-def _build_out_form(fields, approval_code, token):
-    """构建外出表单。outGroup 使用类似的嵌套 map 格式。"""
-    cached_fields = get_form_fields("外出", approval_code, token)
-    out_field_id = "widgetOutGroup"
-    if cached_fields:
-        for fid, finfo in cached_fields.items():
-            if finfo.get("type") == "outGroup":
-                out_field_id = fid
-                break
-
-    start = fields.get("start_date", "")
-    end = fields.get("end_date", start)
-    destination = fields.get("destination", "")
-    reason = fields.get("reason", "")
-
-    value_map = {
-        "start": f"{start}T00:00:00+08:00",
-        "end": f"{end}T00:00:00+08:00",
-        "reason": f"{destination} {reason}".strip()
-    }
-
-    return [{
-        "id": out_field_id,
-        "type": "outGroup",
-        "value": value_map
-    }]
-
-
 def build_form(approval_type, fields, token):
     """根据审批类型构建表单数据。"""
     approval_code = APPROVAL_CODES[approval_type]
 
-    if approval_type == "请假":
-        return _build_leave_form(fields, approval_code, token)
-
-    if approval_type == "外出":
-        return _build_out_form(fields, approval_code, token)
-
-    # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
+    # 优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
     fallback = FIELD_ID_FALLBACK.get(approval_type, {})
     if fallback:
         cached = get_form_fields(approval_type, approval_code, token)
@@ -288,12 +173,17 @@ def build_form(approval_type, fields, token):
         # 跳过附件、图片、说明类字段
         if field_type in ("attach", "attachV2", "image", "imageV2", "description", "attachmentV2"):
             continue
-        # 在 fields 里按 field_id 或 field_name 匹配值
-        value = fields.get(field_id) or fields.get(field_name) or ""
+        # 在 fields 里按 field_id、field_name 或逻辑 key 匹配值
+        logical_key = FIELD_LABELS_REVERSE.get(field_name, field_name)
+        value = fields.get(field_id) or fields.get(field_name) or fields.get(logical_key) or ""
+        if logical_key in DATE_FIELDS and value:
+            value = f"{value}T00:00:00+08:00" if "T" not in str(value) else str(value)
+        else:
+            value = str(value)
         form_list.append({
             "id": field_id,
-            "type": field_type if field_type in ("input", "textarea", "date", "number") else "input",
-            "value": str(value)
+            "type": field_type if field_type in ("input", "textarea", "date", "number", "radioV2") else "input",
+            "value": value
         })
 
     return form_list
