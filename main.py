@@ -68,7 +68,7 @@ def upload_approval_file(file_name, file_content):
     try:
         token = get_token()
         res = httpx.post(
-            "https://open.feishu.cn/open-apis/approval/openapi/v2/file/upload",
+            "https://open.feishu.cn/open-apis/approval/v4/files/upload",
             headers={"Authorization": f"Bearer {token}"},
             data={"name": file_name, "type": "attachment"},
             files={"content": (file_name, file_content)},
@@ -118,17 +118,19 @@ def send_message(open_id, text):
         print(f"发送消息失败: {resp.msg}")
 
 
-def send_card_message(open_id, text, url, btn_label):
+def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
+    """发送卡片消息。use_desktop_link=True 时，PC 端用 lark:// 在桌面客户端打开，避免跳浏览器"""
+    if use_desktop_link and "instanceCode=" in url:
+        https_url = url.replace("lark://", "https://", 1) if url.startswith("lark://") else url
+        lark_url = "lark://" + https_url[8:] if https_url.startswith("https://") else url
+        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": lark_url}}
+    else:
+        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     card = {
         "config": {"wide_screen_mode": True},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-            {"tag": "action", "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": btn_label},
-                "type": "primary",
-                "url": url
-            }]}
+            {"tag": "action", "actions": [btn_config]}
         ]
     }
     body = CreateMessageRequestBody.builder() \
@@ -659,9 +661,9 @@ def _try_complete_seal(open_id, user_id, text):
     if success:
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
-            link = f"lark://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
             card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-            send_card_message(open_id, card_content, link, "查看工单")
+            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
         else:
             send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
     else:
@@ -783,9 +785,9 @@ def on_message(data):
                     if success:
                         instance_code = resp_data.get("instance_code", "")
                         if instance_code:
-                            link = f"lark://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                             card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-                            send_card_message(open_id, card_content, link, "查看工单")
+                            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
                             # 已发卡片，不再重复发送文字详情
                         else:
                             replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
