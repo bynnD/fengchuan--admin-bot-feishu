@@ -3,7 +3,10 @@ import json
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-from approval_config import APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS
+from approval_config import (
+    APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
+    LINK_ONLY_TYPES, PURCHASE_FIELD_MAP, SEAL_FIELD_MAP
+)
 from rules_config import get_admin_comment
 import datetime
 import time
@@ -15,9 +18,6 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 PROCESSED_EVENTS = set()
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
-
-# 存储每种审批的真实字段ID：{approval_type: {field_id: field_name}}
-APPROVAL_REAL_FIELDS = {}
 
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
@@ -38,29 +38,6 @@ def get_token():
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
 
-def get_approval_form_fields(approval_type, approval_code):
-    token = get_token()
-    res = httpx.get(
-        f"https://open.feishu.cn/open-apis/approval/v4/approvals/{approval_code}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10
-    )
-    data = res.json()
-    if data.get("code") != 0:
-        print(f"获取审批定义失败[{approval_type}]: {data}")
-        return {}
-    form_str = data.get("data", {}).get("form", "[]")
-    form = json.loads(form_str)
-    fields = {}
-    for item in form:
-        field_id = item.get("id")
-        field_name = item.get("name", field_id)
-        field_type = item.get("type", "")
-        if field_id:
-            fields[field_id] = {"name": field_name, "type": field_type}
-    print(f"审批[{approval_type}]真实字段: {json.dumps(fields, ensure_ascii=False)}")
-    return fields
-
 def send_message(open_id, text):
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
@@ -75,6 +52,32 @@ def send_message(open_id, text):
     if not resp.success():
         print(f"发送消息失败: {resp.msg}")
 
+def send_link_message(open_id, text, url):
+    content = {
+        "zh_cn": {
+            "title": "审批申请",
+            "content": [[
+                {"tag": "text", "text": text + "\n\n"},
+                {"tag": "a", "text": "👉 点击这里前往飞书审批页面提交", "href": url}
+            ]]
+        }
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("post") \
+        .content(json.dumps(content, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        print(f"发送链接消息失败: {resp.msg}")
+
+def build_approval_link(approval_code):
+    return f"https://applink.feishu.cn/client/approval/instance/create?approval_code={approval_code}"
+
 def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
     field_hints = "\n".join([f"{k}: {v}" for k, v in APPROVAL_FIELD_HINTS.items()])
@@ -85,16 +88,16 @@ def analyze_message(history):
         f"各类型需要的字段：\n{field_hints}\n\n"
         f"重要规则：\n"
         f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
-        f"2. '明天'、'后天'、'下周一'等要换算成具体日期(YYYY-MM-DD)\n"
-        f"3. '两个小时'、'半天'等时长，days填0.5或按实际换算，start_date和end_date填同一天\n"
+        f"2. '明天'、'后天'、'下周一'等换算成具体日期(YYYY-MM-DD)\n"
+        f"3. '两个小时'、'半天'等时长，days填0.5，start_date和end_date填同一天\n"
         f"4. '去看病'、'身体不舒服'等明显是病假，leave_type直接填'病假'\n"
         f"5. 只有真的无法推断的字段才放入missing\n"
-        f"6. reason如果没说可根据上下文推断，实在没有才列为missing\n\n"
-        f"分析对话历史，返回JSON：\n"
+        f"6. reason可根据上下文推断，实在没有才列为missing\n\n"
+        f"返回JSON：\n"
         f"- approval_type: 审批类型（从列表选，无法判断填null）\n"
-        f"- fields: 综合对话历史已提取的字段键值对\n"
-        f"- missing: 真正缺少且无法推断的字段名列表\n"
-        f"- unclear: 无法判断类型时用中文说明需要补充什么\n"
+        f"- fields: 已提取的字段键值对\n"
+        f"- missing: 真正缺少的字段名列表\n"
+        f"- unclear: 无法判断类型时用中文说明\n"
         f"只返回JSON。"
     )
     messages = [{"role": "system", "content": system_prompt}] + history
@@ -110,33 +113,28 @@ def analyze_message(history):
             timeout=30
         )
         res.raise_for_status()
-        data = res.json()
-        return json.loads(data["choices"][0]["message"]["content"])
+        return json.loads(res.json()["choices"][0]["message"]["content"])
     except Exception as e:
         print(f"AI分析失败: {e}")
         return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
-def create_approval(user_id, approval_type, fields, admin_comment):
+def create_approval_api(user_id, approval_type, fields, admin_comment):
     approval_code = APPROVAL_CODES[approval_type]
-    real_fields = APPROVAL_REAL_FIELDS.get(approval_type, {})
 
-    # 用真实字段ID构建表单
+    if approval_type == "采购申请":
+        field_map = PURCHASE_FIELD_MAP
+    elif approval_type == "用印申请":
+        field_map = SEAL_FIELD_MAP
+    else:
+        return False, "不支持API提交", {}
+
     form_list = []
-    for field_id, field_info in real_fields.items():
-        field_type = field_info.get("type", "input")
-        field_name = field_info.get("name", field_id)
-        # 跳过附件和说明类字段
-        if field_type in ("attach", "attachV2", "description"):
-            continue
-        # 用字段名匹配用户提供的值
-        value = fields.get(field_id) or fields.get(field_name) or ""
-        # 行政意见字段特殊处理
-        if "行政" in field_name or "admin" in field_id.lower():
-            value = admin_comment
-        form_list.append({"id": field_id, "type": "input", "value": str(value)})
+    for logical_key, real_id in field_map.items():
+        value = str(fields.get(logical_key, ""))
+        form_list.append({"id": real_id, "type": "input", "value": value})
 
     form_data = json.dumps(form_list, ensure_ascii=False)
-    print(f"提交表单: {form_data}")
+    print(f"提交表单[{approval_type}]: {form_data}")
 
     token = get_token()
     res = httpx.post(
@@ -153,13 +151,11 @@ def create_approval(user_id, approval_type, fields, admin_comment):
     print(f"创建审批响应: {data}")
     return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
-def format_success_message(approval_type, fields, admin_comment):
-    lines = [f"✅ 已为你提交{approval_type}申请！"]
+def format_fields_summary(approval_type, fields):
+    lines = []
     for k, v in fields.items():
         label = FIELD_LABELS.get(k, k)
         lines.append(f"· {label}: {v}")
-    lines.append(f"\n💡 行政意见: {admin_comment}")
-    lines.append("等待主管审批即可。")
     return "\n".join(lines)
 
 def on_message(data):
@@ -202,14 +198,31 @@ def on_message(data):
             return
 
         admin_comment = get_admin_comment(approval_type, fields)
-        success, msg, result_data = create_approval(user_id, approval_type, fields, admin_comment)
-        if success:
-            reply = format_success_message(approval_type, fields, admin_comment)
-            send_message(open_id, reply)
+        summary = format_fields_summary(approval_type, fields)
+
+        if approval_type in LINK_ONLY_TYPES:
+            approval_code = APPROVAL_CODES[approval_type]
+            link = build_approval_link(approval_code)
+            tip = (
+                f"已为你整理好{approval_type}信息：\n{summary}\n\n"
+                f"💡 行政意见: {admin_comment}\n\n"
+                f"由于该审批包含特殊控件，需要你点击下方链接前往飞书审批页面完成提交："
+            )
+            send_link_message(open_id, tip, link)
             CONVERSATIONS[open_id] = []
         else:
-            print(f"创建审批失败: {msg}")
-            send_message(open_id, f"提交失败，错误信息：{msg}")
+            success, msg, _ = create_approval_api(user_id, approval_type, fields, admin_comment)
+            if success:
+                reply = (
+                    f"✅ 已为你提交{approval_type}申请！\n{summary}\n\n"
+                    f"💡 行政意见: {admin_comment}\n"
+                    f"等待主管审批即可。"
+                )
+                send_message(open_id, reply)
+                CONVERSATIONS[open_id] = []
+            else:
+                print(f"创建审批失败: {msg}")
+                send_message(open_id, f"提交失败：{msg}")
 
     except Exception as e:
         print(f"处理消息出错: {e}")
@@ -217,11 +230,6 @@ def on_message(data):
             send_message(open_id, "系统出现异常，请稍后再试。")
 
 if __name__ == "__main__":
-    # 启动时自动获取所有审批的真实字段
-    print("正在获取审批表单字段...")
-    for name, code in APPROVAL_CODES.items():
-        APPROVAL_REAL_FIELDS[name] = get_approval_form_fields(name, code)
-
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .build()
