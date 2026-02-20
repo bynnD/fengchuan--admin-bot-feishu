@@ -24,6 +24,7 @@ client = lark.Client.builder() \
     .app_secret(FEISHU_APP_SECRET) \
     .build()
 
+
 def get_token():
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
@@ -37,6 +38,7 @@ def get_token():
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
+
 
 def send_message(open_id, text):
     body = CreateMessageRequestBody.builder() \
@@ -52,7 +54,8 @@ def send_message(open_id, text):
     if not resp.success():
         print(f"发送消息失败: {resp.msg}")
 
-def send_link_message(open_id, text, url, approval_type):
+
+def send_card_message(open_id, text, url, approval_type):
     card = {
         "config": {"wide_screen_mode": True},
         "elements": [
@@ -62,12 +65,14 @@ def send_link_message(open_id, text, url, approval_type):
             },
             {
                 "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"前往提交{approval_type}申请"},
-                    "type": "primary",
-                    "url": url
-                }]
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"前往提交{approval_type}申请"},
+                        "type": "primary",
+                        "url": url
+                    }
+                ]
             }
         ]
     }
@@ -84,8 +89,10 @@ def send_link_message(open_id, text, url, approval_type):
     if not resp.success():
         print(f"发送卡片消息失败: {resp.msg}")
 
+
 def build_approval_link(approval_code):
-    return f"https://applink.feishu.cn/client/approval/newinstance?approval_code={approval_code}"
+    return f"https://www.feishu.cn/approval/newinstance?approval_code={approval_code}&from=bot"
+
 
 def analyze_message(history):
     approval_list = "\n".join([f"- {k}" for k in APPROVAL_CODES.keys()])
@@ -97,9 +104,9 @@ def analyze_message(history):
         f"各类型需要的字段：\n{field_hints}\n\n"
         f"重要规则：\n"
         f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
-        f"2. '明天'、'后天'、'下周一'等换算成具体日期(YYYY-MM-DD)\n"
-        f"3. '两个小时'、'半天'等时长，days填0.5，start_date和end_date填同一天\n"
-        f"4. '去看病'、'身体不舒服'等明显是病假，leave_type直接填'病假'\n"
+        f"2. 明天、后天、下周一等换算成具体日期(YYYY-MM-DD)\n"
+        f"3. 两个小时、半天等时长，days填0.5，start_date和end_date填同一天\n"
+        f"4. 去看病、身体不舒服等明显是病假，leave_type直接填病假\n"
         f"5. 只有真的无法推断的字段才放入missing\n"
         f"6. reason可根据上下文推断，实在没有才列为missing\n\n"
         f"返回JSON：\n"
@@ -126,6 +133,7 @@ def analyze_message(history):
     except Exception as e:
         print(f"AI分析失败: {e}")
         return {"approval_type": None, "unclear": "AI助手暂时无法响应，请稍后再试。"}
+
 
 def create_approval_api(user_id, approval_type, fields, admin_comment):
     approval_code = APPROVAL_CODES[approval_type]
@@ -160,12 +168,14 @@ def create_approval_api(user_id, approval_type, fields, admin_comment):
     print(f"创建审批响应: {data}")
     return data.get("code") == 0, data.get("msg", ""), data.get("data", {})
 
-def format_fields_summary(approval_type, fields):
+
+def format_fields_summary(fields):
     lines = []
     for k, v in fields.items():
         label = FIELD_LABELS.get(k, k)
         lines.append(f"· {label}: {v}")
     return "\n".join(lines)
+
 
 def on_message(data):
     event_id = data.header.event_id
@@ -207,24 +217,24 @@ def on_message(data):
             return
 
         admin_comment = get_admin_comment(approval_type, fields)
-        summary = format_fields_summary(approval_type, fields)
+        summary = format_fields_summary(fields)
 
         if approval_type in LINK_ONLY_TYPES:
             approval_code = APPROVAL_CODES[approval_type]
             link = build_approval_link(approval_code)
             tip = (
                 f"已为你整理好{approval_type}信息：\n{summary}\n\n"
-                f"💡 行政意见: {admin_comment}\n\n"
-                f"由于该审批包含特殊控件，需要你点击下方按钮前往飞书审批页面完成提交："
+                f"行政意见: {admin_comment}\n\n"
+                f"请点击下方按钮，在飞书客户端中打开审批表单完成提交："
             )
-            send_link_message(open_id, tip, link, approval_type)
+            send_card_message(open_id, tip, link, approval_type)
             CONVERSATIONS[open_id] = []
         else:
             success, msg, _ = create_approval_api(user_id, approval_type, fields, admin_comment)
             if success:
                 reply = (
-                    f"✅ 已为你提交{approval_type}申请！\n{summary}\n\n"
-                    f"💡 行政意见: {admin_comment}\n"
+                    f"已为你提交{approval_type}申请！\n{summary}\n\n"
+                    f"行政意见: {admin_comment}\n"
                     f"等待主管审批即可。"
                 )
                 send_message(open_id, reply)
@@ -238,6 +248,7 @@ def on_message(data):
         if open_id:
             send_message(open_id, "系统出现异常，请稍后再试。")
 
+
 if __name__ == "__main__":
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
@@ -248,5 +259,5 @@ if __name__ == "__main__":
         event_handler=handler,
         log_level=lark.LogLevel.INFO
     )
-    print("🚀 飞书审批机器人已启动...")
+    print("飞书审批机器人已启动...")
     ws_client.start()
