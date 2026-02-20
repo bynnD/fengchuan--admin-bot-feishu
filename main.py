@@ -133,6 +133,26 @@ def build_form(approval_type, fields, token):
     approval_code = APPROVAL_CODES[approval_type]
 
     if approval_type == "请假":
+        # 先获取真实的字段结构，找到 leaveGroupV2 控件的真实 ID
+        cached_fields = get_form_fields(approval_type, approval_code, token)
+        if cached_fields:
+            # 查找 leaveGroupV2 类型的字段
+            leave_field_id = None
+            for field_id, field_info in cached_fields.items():
+                if field_info.get("type") == "leaveGroupV2":
+                    leave_field_id = field_id
+                    break
+            
+            if leave_field_id:
+                print(f"找到请假控件ID: {leave_field_id}")
+            else:
+                # 如果找不到，使用默认ID
+                leave_field_id = "widgetLeaveGroupV2"
+                print(f"未找到 leaveGroupV2 字段，使用默认ID: {leave_field_id}")
+        else:
+            leave_field_id = "widgetLeaveGroupV2"
+            print(f"无法获取字段结构，使用默认ID: {leave_field_id}")
+        
         start_date = fields.get("start_date", "")
         end_date = fields.get("end_date", start_date)
         days = fields.get("days", 1)
@@ -145,19 +165,27 @@ def build_form(approval_type, fields, token):
         except:
             is_half_day = False
         start_time = f"{start_date}T12:00:00+08:00" if is_half_day else f"{start_date}T00:00:00+08:00"
-        end_time = f"{end_date}T00:00:00+08:00"
+        # 结束时间：如果是整天，应该是当天的23:59:59，如果是半天，应该是当天的00:00:00
+        if is_half_day:
+            end_time = f"{end_date}T00:00:00+08:00"
+        else:
+            end_time = f"{end_date}T23:59:59+08:00"
+        
+        # 根据飞书 API，leaveGroupV2 的 value 应该是一个对象（map）
+        # 注意：根据错误信息 "group value not map"，value 必须是对象格式
+        value_obj = {
+            "end": end_time,
+            "interval": days_str,
+            "name": leave_type,
+            "reason": reason,
+            "start": start_time,
+            "timezoneOffset": -480,
+            "unit": "DAY"
+        }
         return [{
-            "id": "widgetLeaveGroupV2",
+            "id": leave_field_id,
             "type": "leaveGroupV2",
-            "value": {
-                "end": end_time,
-                "interval": days_str,
-                "name": leave_type,
-                "reason": reason,
-                "start": start_time,
-                "timezoneOffset": -480,
-                "unit": "DAY"
-            }
+            "value": value_obj  # value 必须是对象（map），不能是数组或字符串
         }]
 
     if approval_type == "外出":
