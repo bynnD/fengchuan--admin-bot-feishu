@@ -184,12 +184,13 @@ def build_form(approval_type, fields, token):
             "widgetLeaveGroupFeedingArrivingLate": "0"
         }
         
-        print(f"请假表单 value: {json.dumps(value_obj, ensure_ascii=False)}")
+        value_str = json.dumps(value_obj, ensure_ascii=False)
+        print(f"请假表单 value: {value_str}")
         
         return [{
             "id": leave_field_id,
             "type": "leaveGroupV2",
-            "value": value_obj
+            "value": value_str
         }]
 
     if approval_type == "外出":
@@ -198,14 +199,15 @@ def build_form(approval_type, fields, token):
         destination = fields.get("destination", "")
         reason = fields.get("reason", "")
         # value格式来自真实审批实例
+        out_value = {
+            "end": f"{end}T00:00:00+08:00",
+            "start": f"{start}T00:00:00+08:00",
+            "reason": f"{destination} {reason}".strip()
+        }
         return [{
             "id": "widgetOutGroup",
             "type": "outGroup",
-            "value": {
-                "end": f"{end}T00:00:00+08:00",
-                "start": f"{start}T00:00:00+08:00",
-                "reason": f"{destination} {reason}".strip()
-            }
+            "value": json.dumps(out_value, ensure_ascii=False)
         }]
 
     # 通用类型：优先用兜底字段映射（已验证的字段ID），其次用缓存的字段结构
