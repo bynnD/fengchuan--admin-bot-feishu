@@ -273,8 +273,12 @@ def build_form(approval_type, fields, token, file_codes=None):
         if field_type in ("description",):
             continue
         if field_type in ("attach", "attachV2", "image", "imageV2", "attachmentV2"):
-            if field_id in file_codes:
-                form_list.append({"id": field_id, "type": field_type, "value": file_codes[field_id]})
+            files = file_codes.get(field_id)
+            if not files and file_codes:
+                # 用印申请等：传入的 file_codes 可能用固定 ID，实际表单的附件字段 ID 可能不同（如 widget3）
+                files = next(iter(file_codes.values()), None)
+            if files:
+                form_list.append({"id": field_id, "type": field_type, "value": files})
             continue
 
         if field_type == "dateInterval":
