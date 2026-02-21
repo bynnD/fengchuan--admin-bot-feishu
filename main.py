@@ -130,11 +130,13 @@ def send_message(open_id, text):
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
-    """发送卡片消息。use_desktop_link=True 时，PC/移动端均用 applink 在飞书客户端内打开"""
+    """发送卡片消息。use_desktop_link=True 时，PC 端用 lark:// 协议在客户端内打开，避免跳转浏览器"""
     if use_desktop_link and "instanceCode=" in url:
-        https_url = url.replace("lark://", "https://", 1) if url.startswith("lark://") else url
-        # 统一用 applink，在飞书客户端内点击会在客户端打开；feishu.cn/approval/detail 在浏览器会 404
-        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": https_url}}
+        m = re.search(r"instanceCode=([^&]+)", url)
+        ic = m.group(1) if m else ""
+        # 桌面端和移动端均用 lark:// 协议，在飞书 APP/客户端内打开工单
+        lark_url = f"lark://applink.feishu.cn/client/approval?instanceCode={ic}" if ic else url
+        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": lark_url, "pc_url": lark_url, "android_url": lark_url, "ios_url": lark_url}}
     else:
         btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     card = {
