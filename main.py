@@ -93,7 +93,14 @@ def upload_approval_file(file_name, file_content):
             return None, "接口返回格式异常，请稍后重试"
         if data.get("code") == 0:
             d = data.get("data", {})
-            file_code = d.get("code") or d.get("file_token") or d.get("file_code") or ""
+            # 飞书 v4 接口可能返回 urls_detail: [{code: "xxx", ...}]，code 在数组首项中
+            urls = d.get("urls_detail") or []
+            first = urls[0] if isinstance(urls, list) and urls else {}
+            file_code = (
+                (first.get("code") or first.get("file_code") or "")
+                or d.get("code") or d.get("file_token") or d.get("file_code")
+                or ""
+            )
             print(f"文件上传成功: {file_name} -> {file_code}")
             if not file_code:
                 print(f"警告: API 返回成功但无 file code，完整 data: {d}")
