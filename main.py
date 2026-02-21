@@ -9,6 +9,7 @@ from approval_types import (
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment
 )
+from approval_types.purchase import COST_DETAIL_SKIP_SUBFIELDS
 import base64
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
@@ -178,12 +179,15 @@ def analyze_message(history):
         f"3. 只有真的无法推断的字段才放入missing\n"
         f"4. reason可根据上下文推断，实在没有才列为missing\n"
         f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n"
-        f"6. 采购的cost_detail是费用明细列表(必填)，每项必须含名称、规格、数量、金额、是否有库存(是/否)。"
-        f"多个物品就多项，格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\",\"是否有库存\":\"否\"}}]。"
-        f"缺少任何一项信息就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')\n"
+        f"6. 采购的cost_detail是费用明细列表(必填)，每项必须含名称、规格、数量、金额。"
+        f"「是否有库存」由审批人填写，发起人不填，不要提取。"
+        f"格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\"}}]。"
+        f"缺少名称/规格/数量/金额任一项就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')。"
+        f"purchase_type(采购类别)可根据采购物品自动推断，如办公电脑、办公桌→办公用品，设备、机器→设备类等。\n"
         f"7. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
         f"document_name/document_type不需要用户说，会从上传文件自动获取。"
-        f"如果用户还没上传文件，在unclear中提示'请上传需要盖章的文件'\n\n"
+        f"若用户明确说「盖公章」「要盖公章」「公章」等，必须将 seal_type 提取为「公章」，不要放入 missing。"
+        f"若用户还没上传文件，在 unclear 中提示「请上传需要盖章的文件」。\n\n"
         f"返回JSON：\n"
         f"- requests: 数组，每项含 approval_type、fields、missing\n"
         f"  若只有1个需求，数组长度为1；若无法识别任何需求，返回空数组\n"
@@ -243,10 +247,11 @@ def _match_sub_field(sf_name, item):
     return ""
 
 
-def _format_field_value(logical_key, raw_value, field_type, field_info=None):
+def _format_field_value(logical_key, raw_value, field_type, field_info=None, approval_type=None):
     """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。"""
     if field_type == "fieldList":
         sub_fields = (field_info or {}).get("sub_fields", [])
+        skip_ids = COST_DETAIL_SKIP_SUBFIELDS if (approval_type == "采购申请" and logical_key == "cost_detail") else set()
         if isinstance(raw_value, list) and raw_value:
             if sub_fields:
                 rows = []
@@ -254,7 +259,8 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
                     if isinstance(item, dict):
                         row = []
                         for sf in sub_fields:
-                            val = _match_sub_field(sf.get("name", ""), item)
+                            sf_id = sf.get("id") or sf.get("widget_id") or ""
+                            val = "" if sf_id in skip_ids else _match_sub_field(sf.get("name", ""), item)
                             row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
                         rows.append(row)
                     elif isinstance(item, list):
@@ -371,7 +377,7 @@ def build_form(approval_type, fields, token, file_codes=None):
             fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
             if fallback_subs:
                 field_info = {**field_info, "sub_fields": fallback_subs}
-        value = _format_field_value(logical_key, raw, field_type, field_info)
+        value = _format_field_value(logical_key, raw, field_type, field_info, approval_type=approval_type)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
         if logical_key in DATE_FIELDS and raw:
             ftype = "date"
@@ -435,9 +441,54 @@ def _form_summary(form_list, cached):
     return "\n".join(lines)
 
 
+def _infer_purchase_type_from_cost_detail(cost_detail):
+    """根据采购物品推断采购类别。返回推断的类别文本，失败返回空。"""
+    if not cost_detail or not isinstance(cost_detail, list):
+        return ""
+    items_desc = []
+    for item in cost_detail[:5]:
+        if isinstance(item, dict):
+            name = item.get("名称") or item.get("name") or item.get("物品") or ""
+            spec = item.get("规格") or item.get("spec") or ""
+            items_desc.append(f"{name} {spec}".strip() or "未知")
+        else:
+            items_desc.append(str(item)[:50])
+    if not items_desc:
+        return ""
+    text = "、".join(items_desc)
+    prompt = (
+        f"根据采购物品推断采购类别。\n物品：{text}\n"
+        f"常见类别：办公用品、设备、耗材、原材料等。"
+        f"只返回一个最合适的类别词，不要其他内容。"
+    )
+    try:
+        res = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 20
+            },
+            timeout=10
+        )
+        res.raise_for_status()
+        out = res.json()["choices"][0]["message"]["content"].strip()
+        return out.split("\n")[0].strip() if out else ""
+    except Exception as e:
+        print(f"推断采购类别失败: {e}")
+        return ""
+
+
 def create_approval(user_id, approval_type, fields, file_codes=None):
     approval_code = APPROVAL_CODES[approval_type]
     token = get_token()
+
+    fields = dict(fields)
+    if approval_type == "采购申请" and not fields.get("purchase_type") and fields.get("cost_detail"):
+        inferred = _infer_purchase_type_from_cost_detail(fields["cost_detail"])
+        if inferred:
+            fields["purchase_type"] = inferred
 
     cached = get_form_fields(approval_type, approval_code, token)
     form_list = build_form(approval_type, fields, token, file_codes=file_codes)
@@ -506,6 +557,8 @@ def _on_message_read(_data):
 
 
 PENDING_SEAL = {}
+# 用印申请：用户首次消息中已提取的字段（如「盖公章」），等收到文件后合并
+SEAL_INITIAL_FIELDS = {}
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
@@ -544,8 +597,48 @@ def _get_seal_form_options():
     return result
 
 
+def _extract_seal_from_filename(file_name, company_opts, seal_opts):
+    """根据文件名用 AI 推断用印公司、印章类型、用印事由。返回 dict，仅包含能推断的字段。"""
+    base_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+    if not base_name or len(base_name) < 2:
+        return {}
+    company_str = "、".join(company_opts) if company_opts else "无"
+    seal_str = "、".join(seal_opts) if seal_opts else "公章、合同章、法人章、财务章"
+    prompt = (
+        f"根据文件名推断用印申请信息。\n"
+        f"文件名：{base_name}\n"
+        f"可选用印公司：{company_str}\n"
+        f"可选印章类型：{seal_str}\n"
+        f"请返回JSON，只包含能推断的字段，无法推断的不要写：\n"
+        f"- company: 从文件名中的公司名匹配上述选项（如「扇贝&风船」可推断风船等）\n"
+        f"- seal_type: 合同类文件通常用公章或合同章\n"
+        f"- reason: 文件用途/用印事由（如「流量广告合作协议」）\n"
+        f"只返回JSON，不要其他内容。"
+    )
+    try:
+        res = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            },
+            timeout=15
+        )
+        res.raise_for_status()
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        out = json.loads(content)
+        return {k: v for k, v in out.items() if v and k in ("company", "seal_type", "reason")}
+    except Exception as e:
+        print(f"从文件名推断用印信息失败: {e}")
+        return {}
+
+
 def _handle_file_message(open_id, user_id, message_id, content_json):
-    """处理文件消息：下载文件→上传审批附件→提取文件名→等用户补充其余字段"""
+    """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段"""
     file_key = content_json.get("file_key", "")
     file_name = content_json.get("file_name", "未知文件")
     if not file_key:
@@ -572,11 +665,18 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         "document_count": "1",
     }
 
-    PENDING_SEAL[open_id] = {
-        "doc_fields": doc_fields,
-        "file_code": file_code,
-        "user_id": user_id,
-    }
+    opts = _get_seal_form_options()
+    company_opts = opts.get("company", [])
+    seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
+    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+
+    # 合并：文件基础信息 + 文件名 AI 推断 + 首次消息已提取字段（后者优先）
+    ai_fields = _extract_seal_from_filename(file_name, company_opts, seal_opts)
+    initial_fields = SEAL_INITIAL_FIELDS.pop(open_id, {})
+    doc_fields = {**doc_fields, **ai_fields, **initial_fields}
+    doc_fields.setdefault("usage_method", "盖章")
+    doc_fields.setdefault("lawyer_reviewed", "否")
 
     CONVERSATIONS.setdefault(open_id, [])
     CONVERSATIONS[open_id].append({
@@ -584,24 +684,66 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         "content": f"[已接收文件] 文件名称={doc_name}"
     })
 
-    opts = _get_seal_form_options()
-    company_opts = opts.get("company", [])
-    seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
-    usage_opts = opts.get("usage_method", ["盖章", "外带"])
-    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+    missing = [k for k in ["company", "seal_type", "reason"] if not doc_fields.get(k)]
+    if not missing:
+        # 全部可推断，直接创建工单
+        _do_create_seal(open_id, user_id, doc_fields, file_code)
+        return
 
+    PENDING_SEAL[open_id] = {
+        "doc_fields": doc_fields,
+        "file_code": file_code,
+        "user_id": user_id,
+    }
+
+    # 只列出缺失项
+    labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
+    hint_map = {
+        "company": f"{'、'.join(company_opts) if company_opts else '请输入'}",
+        "seal_type": "、".join(seal_opts),
+        "reason": "（请描述）",
+    }
     lines = [
         f"已接收文件：{file_name}",
         f"· 文件名称: {doc_name}",
         "",
         "请补充以下信息（一条消息说完即可）：",
-        f"1. 用印公司：{'、'.join(company_opts) if company_opts else '请输入'}",
-        f"2. 印章类型：{'、'.join(seal_opts)}",
-        f"3. 文件用途/用印事由：（请描述）",
-        f"4. 盖章还是外带：{'、'.join(usage_opts)}（默认盖章）",
-        f"5. 律师是否已审核：{'、'.join(lawyer_opts)}（默认否）",
     ]
+    for i, k in enumerate(missing, 1):
+        lines.append(f"{i}. {labels[k]}：{hint_map.get(k, '')}")
+    lines.extend([
+        f"盖章还是外带：{'、'.join(usage_opts)}（默认盖章）",
+        f"律师是否已审核：{'、'.join(lawyer_opts)}（默认否）",
+    ])
     send_message(open_id, "\n".join(lines))
+
+
+def _do_create_seal(open_id, user_id, all_fields, file_code):
+    """用印申请字段齐全时，直接创建工单"""
+    all_fields = dict(all_fields)
+    all_fields.setdefault("usage_method", "盖章")
+    all_fields.setdefault("document_count", "1")
+    all_fields.setdefault("lawyer_reviewed", "否")
+
+    file_codes = {ATTACHMENT_FIELD_ID: [file_code]} if file_code else {}
+    admin_comment = get_admin_comment("用印申请", all_fields)
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=file_codes)
+
+    if open_id in PENDING_SEAL:
+        del PENDING_SEAL[open_id]
+    if open_id in CONVERSATIONS:
+        CONVERSATIONS[open_id] = []
+
+    if success:
+        instance_code = resp_data.get("instance_code", "")
+        if instance_code:
+            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
+        else:
+            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+    else:
+        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -665,26 +807,7 @@ def _try_complete_seal(open_id, user_id, text):
         PENDING_SEAL[open_id]["doc_fields"] = all_fields
         return True
 
-    file_codes = {}
-    if file_code:
-        file_codes[ATTACHMENT_FIELD_ID] = [file_code]
-
-    admin_comment = get_admin_comment("用印申请", all_fields)
-    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=file_codes)
-
-    if success:
-        instance_code = resp_data.get("instance_code", "")
-        if instance_code:
-            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
-        else:
-            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
-    else:
-        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
-
-    del PENDING_SEAL[open_id]
-    CONVERSATIONS[open_id] = []
+    _do_create_seal(open_id, user_id, all_fields, file_code)
     return True
 
 
@@ -743,6 +866,10 @@ def on_message(data):
             miss = req.get("missing", [])
             fields_check = req.get("fields", {})
             if at == "用印申请" and open_id not in PENDING_SEAL:
+                # 保存首次消息中已提取的字段（如「盖公章」），收到文件后合并
+                initial = req.get("fields", {})
+                if initial:
+                    SEAL_INITIAL_FIELDS[open_id] = initial
                 send_message(open_id, "请补充以下信息：\n"
                              f"用印申请还缺少：上传用章文件\n"
                              f"请先上传需要盖章的文件（Word/PDF），我会自动提取文件名称。")

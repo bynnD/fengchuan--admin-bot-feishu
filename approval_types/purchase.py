@@ -5,9 +5,9 @@ APPROVAL_CODE = "6CF86C28-26AA-4E8B-ABF4-82DFAE86028C"
 LINK_ONLY = False
 
 FIELD_HINTS = (
-    "purchase_reason(采购事由), purchase_type(采购类别), expected_date(期望交付时间YYYY-MM-DD), "
-    "cost_detail(费用明细列表,必填,每项必须包含:名称/规格/数量/金额/是否有库存(是或否),"
-    "多个物品就多项,如[{\"名称\":\"笔记本\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\",\"是否有库存\":\"否\"}])"
+    "purchase_reason(采购事由), purchase_type(采购类别,可根据物品推断), expected_date(期望交付时间YYYY-MM-DD), "
+    "cost_detail(费用明细列表,必填,每项包含:名称/规格/数量/金额。是否有库存由审批人填写,发起人不填。"
+    "格式如[{\"名称\":\"笔记本\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\"}])"
 )
 
 FIELD_LABELS = {
@@ -19,6 +19,9 @@ FIELD_LABELS = {
 
 # 表单字段名可能为「物资明细」或「费用明细」，均映射到 cost_detail
 FIELD_NAME_ALIASES = {"物资明细": "cost_detail"}
+
+# 费用明细中由下一审批节点填写的子字段，发起人不自动填写
+COST_DETAIL_SKIP_SUBFIELDS = {"widget17388300029330001"}  # 是否有库存（无库存需采购/有库存请申请领用）
 
 FIELD_ID_FALLBACK = {
     "purchase_reason": "widget16510608596030001",
