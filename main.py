@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from urllib.parse import quote
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -130,13 +131,21 @@ def send_message(open_id, text):
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
-    """发送卡片消息。use_desktop_link=True 时，PC 端用 lark:// 协议在客户端内打开，避免跳转浏览器"""
+    """发送卡片消息。use_desktop_link=True 时使用飞书官方审批 applink，在应用内打开"""
     if use_desktop_link and "instanceCode=" in url:
         m = re.search(r"instanceCode=([^&]+)", url)
-        ic = m.group(1) if m else ""
-        # 桌面端和移动端均用 lark:// 协议，在飞书 APP/客户端内打开工单
-        lark_url = f"lark://applink.feishu.cn/client/approval?instanceCode={ic}" if ic else url
-        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": lark_url, "pc_url": lark_url, "android_url": lark_url, "ios_url": lark_url}}
+        ic = m.group(1).strip() if m else ""
+        if ic:
+            # 飞书官方文档：https://open.feishu.cn/document/applink-protocol/supported-protocol/open-an-approval-page
+            # 使用 client/mini_program/open 协议，在飞书应用内打开审批详情
+            app_id = "cli_9cb844403dbb9108"  # 飞书审批应用 ID
+            mobile_path = quote(f"pages/detail/index?instanceId={ic}", safe="")
+            pc_path = quote(f"pc/pages/in-process/index?instanceId={ic}", safe="")
+            mobile_url = f"https://applink.feishu.cn/client/mini_program/open?appId={app_id}&path={mobile_path}"
+            pc_url = f"https://applink.feishu.cn/client/mini_program/open?mode=appCenter&appId={app_id}&path={pc_path}"
+            btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": mobile_url, "pc_url": pc_url, "android_url": mobile_url, "ios_url": mobile_url}}
+        else:
+            btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     else:
         btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     card = {
