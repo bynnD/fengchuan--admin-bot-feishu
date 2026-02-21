@@ -35,6 +35,18 @@ FIELD_LABELS_REVERSE = {v: k for k, v in FIELD_LABELS.items()}
 FIELD_LABELS_REVERSE.update(FIELD_NAME_ALIASES)
 IMAGE_SUPPORT_TYPES = {t.NAME for t in _TYPES if getattr(t, "SUPPORTS_IMAGE", False)}
 
+# 有附件识别读取需求的工单类型 -> 文件内容提取器（均使用 file_extraction 的 OCR/文本提取）
+FILE_EXTRACTORS = {
+    t.NAME: t.extract_fields_from_file
+    for t in _TYPES
+    if getattr(t, "HAS_FILE_EXTRACTION", False) and hasattr(t, "extract_fields_from_file")
+}
+
+
+def get_file_extractor(approval_type):
+    """获取工单类型的文件内容提取器，无则返回 None"""
+    return FILE_EXTRACTORS.get(approval_type)
+
 
 def get_admin_comment(approval_type, fields):
     for t in _TYPES:

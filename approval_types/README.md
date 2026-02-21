@@ -37,6 +37,17 @@ def get_admin_comment(fields):
 
 2. 在 `__init__.py` 的 `_TYPES` 列表中加入新模块：`from . import xxx` 并加入 `_TYPES = [..., xxx]`
 
+## 有附件识别读取需求的工单
+
+若工单需要从上传的附件（Word/PDF/图片/扫描件）中自动识别并填写字段，需：
+
+1. 设置 `HAS_FILE_EXTRACTION = True`
+2. 实现 `extract_fields_from_file(file_content, file_name, form_opts, get_token) -> dict`
+   - 内部调用 `file_extraction.extract_text_from_file()` 获取文本（含飞书 OCR 识别图片/扫描件）
+   - 根据业务用 AI 从文本中提取字段，返回 `{字段名: 值}`
+
+参考 `seal.py`（用印申请）的实现。
+
 ## 删除工单类型
 
 删除对应 py 文件，并从 `__init__.py` 的 `_TYPES` 中移除即可。

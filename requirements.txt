@@ -1,2 +1,5 @@
 lark-oapi
 httpx
+python-docx
+pypdf
+pymupdf

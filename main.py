@@ -7,9 +7,8 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
     APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
-    IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment
+    IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment, get_file_extractor
 )
-import base64
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
 import time
@@ -131,13 +130,11 @@ def send_message(open_id, text):
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
-    """发送卡片消息。use_desktop_link=True 时，PC 端用 feishu.cn 链接在客户端内嵌打开"""
+    """发送卡片消息。use_desktop_link=True 时，PC/移动端均用 applink 在飞书客户端内打开"""
     if use_desktop_link and "instanceCode=" in url:
-        m = re.search(r"instanceCode=([^&]+)", url)
-        ic = m.group(1) if m else ""
         https_url = url.replace("lark://", "https://", 1) if url.startswith("lark://") else url
-        feishu_url = f"https://www.feishu.cn/approval/detail/{ic}" if ic else https_url
-        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": feishu_url}}
+        # 统一用 applink，在飞书客户端内点击会在客户端打开；feishu.cn/approval/detail 在浏览器会 404
+        btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "multi_url": {"url": https_url, "pc_url": https_url}}
     else:
         btn_config = {"tag": "button", "text": {"tag": "plain_text", "content": btn_label}, "type": "primary", "url": url}
     card = {
@@ -594,46 +591,6 @@ def _get_seal_form_options():
     return result
 
 
-def _extract_seal_from_filename(file_name, company_opts, seal_opts):
-    """根据文件名用 AI 推断用印公司、印章类型、用印事由。返回 dict，仅包含能推断的字段。"""
-    base_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-    if not base_name or len(base_name) < 2:
-        return {}
-    company_str = "、".join(company_opts) if company_opts else "无"
-    seal_str = "、".join(seal_opts) if seal_opts else "公章、合同章、法人章、财务章"
-    prompt = (
-        f"根据文件名推断用印申请信息。\n"
-        f"文件名：{base_name}\n"
-        f"可选用印公司：{company_str}\n"
-        f"可选印章类型：{seal_str}\n"
-        f"请返回JSON，只包含能推断的字段，无法推断的不要写：\n"
-        f"- company: 从文件名中的公司名匹配上述选项（如「扇贝&风船」可推断风船等）\n"
-        f"- seal_type: 合同类文件通常用公章或合同章\n"
-        f"- reason: 文件用途/用印事由（如「流量广告合作协议」）\n"
-        f"只返回JSON，不要其他内容。"
-    )
-    try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=15
-        )
-        res.raise_for_status()
-        content = res.json()["choices"][0]["message"]["content"].strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        out = json.loads(content)
-        return {k: v for k, v in out.items() if v and k in ("company", "seal_type", "reason")}
-    except Exception as e:
-        print(f"从文件名推断用印信息失败: {e}")
-        return {}
-
-
 def _handle_file_message(open_id, user_id, message_id, content_json):
     """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段"""
     file_key = content_json.get("file_key", "")
@@ -656,10 +613,14 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         return
 
     doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+    ext = (file_name.rsplit(".", 1)[-1] or "").lower()
+    doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
+    doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
 
     doc_fields = {
         "document_name": doc_name,
         "document_count": "1",
+        "document_type": doc_type,
     }
 
     opts = _get_seal_form_options()
@@ -668,8 +629,9 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     usage_opts = opts.get("usage_method", ["盖章", "外带"])
     lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
 
-    # 合并：文件基础信息 + 文件名 AI 推断 + 首次消息已提取字段（后者优先）
-    ai_fields = _extract_seal_from_filename(file_name, company_opts, seal_opts)
+    # 合并：文件基础信息 + 文件内容 AI 识别（使用通用提取器，含 OCR，适用所有有附件识别需求的工单）+ 首次消息已提取字段（后者优先）
+    extractor = get_file_extractor("用印申请")
+    ai_fields = extractor(file_content, file_name, {"company": company_opts, "seal_type": seal_opts}, get_token) if extractor else {}
     initial_fields = SEAL_INITIAL_FIELDS.pop(open_id, {})
     doc_fields = {**doc_fields, **ai_fields, **initial_fields}
     doc_fields.setdefault("usage_method", "盖章")
@@ -828,7 +790,7 @@ def on_message(data):
             return
 
         if msg_type == "image":
-            send_message(open_id, "如需用印申请，请发送原始文件（Word/PDF），而非图片截图。\n"
+            send_message(open_id, "如需用印申请，请发送需要盖章的文件（Word/PDF/图片均可，图片和扫描件将自动识别文字）。\n"
                          "其他审批请用文字描述。")
             return
 
@@ -869,7 +831,7 @@ def on_message(data):
                     SEAL_INITIAL_FIELDS[open_id] = initial
                 send_message(open_id, "请补充以下信息：\n"
                              f"用印申请还缺少：上传用章文件\n"
-                             f"请先上传需要盖章的文件（Word/PDF），我会自动提取文件名称。")
+                             f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
                 CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                 requests = [r for r in requests if r.get("approval_type") != "用印申请"]
                 if not requests:
