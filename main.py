@@ -642,7 +642,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     elif extractor:
         print(f"用印文件识别: 未识别到字段，文件名={file_name}，请检查 Railway 日志中是否有「用印提取」或「从文件内容推断」报错")
     initial_fields = SEAL_INITIAL_FIELDS.pop(open_id, {})
-    doc_fields = {**doc_fields, **ai_fields, **initial_fields}
+    doc_fields = {**doc_fields, **ai_fields}
+    # 仅当首次消息有有效值时才覆盖，避免空值覆盖 AI 识别结果
+    for k, v in initial_fields.items():
+        if v and str(v).strip():
+            doc_fields[k] = v
     doc_fields.setdefault("usage_method", "盖章")
     doc_fields.setdefault("lawyer_reviewed", "否")
 
@@ -653,6 +657,8 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     })
 
     missing = [k for k in ["company", "seal_type", "reason"] if not doc_fields.get(k)]
+    if missing and ai_fields:
+        print(f"用印合并后仍缺失 {missing}，doc_fields 相关: company={doc_fields.get('company')!r}, seal_type={doc_fields.get('seal_type')!r}, reason={doc_fields.get('reason')!r}")
     if not missing:
         # 全部可推断，直接创建工单
         _do_create_seal(open_id, user_id, doc_fields, file_code)
