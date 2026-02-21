@@ -605,6 +605,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     if not file_content:
         send_message(open_id, "文件下载失败，请重新发送文件。")
         return
+    print(f"用印文件: 已下载 {file_name}, 大小={len(file_content)} bytes")
 
     file_code, upload_err = upload_approval_file(file_name, file_content)
     if not file_code:
@@ -631,7 +632,15 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
     # 合并：文件基础信息 + 文件内容 AI 识别（使用通用提取器，含 OCR，适用所有有附件识别需求的工单）+ 首次消息已提取字段（后者优先）
     extractor = get_file_extractor("用印申请")
-    ai_fields = extractor(file_content, file_name, {"company": company_opts, "seal_type": seal_opts}, get_token) if extractor else {}
+    if not extractor:
+        print("用印提取: 未找到 extractor，请检查 approval_types 注册")
+    if not DEEPSEEK_API_KEY:
+        print("用印提取: DEEPSEEK_API_KEY 未配置，无法调用 AI 识别")
+    ai_fields = extractor(file_content, file_name, {"company": company_opts or None, "seal_type": seal_opts or None}, get_token) if extractor else {}
+    if ai_fields:
+        print(f"用印文件识别结果: {ai_fields}")
+    elif extractor:
+        print(f"用印文件识别: 未识别到字段，文件名={file_name}，请检查 Railway 日志中是否有「用印提取」或「从文件内容推断」报错")
     initial_fields = SEAL_INITIAL_FIELDS.pop(open_id, {})
     doc_fields = {**doc_fields, **ai_fields, **initial_fields}
     doc_fields.setdefault("usage_method", "盖章")
@@ -927,7 +936,20 @@ def on_message(data):
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/debug-form":
+        if path == "/debug-extract":
+            from approval_types import get_file_extractor, FILE_EXTRACTORS
+            diag = {
+                "extractor_registered": get_file_extractor("用印申请") is not None,
+                "file_extractors": list(FILE_EXTRACTORS.keys()),
+                "DEEPSEEK_API_KEY_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
+                "DEEPSEEK_API_KEY_len": len(os.environ.get("DEEPSEEK_API_KEY", "")),
+                "hint": "若 extractor_registered 为 false 或 DEEPSEEK_API_KEY_set 为 false，则无法识别",
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(diag, ensure_ascii=False, indent=2).encode("utf-8"))
+        elif path == "/debug-form":
             from urllib.parse import parse_qs
             qs = parse_qs((self.path.split("?") + ["?"])[1])
             at = (qs.get("type") or [""])[0] or "采购申请"

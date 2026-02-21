@@ -43,14 +43,21 @@ def extract_text_from_file(file_content, file_name, get_token):
         if ext in ("docx", "doc"):
             from docx import Document
             from io import BytesIO
-            doc = Document(BytesIO(file_content))
-            parts = [p.text for p in doc.paragraphs if p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            parts.append(cell.text)
-            return "\n".join(parts)[:8000]
+            try:
+                doc = Document(BytesIO(file_content))
+                parts = [p.text for p in doc.paragraphs if p.text.strip()]
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            if cell.text.strip():
+                                parts.append(cell.text)
+                text = "\n".join(parts)[:8000]
+                if not text.strip():
+                    print(f"Word 解析({file_name}): 段落和表格均为空")
+                return text
+            except Exception as doc_err:
+                print(f"Word 解析失败({file_name}): {doc_err}")
+                return ""
         if ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp"):
             return feishu_ocr(file_content, get_token)[:8000]
         if ext == "pdf":
