@@ -9,7 +9,6 @@ from approval_types import (
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment
 )
-from approval_types.purchase import COST_DETAIL_SKIP_SUBFIELDS
 import base64
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 import datetime
@@ -247,11 +246,10 @@ def _match_sub_field(sf_name, item):
     return ""
 
 
-def _format_field_value(logical_key, raw_value, field_type, field_info=None, approval_type=None):
+def _format_field_value(logical_key, raw_value, field_type, field_info=None):
     """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。"""
     if field_type == "fieldList":
         sub_fields = (field_info or {}).get("sub_fields", [])
-        skip_ids = COST_DETAIL_SKIP_SUBFIELDS if (approval_type == "采购申请" and logical_key == "cost_detail") else set()
         if isinstance(raw_value, list) and raw_value:
             if sub_fields:
                 rows = []
@@ -259,8 +257,7 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None, app
                     if isinstance(item, dict):
                         row = []
                         for sf in sub_fields:
-                            sf_id = sf.get("id") or sf.get("widget_id") or ""
-                            val = "" if sf_id in skip_ids else _match_sub_field(sf.get("name", ""), item)
+                            val = _match_sub_field(sf.get("name", ""), item)
                             row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
                         rows.append(row)
                     elif isinstance(item, list):
@@ -377,7 +374,7 @@ def build_form(approval_type, fields, token, file_codes=None):
             fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
             if fallback_subs:
                 field_info = {**field_info, "sub_fields": fallback_subs}
-        value = _format_field_value(logical_key, raw, field_type, field_info, approval_type=approval_type)
+        value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
         if logical_key in DATE_FIELDS and raw:
             ftype = "date"

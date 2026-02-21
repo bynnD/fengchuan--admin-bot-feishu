@@ -20,9 +20,6 @@ FIELD_LABELS = {
 # 表单字段名可能为「物资明细」或「费用明细」，均映射到 cost_detail
 FIELD_NAME_ALIASES = {"物资明细": "cost_detail"}
 
-# 费用明细中由下一审批节点填写的子字段，发起人不自动填写
-COST_DETAIL_SKIP_SUBFIELDS = {"widget17388300029330001"}  # 是否有库存（无库存需采购/有库存请申请领用）
-
 FIELD_ID_FALLBACK = {
     "purchase_reason": "widget16510608596030001",
     "purchase_type":   "widget16510608666360001",
