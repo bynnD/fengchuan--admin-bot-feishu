@@ -25,6 +25,7 @@ def call_deepseek_with_retry(
     timeout=30,
     max_retries=2,
     api_key=None,
+    max_tokens=None,
 ):
     """
     带指数退避的 DeepSeek API 调用。
@@ -37,6 +38,8 @@ def call_deepseek_with_retry(
     }
     if response_format:
         payload["response_format"] = response_format
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     for attempt in range(max_retries + 1):
         try:
             res = httpx.post(
@@ -52,4 +55,4 @@ def call_deepseek_with_retry(
             if attempt == max_retries or not _is_retryable_error(err_msg):
                 raise
             time.sleep(2**attempt)
-    return None  # unreachable
+    raise RuntimeError("call_deepseek_with_retry: 不应到达此处")

@@ -22,24 +22,36 @@ _memory_cache = {}
 _free_process_cache = {}  # approval_code -> bool，缓存是否为报备单
 
 
+def _load_disk_cache_unsafe():
+    """内部使用，调用前必须已持有 _cache_lock"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"读取缓存文件失败: {e}")
+    return {}
+
+
+def _save_disk_cache_unsafe(cache):
+    """内部使用，调用前必须已持有 _cache_lock"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存缓存文件失败: {e}")
+
+
 def _load_disk_cache():
+    """对外暴露，自带锁。持锁期间做文件 I/O，避免在已持锁的调用链中嵌套使用。"""
     with _cache_lock:
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"读取缓存文件失败: {e}")
-        return {}
+        return _load_disk_cache_unsafe()
 
 
 def _save_disk_cache(cache):
+    """对外暴露，自带锁。"""
     with _cache_lock:
-        try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(cache, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"保存缓存文件失败: {e}")
+        _save_disk_cache_unsafe(cache)
 
 
 def _fetch_from_api(approval_code, token):
@@ -133,7 +145,7 @@ def get_form_fields(approval_type, approval_code, token):
         if approval_type in _memory_cache:
             return _memory_cache[approval_type]
 
-        disk_cache = _load_disk_cache()
+        disk_cache = _load_disk_cache_unsafe()
         if approval_type in disk_cache:
             _memory_cache[approval_type] = disk_cache[approval_type]
             print(f"从缓存加载字段结构: {approval_type}")
@@ -142,9 +154,9 @@ def get_form_fields(approval_type, approval_code, token):
     fields = _fetch_from_api(approval_code, token)
     if fields:
         with _cache_lock:
-            disk_cache = _load_disk_cache()
+            disk_cache = _load_disk_cache_unsafe()
             disk_cache[approval_type] = fields
-            _save_disk_cache(disk_cache)
+            _save_disk_cache_unsafe(disk_cache)
             _memory_cache[approval_type] = fields
         return fields
 
@@ -163,10 +175,10 @@ def invalidate_cache(approval_type):
         if approval_type in _memory_cache:
             del _memory_cache[approval_type]
 
-        disk_cache = _load_disk_cache()
+        disk_cache = _load_disk_cache_unsafe()
         if approval_type in disk_cache:
             del disk_cache[approval_type]
-            _save_disk_cache(disk_cache)
+            _save_disk_cache_unsafe(disk_cache)
             print(f"已清除字段缓存: {approval_type}，下次将重新获取")
 
 

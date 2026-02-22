@@ -1,7 +1,8 @@
 # 固定版本：项目对 lark_oapi.ws.client.Client._handle_data_frame 做了猴子补丁，
 # 将 CARD 类型消息转为 EVENT 以触发 on_card_action_confirm。SDK 升级可能改变内部实现导致补丁失效。
 lark-oapi==1.4.24
-httpx
+# httpx 大版本间 API 有变化（如 0.x→1.x 的 timeout 行为），固定版本避免兼容问题
+httpx>=0.27,<1.0
 python-docx
 pypdf
 pymupdf

@@ -619,7 +619,7 @@ def _infer_purchase_type_from_cost_detail(cost_detail):
         f"只返回一个最合适的类别词，不要其他内容。"
     )
     try:
-        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], timeout=10, max_retries=1)
+        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], timeout=10, max_retries=1, max_tokens=20)
         out = res.json()["choices"][0]["message"]["content"].strip()
         return out.split("\n")[0].strip() if out else ""
     except Exception as e:
@@ -940,8 +940,11 @@ def _try_complete_seal(open_id, user_id, text):
     except Exception as e:
         print(f"解析用印补充信息失败: {e}")
         with _state_lock:
-            retry_count = PENDING_SEAL[open_id].get("retry_count", 0) + 1
-            PENDING_SEAL[open_id]["retry_count"] = retry_count
+            entry = PENDING_SEAL.get(open_id)
+            if not entry:
+                return True  # 已被清理，静默退出
+            retry_count = entry.get("retry_count", 0) + 1
+            entry["retry_count"] = retry_count
         hint = "无法理解您的输入，请重新描述用印公司、印章类型和用印事由。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
@@ -960,9 +963,12 @@ def _try_complete_seal(open_id, user_id, text):
 
     if missing:
         with _state_lock:
-            retry_count = PENDING_SEAL[open_id].get("retry_count", 0) + 1
-            PENDING_SEAL[open_id]["retry_count"] = retry_count
-            PENDING_SEAL[open_id]["doc_fields"] = all_fields
+            entry = PENDING_SEAL.get(open_id)
+            if not entry:
+                return True  # 已被清理，静默退出
+            retry_count = entry.get("retry_count", 0) + 1
+            entry["retry_count"] = retry_count
+            entry["doc_fields"] = all_fields
         hint = f"还缺少：{'、'.join(missing)}\n请补充。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
@@ -977,9 +983,10 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
     """处理开票申请的文件上传：先结算单，后合同，自动提取字段"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
-    if not pending:
-        return
-    step = pending.get("step", "")
+        if not pending:
+            return
+        step = pending.get("step", "")
+        doc_fields = dict(pending.get("doc_fields", {}))
     file_key = content_json.get("file_key", "")
     file_name = content_json.get("file_name", "未知文件")
     if not file_key:
@@ -1003,7 +1010,7 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
     if ai_fields:
         print(f"开票文件识别结果: {ai_fields}")
 
-    doc_fields = dict(pending.get("doc_fields", {}))
+    # doc_fields 已在锁内快照
     for k, v in ai_fields.items():
         if v and str(v).strip():
             doc_fields[k] = v
@@ -1029,7 +1036,9 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
         return
 
     send_message(open_id, "开票申请已收到两个附件，请补充发票类型和开票项目。")
-    pending["step"] = "user_fields"
+    with _state_lock:
+        if open_id in PENDING_INVOICE:
+            PENDING_INVOICE[open_id]["step"] = "user_fields"
 
 
 def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
@@ -1198,10 +1207,12 @@ def on_message(data):
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
             return
 
-        # P0: 用印+开票同时发起时，只处理用印，避免文件路由冲突
+        # 第一阶段：处理需特殊路由的类型（用印/开票），收集剩余待处理
+        remaining_requests = []
         with _state_lock:
             needs_seal = any(r.get("approval_type") == "用印申请" for r in requests) and open_id not in PENDING_SEAL
             needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests) and open_id not in PENDING_INVOICE
+
         if needs_seal and needs_invoice:
             req_seal = next(r for r in requests if r.get("approval_type") == "用印申请")
             initial = req_seal.get("fields", {})
@@ -1213,56 +1224,53 @@ def on_message(data):
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请"})
-            requests = [r for r in requests if r.get("approval_type") not in ("用印申请", "开票申请")]
-            if not requests:
+            remaining_requests = [r for r in requests if r.get("approval_type") not in ("用印申请", "开票申请")]
+            if not remaining_requests:
                 return
-        for req in requests:
-            at = req.get("approval_type", "")
-            miss = req.get("missing", [])
-            fields_check = req.get("fields", {})
-            if at == "用印申请" and open_id not in PENDING_SEAL:
-                # 保存首次消息中已提取的字段（如「盖公章」），收到文件后合并
-                initial = req.get("fields", {})
-                if initial:
+        else:
+            for req in requests:
+                at = req.get("approval_type", "")
+                miss = req.get("missing", [])
+                fields_check = req.get("fields", {})
+                if at == "用印申请" and open_id not in PENDING_SEAL:
+                    initial = req.get("fields", {})
+                    if initial:
+                        with _state_lock:
+                            SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
+                    send_message(open_id, "请补充以下信息：\n"
+                                 f"用印申请还缺少：上传用章文件\n"
+                                 f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
                     with _state_lock:
-                        SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
-                send_message(open_id, "请补充以下信息：\n"
-                             f"用印申请还缺少：上传用章文件\n"
-                             f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
-                with _state_lock:
-                    if open_id in CONVERSATIONS:
-                        CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
-                requests = [r for r in requests if r.get("approval_type") != "用印申请"]
-                if not requests:
-                    return
-            if at == "开票申请" and open_id not in PENDING_INVOICE:
-                with _state_lock:
-                    PENDING_INVOICE[open_id] = {
-                        "step": "need_settlement",
-                        "settlement_file_code": None,
-                        "contract_file_code": None,
-                        "doc_fields": {},
-                        "user_id": user_id,
-                        "created_at": time.time(),
-                    }
-                send_message(open_id, "请补充以下信息：\n"
-                             f"开票申请需要：上传结算单和合同\n"
-                             f"请先上传结算单（Word/PDF/图片均可），我会自动识别内容。")
-                with _state_lock:
-                    if open_id in CONVERSATIONS:
-                        CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
-                requests = [r for r in requests if r.get("approval_type") != "开票申请"]
-                if not requests:
-                    return
-            if at == "采购申请":
-                cd = fields_check.get("cost_detail")
-                if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
-                    if "cost_detail" not in miss:
-                        miss.append("cost_detail")
-                        req["missing"] = miss
+                        if open_id in CONVERSATIONS:
+                            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
+                    continue
+                if at == "开票申请" and open_id not in PENDING_INVOICE:
+                    with _state_lock:
+                        PENDING_INVOICE[open_id] = {
+                            "step": "need_settlement",
+                            "settlement_file_code": None,
+                            "contract_file_code": None,
+                            "doc_fields": {},
+                            "user_id": user_id,
+                            "created_at": time.time(),
+                        }
+                    send_message(open_id, "请补充以下信息：\n"
+                                 f"开票申请需要：上传结算单和合同\n"
+                                 f"请先上传结算单（Word/PDF/图片均可），我会自动识别内容。")
+                    with _state_lock:
+                        if open_id in CONVERSATIONS:
+                            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
+                    continue
+                if at == "采购申请":
+                    cd = fields_check.get("cost_detail")
+                    if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
+                        if "cost_detail" not in miss:
+                            miss.append("cost_detail")
+                            req["missing"] = miss
+                remaining_requests.append(req)
 
-        complete = [r for r in requests if not r.get("missing")]
-        incomplete = [(r["approval_type"], r.get("missing", [])) for r in requests if r.get("missing")]
+        complete = [r for r in remaining_requests if not r.get("missing")]
+        incomplete = [(r["approval_type"], r.get("missing", [])) for r in remaining_requests if r.get("missing")]
 
         replies = []
         for req in complete:
