@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import uuid
 from urllib.parse import quote
 from collections import OrderedDict
 import httpx
@@ -97,6 +98,9 @@ def _clean_expired_pending(open_id=None):
             created = data.get("created_at", 0) if isinstance(data, dict) else 0
             if created and now - created > SEAL_INITIAL_TTL:
                 del SEAL_INITIAL_FIELDS[oid]
+        for cid in list(PENDING_CONFIRM.keys()):
+            if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
+                del PENDING_CONFIRM[cid]
     for oid, msg in to_notify:
         send_message(oid, msg)
 
@@ -238,6 +242,90 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
     resp = client.im.v1.message.create(request)
     if not resp.success():
         print(f"发送卡片消息失败: {resp.msg}")
+
+
+def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
+    """发送工单确认卡片，用户点击「确认」后创建工单"""
+    confirm_id = str(uuid.uuid4())
+    with _state_lock:
+        PENDING_CONFIRM[confirm_id] = {
+            "open_id": open_id,
+            "user_id": user_id,
+            "approval_type": approval_type,
+            "fields": dict(fields),
+            "file_codes": dict(file_codes) if file_codes else None,
+            "admin_comment": admin_comment,
+            "created_at": time.time(),
+        }
+    text = f"【{approval_type}】\n\n{summary}\n\n行政意见: {admin_comment}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
+    btn_config = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "确认提交"},
+        "type": "primary",
+        "behaviors": [{"type": "callback", "value": {"confirm_id": confirm_id}}],
+    }
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": [btn_config]},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        print(f"发送确认卡片失败: {resp.msg}")
+        with _state_lock:
+            PENDING_CONFIRM.pop(confirm_id, None)
+
+
+def on_card_action_confirm(data):
+    """处理用户点击确认按钮的回调，创建工单"""
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+    try:
+        ev = data.event
+        if not ev:
+            return P2CardActionTriggerResponse(toast={"type": "error", "content": "参数无效"})
+        operator = ev.operator
+        action = ev.action
+        open_id = operator.open_id if operator else ""
+        user_id = operator.user_id if operator else ""
+        value = action.value if action and action.value else {}
+        confirm_id = value.get("confirm_id", "")
+        if not confirm_id:
+            return P2CardActionTriggerResponse(toast={"type": "error", "content": "参数无效"})
+        with _state_lock:
+            pending = PENDING_CONFIRM.pop(confirm_id, None)
+        if not pending:
+            return P2CardActionTriggerResponse(toast={"type": "error", "content": "确认已过期，请重新发起"})
+        if time.time() - pending.get("created_at", 0) > CONFIRM_TTL:
+            return P2CardActionTriggerResponse(toast={"type": "error", "content": "确认已超时，请重新发起"})
+        approval_type = pending["approval_type"]
+        fields = pending["fields"]
+        file_codes = pending.get("file_codes")
+        admin_comment = pending.get("admin_comment", "")
+        success, msg, resp_data, summary = create_approval(user_id, approval_type, fields, file_codes=file_codes)
+        if success:
+            instance_code = resp_data.get("instance_code", "")
+            if instance_code:
+                link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+            else:
+                send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+            return P2CardActionTriggerResponse(toast={"type": "success", "content": "工单已创建"})
+        return P2CardActionTriggerResponse(toast={"type": "error", "content": f"提交失败：{msg}"})
+    except Exception as e:
+        print(f"卡片确认回调处理失败: {e}")
+        traceback.print_exc()
+        return P2CardActionTriggerResponse(toast={"type": "error", "content": "系统异常，请稍后重试"})
 
 
 def analyze_message(history):
@@ -642,6 +730,10 @@ _user_last_msg = {}
 # 开票申请：需结算单+合同双附件，分步收集
 PENDING_INVOICE = {}
 
+# 工单确认：用户点击确认按钮后创建。confirm_id -> {open_id, user_id, approval_type, fields, file_codes, admin_comment, created_at}
+PENDING_CONFIRM = {}
+CONFIRM_TTL = 15 * 60  # 15 分钟
+
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
 # 用印申请需从模版读取选项的字段
@@ -802,7 +894,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_code):
-    """用印申请字段齐全时，直接创建工单"""
+    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单"""
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
@@ -810,7 +902,8 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
 
     file_codes = {ATTACHMENT_FIELD_ID: [file_code]} if file_code else {}
     admin_comment = get_admin_comment("用印申请", all_fields)
-    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=file_codes)
+    summary = format_fields_summary(all_fields, "用印申请")
+    send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=file_codes)
 
     with _state_lock:
         if open_id in PENDING_SEAL:
@@ -818,21 +911,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
         if open_id in CONVERSATIONS:
             CONVERSATIONS[open_id] = []
 
-    if success:
-        instance_code = resp_data.get("instance_code", "")
-        if instance_code:
-            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            card_content = f"【用印申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
-        else:
-            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
-    else:
-        send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
-        if not _is_retryable_error(msg):
-            with _state_lock:
-                if open_id in PENDING_SEAL:
-                    del PENDING_SEAL[open_id]
-            send_message(open_id, "请检查信息后重新发起申请。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -980,7 +1059,7 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
 
 
 def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
-    """开票申请字段齐全时创建工单"""
+    """开票申请字段齐全时，发送确认卡片，用户点击确认后创建工单"""
     aid = _get_invoice_attachment_field_ids()
     file_codes = {}
     if aid.get("settlement") and settlement_code:
@@ -988,7 +1067,6 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
     if aid.get("contract") and contract_code:
         file_codes[aid["contract"]] = [contract_code]
     if not aid and (settlement_code or contract_code):
-        # 表单未缓存到附件字段时，尝试用第一个附件字段
         token = get_token()
         cached = get_form_fields("开票申请", APPROVAL_CODES["开票申请"], token)
         attach_ids = [fid for fid, info in (cached or {}).items()
@@ -999,7 +1077,8 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
                 file_codes[fid] = [codes[i]]
 
     admin_comment = get_admin_comment("开票申请", all_fields)
-    success, msg, resp_data, summary = create_approval(user_id, "开票申请", all_fields, file_codes=file_codes or None)
+    summary = format_fields_summary(all_fields, "开票申请")
+    send_confirm_card(open_id, "开票申请", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None)
 
     with _state_lock:
         if open_id in PENDING_INVOICE:
@@ -1007,21 +1086,7 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
         if open_id in CONVERSATIONS:
             CONVERSATIONS[open_id] = []
 
-    if success:
-        instance_code = resp_data.get("instance_code", "")
-        if instance_code:
-            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            card_content = f"【开票申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
-        else:
-            send_message(open_id, f"· 开票申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
-    else:
-        send_message(open_id, f"· 开票申请：❌ 提交失败 - {msg}")
-        if not _is_retryable_error(msg):
-            with _state_lock:
-                if open_id in PENDING_INVOICE:
-                    del PENDING_INVOICE[open_id]
-            send_message(open_id, "请检查信息后重新发起申请。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
 
 def _try_complete_invoice(open_id, user_id, text):
@@ -1261,25 +1326,8 @@ def on_message(data):
                     send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
                     replies.append(f"· {approval_type}：已整理，请点击按钮提交")
                 else:
-                    success, msg, resp_data, form_summary = create_approval(user_id, approval_type, fields)
-                    if success:
-                        instance_code = resp_data.get("instance_code", "")
-                        if instance_code:
-                            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                            card_content = f"【{approval_type}】\n{form_summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
-                            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
-                            # 已发卡片，不再重复发送文字详情
-                        else:
-                            replies.append(f"· {approval_type}：✅ 已提交\n{form_summary}\n行政意见: {admin_comment}")
-                    else:
-                        print(f"创建审批失败[{approval_type}]: {msg}")
-                        if "free process" in msg.lower() or "unsupported approval" in msg.lower():
-                            mark_free_process(approval_code)
-                            link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
-                            send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n该类型暂不支持自动创建。请点击下方按钮在飞书中发起：", link, f"打开{approval_type}审批表单")
-                            replies.append(f"· {approval_type}：已整理信息，请点击卡片按钮发起")
-                        else:
-                            replies.append(f"· {approval_type}：❌ 提交失败 - {msg}")
+                    send_confirm_card(open_id, approval_type, format_fields_summary(fields, approval_type), admin_comment, user_id, fields)
+                    replies.append(f"· {approval_type}：请确认信息后点击卡片按钮提交")
 
         if incomplete:
             parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]
@@ -1371,10 +1419,28 @@ def _start_health_server():
 if __name__ == "__main__":
     threading.Thread(target=_start_health_server, daemon=True).start()
 
+    # 飞书卡片回调以 CARD 消息类型推送，需当作 EVENT 处理以触发 on_card_action_confirm
+    import lark_oapi.ws.client as _ws_client
+    from lark_oapi.ws.enum import MessageType as _MT
+    _orig_hdf = _ws_client.Client._handle_data_frame
+
+    async def _patched_handle_data(self, frame):
+        hs = frame.headers
+        type_val = _ws_client._get_by_key(hs, _ws_client.HEADER_TYPE)
+        if type_val == _MT.CARD.value:
+            for h in hs:
+                if h.key == _ws_client.HEADER_TYPE:
+                    h.value = _MT.EVENT.value
+                    break
+        return await _orig_hdf(self, frame)
+
+    _ws_client.Client._handle_data_frame = _patched_handle_data
+
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .register_p2_im_message_message_read_v1(_on_message_read) \
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_on_message_read) \
+        .register_p2_card_action_trigger(on_card_action_confirm) \
         .build()
     ws_client = lark.ws.Client(
         FEISHU_APP_ID,
