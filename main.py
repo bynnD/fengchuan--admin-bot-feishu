@@ -565,6 +565,15 @@ def build_form(approval_type, fields, token, file_codes=None):
             logical_key = field_name
 
         raw = fields.get(logical_key) or fields.get(field_id) or fields.get(field_name) or ""
+        if not raw and field_type == "amount":
+            raw = fields.get("amount") or fields.get("金额") or ""
+        if not raw and field_name in ("开票金额", "发票金额"):
+            raw = fields.get("amount") or ""
+        # 开票申请：客户/开票名称、税务登记证号/社会统一信用代码 等表单字段名兜底
+        if not raw and field_name in ("客户/开票名称", "购方名称", "开票抬头"):
+            raw = fields.get("buyer_name") or ""
+        if not raw and field_name in ("税务登记证号/社会统一信用代码", "购方税号", "税务登记证号", "社会统一信用代码"):
+            raw = fields.get("tax_id") or ""
         if raw:
             used_keys.add(logical_key)
         if not raw and logical_key == "reason":
@@ -1123,11 +1132,22 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
 
     type_label = "结算单" if file_type == "settlement" else "合同"
     if has_settlement and has_contract:
-        summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
-        send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
-                     "请补充以下必填项（一条消息说完即可）：\n"
-                     "1. 发票类型（如：增值税专用发票、普通发票等）\n"
-                     "2. 开票项目（如：技术服务费、广告费等）")
+        with _state_lock:
+            pending = PENDING_INVOICE.get(open_id)
+            doc_fields_final = dict(pending.get("doc_fields", {})) if pending else dict(doc_fields)
+            settlement_code = pending.get("settlement_file_code") if pending else None
+            contract_code = pending.get("contract_file_code") if pending else None
+            user_id = pending.get("user_id", "") if pending else user_id
+        has_invoice_type = bool(doc_fields_final.get("invoice_type"))
+        has_invoice_items = bool(doc_fields_final.get("invoice_items"))
+        if has_invoice_type and has_invoice_items:
+            _do_create_invoice(open_id, user_id, doc_fields_final, settlement_code, contract_code)
+        else:
+            summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
+            send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
+                         "请补充以下必填项（一条消息说完即可）：\n"
+                         "1. 发票类型（如：增值税专用发票、普通发票等）\n"
+                         "2. 开票项目（如：技术服务费、广告费等）")
     else:
         need = "合同" if not has_contract else "结算单"
         send_message(open_id, f"已接收{type_label}：{file_name}\n请继续上传{need}（Word/PDF/图片均可）。")
@@ -1337,12 +1357,14 @@ def on_message(data):
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                     continue
                 if at == "开票申请" and open_id not in PENDING_INVOICE:
+                    initial = req.get("fields", {})
+                    doc_fields_init = {k: v for k, v in initial.items() if v and str(v).strip()} if initial else {}
                     with _state_lock:
                         PENDING_INVOICE[open_id] = {
                             "step": "need_settlement",
                             "settlement_file_code": None,
                             "contract_file_code": None,
-                            "doc_fields": {},
+                            "doc_fields": doc_fields_init,
                             "user_id": user_id,
                             "created_at": time.time(),
                         }

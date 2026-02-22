@@ -38,8 +38,14 @@ FIELD_LABELS = {
     "remarks":       "备注",
 }
 
-# 表单字段名可能为「购方名称」或「开票抬头」，均映射到 buyer_name
-FIELD_NAME_ALIASES = {"购方名称": "buyer_name", "开票抬头": "buyer_name"}
+# 表单字段名可能为「购方名称」「开票抬头」「客户/开票名称」等，均映射到 buyer_name；
+# 「购方税号」「税务登记证号」「社会统一信用代码」等映射到 tax_id；「开票金额」「发票金额」映射到 amount
+FIELD_NAME_ALIASES = {
+    "购方名称": "buyer_name", "开票抬头": "buyer_name", "客户/开票名称": "buyer_name",
+    "购方税号": "tax_id", "税务登记证号": "tax_id", "社会统一信用代码": "tax_id",
+    "税务登记证号/社会统一信用代码": "tax_id",
+    "开票金额": "amount", "发票金额": "amount",
+}
 # 表单字段 ID 占位，实际值由 get_form_fields 缓存或 debug-form 获取后填写
 FIELD_ID_FALLBACK = {}
 FIELD_ORDER = ["invoice_type", "invoice_items", "amount", "buyer_name", "tax_id", "contract_no", "settlement_no", "remarks"]
