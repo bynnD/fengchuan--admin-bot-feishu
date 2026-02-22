@@ -924,8 +924,19 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
     doc_fields = {**doc_fields, **ai_fields}
     # 仅当首次消息有有效值时才覆盖，避免空值覆盖 AI 识别结果
+    # company、seal_type 若已由文件 AI 识别，则仅当首次消息提供的是有效选项值时才覆盖，防止占位符覆盖
     for k, v in initial_fields.items():
-        if v and str(v).strip():
+        if not v or not str(v).strip():
+            continue
+        v = str(v).strip()
+        if k == "company" and ai_fields.get("company"):
+            if company_opts and v in company_opts:
+                doc_fields[k] = v
+            # 否则保留 ai_fields 的识别结果，不覆盖
+        elif k == "seal_type" and ai_fields.get("seal_type"):
+            if seal_opts and v in seal_opts:
+                doc_fields[k] = v
+        else:
             doc_fields[k] = v
     doc_fields.setdefault("usage_method", "盖章")
 
@@ -937,9 +948,9 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         })
 
     missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not doc_fields.get(k)]
-    if missing and ai_fields:
-        logger.debug("用印合并后仍缺失 %s，doc_fields: company=%r, seal_type=%r, reason=%r",
-                     missing, doc_fields.get('company'), doc_fields.get('seal_type'), doc_fields.get('reason'))
+    if missing and ai_fields and ("company" in missing or "seal_type" in missing):
+        logger.warning("用印合并异常: AI已识别 company=%r seal_type=%r 但仍被列为缺失，initial_fields=%r",
+                       ai_fields.get("company"), ai_fields.get("seal_type"), initial_fields)
     if not missing:
         # 全部可推断，直接创建工单
         _do_create_seal(open_id, user_id, doc_fields, file_code)
