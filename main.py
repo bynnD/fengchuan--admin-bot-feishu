@@ -54,7 +54,7 @@ _token_lock = threading.Lock()
 # 待办 TTL（秒）
 PENDING_TTL = 30 * 60  # 30 分钟
 SEAL_INITIAL_TTL = 30 * 60  # 30 分钟
-# 用户先上传附件但未说明意图时暂存，等用户说明用印/开票后再处理
+# 用户先上传附件但未说明意图时暂存，等用户说明用印/开票后再处理。支持多文件，结构 {open_id: {"files": [{...}], "created_at", "timer"}}
 PENDING_FILE_UNCLEAR = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
 
@@ -136,7 +136,12 @@ def _clean_expired_pending(open_id=None):
                 del SEAL_INITIAL_FIELDS[oid]
         for oid in list(PENDING_FILE_UNCLEAR.keys()) if open_id is None else ([open_id] if open_id in PENDING_FILE_UNCLEAR else []):
             if oid in PENDING_FILE_UNCLEAR and now - PENDING_FILE_UNCLEAR[oid].get("created_at", 0) > PENDING_TTL:
-                del PENDING_FILE_UNCLEAR[oid]
+                entry = PENDING_FILE_UNCLEAR.pop(oid, None)
+                if entry and entry.get("timer"):
+                    try:
+                        entry["timer"].cancel()
+                    except Exception:
+                        pass
         for cid in list(PENDING_CONFIRM.keys()):
             if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
                 del PENDING_CONFIRM[cid]
@@ -322,10 +327,14 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
         logger.error("发送卡片消息失败: %s", resp.msg)
 
 
-def send_file_intent_options_card(open_id, file_name):
-    """发送文件意图选择卡片：用印申请 / 开票申请，3 分钟内未说明意图时使用"""
+def send_file_intent_options_card(open_id, file_names):
+    """发送文件意图选择卡片：用印申请 / 开票申请，3 分钟内未说明意图时使用。file_names 可为 str 或 list"""
+    if isinstance(file_names, list):
+        names_str = "、".join(f"「{n}」" for n in file_names)
+    else:
+        names_str = f"「{file_names}」"
     text = (
-        f"已收到文件「{file_name}」。\n\n"
+        f"已收到文件{names_str}。\n\n"
         f"请选择您需要办理的业务："
     )
     card = {
@@ -355,23 +364,36 @@ def send_file_intent_options_card(open_id, file_name):
 
 
 def _schedule_file_intent_card(open_id):
-    """3 分钟后若用户仍未说明意图，发送意图选择选项卡"""
+    """3 分钟后若用户仍未说明意图，发送意图选择选项卡。会取消该用户之前的定时器"""
 
     def _send():
         with _state_lock:
             pending = PENDING_FILE_UNCLEAR.get(open_id)
         if not pending:
             return
-        file_name = pending.get("file_name", "未知文件")
-        send_file_intent_options_card(open_id, file_name)
+        files = pending.get("files", [])
+        if not files:
+            return
+        file_names = [f.get("file_name", "未知文件") for f in files]
+        send_file_intent_options_card(open_id, file_names)
 
+    with _state_lock:
+        old = PENDING_FILE_UNCLEAR.get(open_id)
+        if old and old.get("timer"):
+            try:
+                old["timer"].cancel()
+            except Exception:
+                pass
     timer = threading.Timer(FILE_INTENT_WAIT_SEC, _send)
     timer.daemon = True
     timer.start()
+    with _state_lock:
+        if open_id in PENDING_FILE_UNCLEAR:
+            PENDING_FILE_UNCLEAR[open_id]["timer"] = timer
 
 
-def send_seal_options_card(open_id, user_id, doc_fields, file_code, file_name):
-    """发送用印补充选项卡片：律师是否已审核、盖章还是外带，用户点击选择"""
+def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
+    """发送用印补充选项卡片：律师是否已审核、盖章还是外带，用户点击选择。file_codes 为 list"""
     opts = _get_seal_form_options()
     lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
     usage_opts = opts.get("usage_method", ["盖章", "外带"])
@@ -481,14 +503,22 @@ def on_card_action_confirm(data):
             intent = value.get("intent", "")
             with _state_lock:
                 pending_file = PENDING_FILE_UNCLEAR.pop(open_id, None)
-            if not pending_file:
+                if pending_file and pending_file.get("timer"):
+                    try:
+                        pending_file["timer"].cancel()
+                    except Exception:
+                        pass
+            if not pending_file or not pending_file.get("files"):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
             if intent == "用印申请":
+                files_list = pending_file.get("files", [])
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
-                _handle_file_message(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                if files_list:
+                    _handle_file_message(open_id, user_id, None, None, files_list=files_list)
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请，正在处理"}})
             if intent == "开票申请":
+                files_list = pending_file.get("files", [])
                 with _state_lock:
                     PENDING_INVOICE[open_id] = {
                         "step": "need_settlement",
@@ -498,7 +528,9 @@ def on_card_action_confirm(data):
                         "user_id": user_id,
                         "created_at": time.time(),
                     }
-                _handle_invoice_file(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                if files_list:
+                    f0 = files_list[0]
+                    _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         # 用印选项卡片：律师是否已审核、盖章还是外带
@@ -526,11 +558,11 @@ def on_card_action_confirm(data):
 
             missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
             if not missing:
-                file_code = pending.get("file_code")
+                file_codes = pending.get("file_codes") or []
                 with _state_lock:
                     if open_id in PENDING_SEAL:
                         del PENDING_SEAL[open_id]
-                _do_create_seal(open_id, user_id, doc_fields, file_code)
+                _do_create_seal(open_id, user_id, doc_fields, file_codes)
                 send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
@@ -1032,39 +1064,79 @@ def _get_invoice_attachment_field_ids():
     return result
 
 
-def _handle_file_message(open_id, user_id, message_id, content_json):
-    """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段"""
-    file_key = content_json.get("file_key", "")
-    file_name = content_json.get("file_name", "未知文件")
-    if not file_key:
-        send_message(open_id, "无法获取文件，请重新发送。")
-        return
+def _handle_file_message(open_id, user_id, message_id, content_json, files_list=None):
+    """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段。
+    files_list: 可选，多文件时传入 [{"message_id", "content_json", "file_name"}, ...]，单文件时用 message_id/content_json"""
+    if files_list:
+        file_codes_collect = []
+        doc_fields = None
+        first_file_name = ""
+        for i, f in enumerate(files_list):
+            msg_id = f.get("message_id")
+            cj = f.get("content_json", {})
+            fname = f.get("file_name", cj.get("file_name", "未知文件"))
+            fkey = cj.get("file_key", "")
+            if not fkey:
+                send_message(open_id, f"无法获取文件「{fname}」，请重新发送。")
+                return
+            send_message(open_id, f"正在处理文件「{fname}」（{i+1}/{len(files_list)}），请稍候...")
+            file_content, dl_err = download_message_file(msg_id, fkey, "file")
+            if not file_content:
+                err_detail = f"（{dl_err}）" if dl_err else ""
+                send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{err_detail}".strip())
+                return
+            logger.info("用印文件: 已下载 %s, 大小=%d bytes", fname, len(file_content))
+            file_code, upload_err = upload_approval_file(fname, file_content)
+            if not file_code:
+                err_detail = f"（{upload_err}）" if upload_err else ""
+                send_message(open_id, f"文件「{fname}」上传失败。{err_detail}".strip())
+                return
+            file_codes_collect.append(file_code)
+            if i == 0:
+                first_file_name = fname
+        file_code = file_codes_collect[0] if len(file_codes_collect) == 1 else None
+        file_codes = file_codes_collect
+        file_name = first_file_name
+        # 获取首文件内容用于 AI 识别
+        file_content, _ = download_message_file(files_list[0]["message_id"], files_list[0]["content_json"].get("file_key", ""), "file")
+        if not file_content:
+            send_message(open_id, f"文件「{first_file_name}」下载失败，请重新发送。")
+            return
+        doc_name = first_file_name.rsplit(".", 1)[0] if "." in first_file_name else first_file_name
+        if len(files_list) > 1:
+            doc_name = "、".join(f.get("file_name", "").rsplit(".", 1)[0] for f in files_list[:5]) + (" 等" if len(files_list) > 5 else "")
+        doc_count = str(len(files_list))
+        ext = (first_file_name.rsplit(".", 1)[-1] or "").lower()
+        doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
+        doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
+        doc_fields = {"document_name": doc_name, "document_count": doc_count, "document_type": doc_type}
+    else:
+        file_key = content_json.get("file_key", "")
+        file_name = content_json.get("file_name", "未知文件")
+        if not file_key:
+            send_message(open_id, "无法获取文件，请重新发送。")
+            return
+        send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
+        file_content, dl_err = download_message_file(message_id, file_key, "file")
+        if not file_content:
+            err_detail = f"（{dl_err}）" if dl_err else ""
+            send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
+            return
+        logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
+        file_code, upload_err = upload_approval_file(file_name, file_content)
+        if not file_code:
+            err_detail = f"（{upload_err}）" if upload_err else ""
+            send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
+            return
+        file_codes = [file_code]
+        doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+        doc_count = "1"
+        ext = (file_name.rsplit(".", 1)[-1] or "").lower()
+        doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
+        doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
+        doc_fields = {"document_name": doc_name, "document_count": doc_count, "document_type": doc_type}
 
-    send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
-
-    file_content, dl_err = download_message_file(message_id, file_key, "file")
-    if not file_content:
-        err_detail = f"（{dl_err}）" if dl_err else ""
-        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
-        return
-    logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
-
-    file_code, upload_err = upload_approval_file(file_name, file_content)
-    if not file_code:
-        err_detail = f"（{upload_err}）" if upload_err else ""
-        send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
-        return
-
-    doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-    ext = (file_name.rsplit(".", 1)[-1] or "").lower()
-    doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
-    doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
-
-    doc_fields = {
-        "document_name": doc_name,
-        "document_count": "1",
-        "document_type": doc_type,
-    }
+    # 以下为共用逻辑（单文件与多文件）
 
     opts = _get_seal_form_options()
     company_opts = opts.get("company", [])
@@ -1125,13 +1197,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
                        ai_fields.get("company"), ai_fields.get("seal_type"), initial_fields)
     if not missing:
         # 全部可推断，直接创建工单
-        _do_create_seal(open_id, user_id, doc_fields, file_code)
+        _do_create_seal(open_id, user_id, doc_fields, file_codes)
         return
 
     with _state_lock:
         PENDING_SEAL[open_id] = {
             "doc_fields": doc_fields,
-            "file_code": file_code,
+            "file_codes": file_codes,
             "user_id": user_id,
             "created_at": time.time(),
         }
@@ -1139,7 +1211,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
         doc_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择，避免从文本推断后直接进入确认
-        send_seal_options_card(open_id, user_id, doc_fields, file_code, file_name)
+        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name)
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
@@ -1160,16 +1232,17 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         send_message(open_id, "\n".join(lines))
 
 
-def _do_create_seal(open_id, user_id, all_fields, file_code):
-    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单"""
+def _do_create_seal(open_id, user_id, all_fields, file_codes=None):
+    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单。file_codes 为 list，支持多文件"""
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
 
-    file_codes = {ATTACHMENT_FIELD_ID: [file_code]} if file_code else {}
+    codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
+    fc = {ATTACHMENT_FIELD_ID: codes} if codes else {}
     admin_comment = get_admin_comment("用印申请", all_fields)
     summary = format_fields_summary(all_fields, "用印申请")
-    send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=file_codes)
+    send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
 
     with _state_lock:
         if open_id in PENDING_SEAL:
@@ -1194,7 +1267,6 @@ def _try_complete_seal(open_id, user_id, text):
         return True
 
     doc_fields = pending["doc_fields"]
-    file_code = pending.get("file_code")
 
     opts = _get_seal_form_options()
     company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
@@ -1291,7 +1363,8 @@ def _try_complete_seal(open_id, user_id, text):
             send_message(open_id, hint)
         return True
 
-    _do_create_seal(open_id, user_id, all_fields, file_code)
+    file_codes = pending.get("file_codes") or []
+    _do_create_seal(open_id, user_id, all_fields, file_codes)
     return True
 
 
@@ -1524,17 +1597,20 @@ def on_message(data):
             elif is_seal or expects_seal:
                 _handle_file_message(open_id, user_id, message_id, content_json)
             else:
-                # 用户先上传附件但未说明意图，先询问再处理
+                # 用户先上传附件但未说明意图，先询问再处理。支持多文件，追加到列表
                 file_name = content_json.get("file_name", "未知文件")
                 with _state_lock:
-                    PENDING_FILE_UNCLEAR[open_id] = {
+                    if open_id not in PENDING_FILE_UNCLEAR:
+                        PENDING_FILE_UNCLEAR[open_id] = {"files": [], "created_at": time.time()}
+                    PENDING_FILE_UNCLEAR[open_id]["files"].append({
                         "file_key": content_json.get("file_key", ""),
                         "message_id": message_id,
                         "file_name": file_name,
                         "content_json": content_json,
-                        "created_at": time.time(),
-                    }
-                send_message(open_id, f"已收到文件「{file_name}」。请问您需要办理：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+                    })
+                    PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
+                count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
+                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
                 _schedule_file_intent_card(open_id)
             return
 
@@ -1566,7 +1642,8 @@ def on_message(data):
         with _state_lock:
             in_seal = open_id in PENDING_SEAL
             in_invoice = open_id in PENDING_INVOICE
-            pending_file = PENDING_FILE_UNCLEAR.get(open_id)
+            pf = PENDING_FILE_UNCLEAR.get(open_id)
+            pending_file = pf if (pf and pf.get("files")) else None
         if in_seal:
             if _try_complete_seal(open_id, user_id, text):
                 return
@@ -1578,7 +1655,12 @@ def on_message(data):
         if pending_file:
             if _is_cancel_intent(text):
                 with _state_lock:
-                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    entry = PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    if entry and entry.get("timer"):
+                        try:
+                            entry["timer"].cancel()
+                        except Exception:
+                            pass
                 send_message(open_id, "已取消。如需办理用印或开票，请重新上传文件并说明用途。")
                 return
             with _state_lock:
@@ -1592,17 +1674,30 @@ def on_message(data):
             needs_seal = any(r.get("approval_type") == "用印申请" for r in requests)
             needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
             if needs_seal and not needs_invoice:
+                files_list = pending_file.get("files", [])
                 with _state_lock:
-                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    entry = PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    if entry and entry.get("timer"):
+                        try:
+                            entry["timer"].cancel()
+                        except Exception:
+                            pass
                 req_seal = next((r for r in requests if r.get("approval_type") == "用印申请"), None)
                 if req_seal and req_seal.get("fields"):
                     with _state_lock:
                         SEAL_INITIAL_FIELDS[open_id] = {"fields": req_seal["fields"], "created_at": time.time()}
-                _handle_file_message(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                if files_list:
+                    _handle_file_message(open_id, user_id, None, None, files_list=files_list)
                 return
             if needs_invoice and not needs_seal:
+                files_list = pending_file.get("files", [])
                 with _state_lock:
-                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    entry = PENDING_FILE_UNCLEAR.pop(open_id, None)
+                    if entry and entry.get("timer"):
+                        try:
+                            entry["timer"].cancel()
+                        except Exception:
+                            pass
                 req_inv = next((r for r in requests if r.get("approval_type") == "开票申请"), None)
                 doc_fields_init = {k: v for k, v in (req_inv.get("fields") or {}).items() if v and str(v).strip()} if req_inv else {}
                 with _state_lock:
@@ -1614,7 +1709,9 @@ def on_message(data):
                         "user_id": user_id,
                         "created_at": time.time(),
                     }
-                _handle_invoice_file(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                if files_list:
+                    f0 = files_list[0]
+                    _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
                 return
             if needs_seal and needs_invoice:
                 send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请** 还是 **开票申请**？回复「用印」或「开票」。")
