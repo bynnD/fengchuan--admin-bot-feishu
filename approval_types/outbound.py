@@ -21,4 +21,4 @@ DATE_FIELDS = {"start_date", "end_date"}
 
 
 def get_admin_comment(fields):
-    return "外出报备已登记。"
+    return "请核实以上填报信息无误后提交"

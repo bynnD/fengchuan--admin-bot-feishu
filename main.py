@@ -13,6 +13,11 @@ from approval_types import (
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment, get_file_extractor
 )
+from approval_rules_loader import check_switch_command, get_auto_approve_user_ids
+from approval_auto import (
+    is_auto_approval_enabled,
+    set_auto_approval_enabled,
+)
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
 from deepseek_client import call_deepseek_with_retry
 import datetime
@@ -324,7 +329,7 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             "admin_comment": admin_comment,
             "created_at": time.time(),
         }
-    text = f"【{approval_type}】\n\n{summary}\n\n行政意见: {admin_comment}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
+    text = f"【{approval_type}】\n\n{summary}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
     btn_config = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": "确认提交"},
@@ -387,9 +392,9 @@ def on_card_action_confirm(data):
             instance_code = resp_data.get("instance_code", "")
             if instance_code:
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
-                send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+                send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "工单已创建"}})
         return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": f"提交失败：{msg}"}})
     except Exception as e:
@@ -1305,6 +1310,22 @@ def on_message(data):
             send_message(open_id, _get_usage_guide_message())
             return
 
+        # 自动审批开关：仅 auto_approve_user_ids 中的用户可操作
+        if user_id in get_auto_approve_user_ids():
+            cmd = check_switch_command(text)
+            if cmd == "enable":
+                set_auto_approval_enabled(True, user_id)
+                send_message(open_id, "已开启自动审批。")
+                return
+            if cmd == "disable":
+                set_auto_approval_enabled(False, user_id)
+                send_message(open_id, "已关闭自动审批。")
+                return
+            if cmd == "query":
+                status = "已开启" if is_auto_approval_enabled() else "已关闭"
+                send_message(open_id, f"自动审批当前状态：{status}")
+                return
+
         with _state_lock:
             in_seal = open_id in PENDING_SEAL
             in_invoice = open_id in PENDING_INVOICE
@@ -1417,7 +1438,6 @@ def on_message(data):
                 link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
                 tip = (
                     f"【{approval_type}】\n{summary}\n\n"
-                    f"行政意见: {admin_comment}\n\n"
                     f"请点击下方按钮发起工单（需在飞书客户端内打开）。"
                     f"若链接无效，请到 飞书 → 审批 → 发起审批 → 选择「{approval_type}」手动填写。"
                 )
@@ -1431,7 +1451,6 @@ def on_message(data):
                     link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={approval_code}"
                     tip = (
                         f"【{approval_type}】\n{summary}\n\n"
-                        f"行政意见: {admin_comment}\n\n"
                         f"该类型暂不支持自动创建，请点击下方按钮在飞书中发起（需在飞书客户端内打开）："
                     )
                     send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
@@ -1536,6 +1555,19 @@ def _start_health_server():
     server.serve_forever()
 
 
+def _start_auto_approval_polling():
+    """定时轮询待审批任务并执行自动审批"""
+    from approval_auto import poll_and_process, is_auto_approval_enabled
+    interval = int(os.environ.get("AUTO_APPROVAL_POLL_INTERVAL", 300))
+    while True:
+        try:
+            time.sleep(interval)
+            if is_auto_approval_enabled():
+                poll_and_process(get_token)
+        except Exception as e:
+            logger.exception("自动审批轮询异常: %s", e)
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -1544,6 +1576,7 @@ if __name__ == "__main__":
     )
     _validate_env()
     threading.Thread(target=_start_health_server, daemon=True).start()
+    threading.Thread(target=_start_auto_approval_polling, daemon=True).start()
 
     # 飞书卡片回调以 CARD 消息类型推送，需当作 EVENT 处理以触发 on_card_action_confirm。
     # 猴子补丁：将 _handle_data_frame 收到的 CARD 帧的 type 改为 EVENT，使 EventDispatcherHandler 路由到 on_card_action_confirm。

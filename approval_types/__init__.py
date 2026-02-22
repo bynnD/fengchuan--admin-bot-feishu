@@ -66,4 +66,4 @@ def get_admin_comment(approval_type, fields):
     for t in _TYPES:
         if t.NAME == approval_type:
             return t.get_admin_comment(fields)
-    return "行政审核：已确认，同意。"
+    return "请核实以上填报信息无误后提交"

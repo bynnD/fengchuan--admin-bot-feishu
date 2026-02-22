@@ -54,7 +54,7 @@ SUPPORTS_IMAGE = True
 
 
 def get_admin_comment(fields):
-    return "行政审核：开票申请已核实，同意。"
+    return "请核实以上填报信息无误后提交"
 
 
 def extract_fields_from_file(file_content, file_name, form_opts, get_token):

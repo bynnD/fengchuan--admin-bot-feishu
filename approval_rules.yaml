@@ -1,0 +1,44 @@
+# 自动审批规则配置
+# 总开关由用户 531dcb19 通过对话控制，此处为首次部署默认值
+default_enabled: false
+
+# 启用自动审批的审批人 user_id 列表
+auto_approve_user_ids:
+  - "531dcb19"
+
+# 不参与自动审批的工单类型
+exclude_types:
+  - "外出报备"
+
+# 开关固定指令（仅 auto_approve_user_ids 中的用户有效）
+switch_commands:
+  enable:
+    - "开启自动审批"
+    - "打开自动审批"
+  disable:
+    - "关闭自动审批"
+  query:
+    - "自动审批状态"
+    - "自动审批开没开"
+
+# 用印类型与文件类型匹配规则（供 AI 参考，可适当补充）
+seal_type_rules:
+  合同章: "各类业务合同、协议、补充协议等"
+  公章: "银行开户、支票背书、税务申报、公司发出的正式公文、信函、证明、重要合同（投资合同、战略合作等）、报送政府部门的各类材料"
+  法人章: "代表法定代表人个人的文件"
+  财务章: "银行开户、支票领用、汇票背书、现金支取及其他银行业务等"
+
+# 各工单类型规则
+rules:
+  采购申请:
+    enabled: true
+    pass_comment: "采购申请已核实，已自动审批通过。"
+
+  开票申请:
+    enabled: true
+    pass_comment: "开票申请已核实，已自动审批通过。"
+
+  用印申请:
+    enabled: true
+    ai_check: true
+    pass_comment: "用印申请已核实，文件类型与用印类型匹配，已自动审批通过。"

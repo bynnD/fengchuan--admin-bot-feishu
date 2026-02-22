@@ -57,7 +57,7 @@ SUPPORTS_IMAGE = True
 
 
 def get_admin_comment(fields):
-    return "行政审核：用印申请已核实，同意。"
+    return "请核实以上填报信息无误后提交"
 
 
 # 用印公司默认选项（当表单未返回时使用）

@@ -32,21 +32,4 @@ DATE_FIELDS = {"expected_date"}
 
 
 def get_admin_comment(fields):
-    try:
-        cost_detail = fields.get("cost_detail", "0")
-        total = 0
-        if isinstance(cost_detail, list):
-            for item in cost_detail:
-                if isinstance(item, dict):
-                    amt = str(item.get("金额") or item.get("amount") or "0")
-                    total += float("".join(c for c in amt if c.isdigit() or c == ".") or "0")
-        else:
-            total = float("".join(c for c in str(cost_detail) if c.isdigit() or c == ".") or "0")
-        if total <= 1000:
-            return "行政审核：金额1000元以内，同意。"
-        elif total <= 5000:
-            return "行政审核：金额在5000元以内，同意，请附报价单。"
-        else:
-            return "行政审核：金额超过5000元，需总经理审批确认。"
-    except Exception:
-        return "行政审核：采购申请已收到，请确认费用明细。"
+    return "请核实以上填报信息无误后提交"
