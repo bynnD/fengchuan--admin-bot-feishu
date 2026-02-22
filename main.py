@@ -1021,6 +1021,8 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         elif k == "seal_type" and ai_fields.get("seal_type"):
             if seal_opts and v in seal_opts:
                 doc_fields[k] = v
+        elif k == "usage_method":
+            pass  # 不采纳 initial_fields 中的 usage_method，强制用户通过选项卡点击选择
         else:
             doc_fields[k] = v
     # 不在此处默认 usage_method，选项卡需用户显式选择「盖章」或「外带」后再进入确认
@@ -1057,6 +1059,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
     # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
+        doc_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择，避免从文本推断后直接进入确认
         send_seal_options_card(open_id, user_id, doc_fields, file_code, file_name)
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
@@ -1199,6 +1202,7 @@ def _try_complete_seal(open_id, user_id, text):
             entry["retry_count"] = retry_count
             entry["doc_fields"] = all_fields
         if set(missing) <= {"lawyer_reviewed", "usage_method"}:
+            all_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择
             # 避免重复发送选项卡，仅提示用户点击上方卡片
             send_message(open_id, "请点击上方卡片的选项完成「律师是否已审核」和「盖章还是外带」的选择。")
         else:
