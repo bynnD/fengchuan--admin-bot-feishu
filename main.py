@@ -224,7 +224,21 @@ def upload_approval_file(file_name, file_content):
         return None, str(e)
 
 
+def _sanitize_message_text(text):
+    """飞书消息内容校验：移除控制字符、限制长度，避免 invalid message content 错误"""
+    if not text or not isinstance(text, str):
+        return " "
+    # 移除控制字符（保留 \n \r \t）
+    sanitized = "".join(c for c in text if c in "\n\r\t" or ord(c) >= 32)
+    # 飞书文本消息限制约 20KB，预留余量
+    max_len = 18000
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len] + "\n...(内容过长已截断)"
+    return sanitized.strip() or " "
+
+
 def send_message(open_id, text):
+    text = _sanitize_message_text(text)
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
         .msg_type("text") \
@@ -236,7 +250,7 @@ def send_message(open_id, text):
         .build()
     resp = client.im.v1.message.create(request)
     if not resp.success():
-        logger.error("发送消息失败: %s", resp.msg)
+        logger.error("发送消息失败: %s, content前100字: %r", resp.msg, text[:100])
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
@@ -388,6 +402,7 @@ def analyze_message(history):
         f"purchase_type(采购类别)可根据采购物品自动推断，如办公电脑、办公桌→办公用品，设备、机器→设备类等。\n"
         f"7. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
         f"document_name/document_type不需要用户说，会从上传文件自动获取。"
+        f"lawyer_reviewed(律师是否已审核)必须用户明确提供「是」或「否」，未明确说明则放入 missing。"
         f"若用户明确说「盖公章」「要盖公章」「公章」等，必须将 seal_type 提取为「公章」，不要放入 missing。"
         f"若用户还没上传文件，在 unclear 中提示「请上传需要盖章的文件」。\n\n"
         f"返回JSON：\n"
@@ -400,10 +415,20 @@ def analyze_message(history):
     try:
         res = call_deepseek_with_retry(messages, response_format={"type": "json_object"}, timeout=30)
         content = res.json()["choices"][0]["message"]["content"]
+        if content is None:
+            raise ValueError("AI 返回内容为空")
         content = content.strip()
+        if not content:
+            raise ValueError("AI 返回内容为空")
         if content.startswith("```"):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        raw = json.loads(content)
+        if not content:
+            raise ValueError("AI 返回内容为空")
+        try:
+            raw = json.loads(content)
+        except json.JSONDecodeError as je:
+            logger.warning("AI 返回非 JSON，content 前 200 字: %r", content[:200])
+            raise ValueError(f"AI 返回格式异常: {je}") from je
         if "requests" in raw:
             return raw
         if raw.get("approval_type"):
@@ -567,7 +592,12 @@ def build_form(approval_type, fields, token, file_codes=None):
             if fallback_subs:
                 field_info = {**field_info, "sub_fields": fallback_subs}
         value = _format_field_value(logical_key, raw, field_type, field_info)
-        ftype = field_type if field_type in ("input", "textarea", "date", "number", "radioV2", "fieldList", "checkboxV2") else "input"
+        ftype = field_type if field_type in ("input", "textarea", "date", "number", "amount", "radioV2", "fieldList", "checkboxV2") else "input"
+        if field_type == "amount":
+            try:
+                value = float(str(raw).replace(",", "").replace(" ", "")) if raw else 0.0
+            except (ValueError, TypeError):
+                value = 0.0
         if logical_key in DATE_FIELDS and raw:
             ftype = "date"
             value = _format_field_value(logical_key, raw, "date")
@@ -851,7 +881,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         logger.warning("用印提取: DEEPSEEK_API_KEY 未配置，无法调用 AI 识别")
     ai_fields = extractor(file_content, file_name, {"company": company_opts or None, "seal_type": seal_opts or None}, get_token) if extractor else {}
     if ai_fields:
-        print(f"用印文件识别结果: {ai_fields}")
+        logger.info("用印文件识别结果: %s", ai_fields)
     elif extractor:
         logger.warning("用印文件识别: 未识别到字段，文件名=%s", file_name)
     with _state_lock:
@@ -863,7 +893,6 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         if v and str(v).strip():
             doc_fields[k] = v
     doc_fields.setdefault("usage_method", "盖章")
-    doc_fields.setdefault("lawyer_reviewed", "否")
 
     with _state_lock:
         CONVERSATIONS.setdefault(open_id, [])
@@ -872,7 +901,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
             "content": f"[已接收文件] 文件名称={doc_name}"
         })
 
-    missing = [k for k in ["company", "seal_type", "reason"] if not doc_fields.get(k)]
+    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not doc_fields.get(k)]
     if missing and ai_fields:
         logger.debug("用印合并后仍缺失 %s，doc_fields: company=%r, seal_type=%r, reason=%r",
                      missing, doc_fields.get('company'), doc_fields.get('seal_type'), doc_fields.get('reason'))
@@ -890,11 +919,12 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         }
 
     # 只列出缺失项
-    labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
+    labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核"}
     hint_map = {
         "company": f"{'、'.join(company_opts) if company_opts else '请输入'}",
         "seal_type": "、".join(seal_opts),
         "reason": "（请描述）",
+        "lawyer_reviewed": f"{'、'.join(lawyer_opts)}（必填，请明确选择）",
     }
     lines = [
         f"已接收文件：{file_name}",
@@ -904,10 +934,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     ]
     for i, k in enumerate(missing, 1):
         lines.append(f"{i}. {labels[k]}：{hint_map.get(k, '')}")
-    lines.extend([
-        f"盖章还是外带：{'、'.join(usage_opts)}（默认盖章）",
-        f"律师是否已审核：{'、'.join(lawyer_opts)}（默认否）",
-    ])
+    lines.append(f"盖章还是外带：{'、'.join(usage_opts)}（默认盖章）")
     send_message(open_id, "\n".join(lines))
 
 
@@ -916,7 +943,6 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
-    all_fields.setdefault("lawyer_reviewed", "否")
 
     file_codes = {ATTACHMENT_FIELD_ID: [file_code]} if file_code else {}
     admin_comment = get_admin_comment("用印申请", all_fields)
@@ -952,7 +978,7 @@ def _try_complete_seal(open_id, user_id, text):
     company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
     seal_hint = f"（选项：{'/'.join(opts.get('seal_type', ['公章','合同章','法人章','财务章']))}）"
     usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带']))}，默认盖章）"
-    lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否']))}，默认否）"
+    lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否']))}，必填，用户必须明确选择）"
 
     prompt = (
         f"用户为用印申请补充了以下信息：\n{text}\n\n"
@@ -961,7 +987,7 @@ def _try_complete_seal(open_id, user_id, text):
         f"- seal_type: 印章类型{seal_hint}\n"
         f"- reason: 文件用途/用印事由\n"
         f"- usage_method: 盖章或外带{usage_hint}\n"
-        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}\n"
+        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，若用户未提及则必须列为缺失\n"
         f"- remarks: 备注(如果有)\n"
         f"只返回JSON。若用户未提及某选项字段，使用默认值。"
     )
@@ -988,10 +1014,9 @@ def _try_complete_seal(open_id, user_id, text):
     all_fields = {**doc_fields, **user_fields}
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
-    all_fields.setdefault("lawyer_reviewed", "否")
 
     missing = []
-    for key in ["company", "seal_type", "reason"]:
+    for key in ["company", "seal_type", "reason", "lawyer_reviewed"]:
         if not all_fields.get(key):
             missing.append(FIELD_LABELS.get(key, key))
 
@@ -1013,14 +1038,44 @@ def _try_complete_seal(open_id, user_id, text):
     return True
 
 
+def _infer_invoice_file_type(file_name, ai_fields):
+    """
+    根据文件名和 AI 识别内容判断是结算单还是合同。
+    返回 "settlement" | "contract"
+    """
+    base_name = (file_name.rsplit(".", 1)[0] if "." in file_name else file_name) or ""
+    # 文件名关键词
+    if any(k in base_name for k in ("结算", "结算单", "对账", "对账单", "月结")):
+        return "settlement"
+    if any(k in base_name for k in ("合同", "协议")):
+        return "contract"
+    # 根据内容推断：结算单通常有金额、结算单编号；合同通常有购方、税号
+    has_amount = bool(ai_fields.get("amount"))
+    has_settlement_no = bool(ai_fields.get("settlement_no"))
+    has_buyer = bool(ai_fields.get("buyer_name"))
+    has_tax_id = bool(ai_fields.get("tax_id"))
+    has_contract_no = bool(ai_fields.get("contract_no"))
+    if (has_amount or has_settlement_no) and not (has_buyer or has_tax_id):
+        return "settlement"
+    if (has_buyer or has_tax_id or has_contract_no):
+        return "contract"
+    # 默认：有金额倾向结算单，否则倾向合同
+    return "settlement" if has_amount else "contract"
+
+
 def _handle_invoice_file(open_id, user_id, message_id, content_json):
-    """处理开票申请的文件上传：先结算单，后合同，自动提取字段"""
+    """处理开票申请的文件上传：根据文件名和内容自动识别是结算单还是合同，支持任意上传顺序"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
             return
         step = pending.get("step", "")
         doc_fields = dict(pending.get("doc_fields", {}))
+        has_settlement = bool(pending.get("settlement_file_code"))
+        has_contract = bool(pending.get("contract_file_code"))
+    if step == "user_fields":
+        send_message(open_id, "已收到结算单和合同，请补充发票类型和开票项目（如：增值税专用发票 广告费）。")
+        return
     file_key = content_json.get("file_key", "")
     file_name = content_json.get("file_name", "未知文件")
     if not file_key:
@@ -1045,35 +1100,35 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
     if ai_fields:
         logger.info("开票文件识别结果: %s", ai_fields)
 
-    # doc_fields 已在锁内快照
     for k, v in ai_fields.items():
         if v and str(v).strip():
             doc_fields[k] = v
 
-    if step == "need_settlement":
-        with _state_lock:
+    file_type = _infer_invoice_file_type(file_name, ai_fields)
+    with _state_lock:
+        pending = PENDING_INVOICE.get(open_id)
+        if not pending:
+            return
+        if file_type == "settlement":
             pending["settlement_file_code"] = file_code
-            pending["doc_fields"] = doc_fields
-            pending["step"] = "need_contract"
-        send_message(open_id, f"已接收结算单：{file_name}\n请上传合同（Word/PDF/图片均可）。")
-        return
-
-    if step == "need_contract":
-        with _state_lock:
+        else:
             pending["contract_file_code"] = file_code
-            pending["doc_fields"] = doc_fields
+        pending["doc_fields"] = doc_fields
+        has_settlement = bool(pending.get("settlement_file_code"))
+        has_contract = bool(pending.get("contract_file_code"))
+        if has_settlement and has_contract:
             pending["step"] = "user_fields"
+
+    type_label = "结算单" if file_type == "settlement" else "合同"
+    if has_settlement and has_contract:
         summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
-        send_message(open_id, f"已接收合同：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
+        send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
                      "请补充以下必填项（一条消息说完即可）：\n"
                      "1. 发票类型（如：增值税专用发票、普通发票等）\n"
                      "2. 开票项目（如：技术服务费、广告费等）")
-        return
-
-    send_message(open_id, "开票申请已收到两个附件，请补充发票类型和开票项目。")
-    with _state_lock:
-        if open_id in PENDING_INVOICE:
-            PENDING_INVOICE[open_id]["step"] = "user_fields"
+    else:
+        need = "合同" if not has_contract else "结算单"
+        send_message(open_id, f"已接收{type_label}：{file_name}\n请继续上传{need}（Word/PDF/图片均可）。")
 
 
 def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
@@ -1291,7 +1346,7 @@ def on_message(data):
                         }
                     send_message(open_id, "请补充以下信息：\n"
                                  f"开票申请需要：上传结算单和合同\n"
-                                 f"请先上传结算单（Word/PDF/图片均可），我会自动识别内容。")
+                                 f"请上传结算单和合同（可任意顺序，Word/PDF/图片均可），我会根据文件名和内容自动识别。")
                     with _state_lock:
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
