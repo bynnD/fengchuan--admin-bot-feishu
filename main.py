@@ -2,6 +2,7 @@ import os
 import re
 import json
 import uuid
+import logging
 from urllib.parse import quote
 from collections import OrderedDict
 import httpx
@@ -16,13 +17,22 @@ from field_cache import get_form_fields, invalidate_cache, is_free_process, mark
 from deepseek_client import call_deepseek_with_retry
 import datetime
 import time
-import traceback
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+logger = logging.getLogger(__name__)
+
+# 配置常量
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")  # 可选，用于 /debug-form 等调试接口认证
+
+# 飞书审批应用 ID（打开审批详情页用），可通过 FEISHU_APPROVAL_APP_ID 覆盖
+FEISHU_APPROVAL_APP_ID = os.environ.get("FEISHU_APPROVAL_APP_ID", "cli_9cb844403dbb9108")
+
+# 文件大小限制（字节），默认 50MB
+MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", 50 * 1024 * 1024))
 
 # 共享状态锁（SDK 可能多线程调用）
 _state_lock = threading.RLock()
@@ -52,6 +62,14 @@ client = lark.Client.builder() \
     .build()
 
 
+def _validate_env():
+    """启动时校验必需环境变量，缺失则退出"""
+    required = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "DEEPSEEK_API_KEY"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(f"缺少必需环境变量: {', '.join(missing)}，请配置后重试。")
+
+
 def get_token():
     now = time.time()
     with _token_lock:
@@ -63,7 +81,14 @@ def get_token():
             timeout=10
         )
         data = res.json()
-        _token_cache["token"] = data["tenant_access_token"]
+        if data.get("code") != 0:
+            err_msg = data.get("msg", "未知错误")
+            err_code = data.get("code", "")
+            raise RuntimeError(f"获取飞书 token 失败: code={err_code}, msg={err_msg}")
+        token = data.get("tenant_access_token")
+        if not token:
+            raise RuntimeError("获取飞书 token 失败: 响应中无 tenant_access_token")
+        _token_cache["token"] = token
         _token_cache["expires_at"] = now + data.get("expire", 7200)
         return _token_cache["token"]
 
@@ -122,7 +147,7 @@ def _is_cancel_intent(text):
 
 
 def download_message_file(message_id, file_key, file_type="file"):
-    """从飞书消息下载文件，返回二进制内容"""
+    """从飞书消息下载文件。返回 (content, None) 成功，(None, 错误信息) 失败"""
     try:
         token = get_token()
         res = httpx.get(
@@ -132,15 +157,24 @@ def download_message_file(message_id, file_key, file_type="file"):
             timeout=30
         )
         if res.status_code == 200:
-            return res.content
-        print(f"下载文件失败: status={res.status_code}")
+            content = res.content
+            if len(content) > MAX_FILE_SIZE:
+                max_mb = MAX_FILE_SIZE // 1024 // 1024
+                logger.warning("文件大小超过限制: %d > %d", len(content), MAX_FILE_SIZE)
+                return None, f"文件大小超过限制（最大 {max_mb}MB），请压缩后重试"
+            return content, None
+        logger.error("下载文件失败: status=%s", res.status_code)
+        return None, f"下载失败(status={res.status_code})"
     except Exception as e:
-        print(f"下载文件异常: {e}")
-    return None
+        logger.exception("下载文件异常: %s", e)
+        return None, str(e)
 
 
 def upload_approval_file(file_name, file_content):
-    """上传文件到飞书审批，返回 (file_code, None) 成功，(None, 错误信息) 失败"""
+    """上传文件到飞书审批，返回 (file_code, None) 成功，(None, 错误信息) 失败。超过 MAX_FILE_SIZE 则拒绝"""
+    if len(file_content) > MAX_FILE_SIZE:
+        max_mb = MAX_FILE_SIZE // 1024 // 1024
+        return None, f"文件大小超过限制（最大 {max_mb}MB），请压缩后重试"
     try:
         token = get_token()
         res = httpx.post(
@@ -164,7 +198,7 @@ def upload_approval_file(file_name, file_content):
                 except json.JSONDecodeError:
                     pass
         if data is None:
-            print(f"文件上传响应非JSON: status={res.status_code}, body前200字: {raw_text[:200]}")
+            logger.warning("文件上传响应非JSON: status=%s, body前200字: %s", res.status_code, raw_text[:200])
             return None, "接口返回格式异常，请稍后重试"
         if data.get("code") == 0:
             d = data.get("data", {})
@@ -176,17 +210,17 @@ def upload_approval_file(file_name, file_content):
                 or d.get("code") or d.get("file_token") or d.get("file_code")
                 or ""
             )
-            print(f"文件上传成功: {file_name} -> {file_code}")
+            logger.info("文件上传成功: %s -> %s", file_name, file_code)
             if not file_code:
-                print(f"警告: API 返回成功但无 file code，完整 data: {d}")
+                logger.warning("API 返回成功但无 file code，完整 data: %s", d)
                 return None, "接口返回成功但未返回文件标识，请重试"
             return file_code, None
         err_msg = data.get("msg", "未知错误")
         err_code = data.get("code", "")
-        print(f"文件上传失败: code={err_code}, msg={err_msg}")
+        logger.error("文件上传失败: code=%s, msg=%s", err_code, err_msg)
         return None, err_msg
     except Exception as e:
-        print(f"文件上传异常: {e}")
+        logger.exception("文件上传异常: %s", e)
         return None, str(e)
 
 
@@ -202,7 +236,7 @@ def send_message(open_id, text):
         .build()
     resp = client.im.v1.message.create(request)
     if not resp.success():
-        print(f"发送消息失败: {resp.msg}")
+        logger.error("发送消息失败: %s", resp.msg)
 
 
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
@@ -213,7 +247,7 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
         if ic:
             # 飞书官方文档：https://open.feishu.cn/document/applink-protocol/supported-protocol/open-an-approval-page
             # 使用 client/mini_program/open 协议，在飞书应用内打开审批详情
-            app_id = "cli_9cb844403dbb9108"  # 飞书审批应用 ID
+            app_id = FEISHU_APPROVAL_APP_ID
             mobile_path = quote(f"pages/detail/index?instanceId={ic}", safe="")
             pc_path = quote(f"pc/pages/in-process/index?instanceId={ic}", safe="")
             mobile_url = f"https://applink.feishu.cn/client/mini_program/open?appId={app_id}&path={mobile_path}"
@@ -241,7 +275,7 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
         .build()
     resp = client.im.v1.message.create(request)
     if not resp.success():
-        print(f"发送卡片消息失败: {resp.msg}")
+        logger.error("发送卡片消息失败: %s", resp.msg)
 
 
 def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
@@ -282,7 +316,7 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
         .build()
     resp = client.im.v1.message.create(request)
     if not resp.success():
-        print(f"发送确认卡片失败: {resp.msg}")
+        logger.error("发送确认卡片失败: %s", resp.msg)
         with _state_lock:
             PENDING_CONFIRM.pop(confirm_id, None)
 
@@ -326,8 +360,7 @@ def on_card_action_confirm(data):
             return P2CardActionTriggerResponse(toast={"type": "success", "content": "工单已创建"})
         return P2CardActionTriggerResponse(toast={"type": "error", "content": f"提交失败：{msg}"})
     except Exception as e:
-        print(f"卡片确认回调处理失败: {e}")
-        traceback.print_exc()
+        logger.exception("卡片确认回调处理失败: %s", e)
         return P2CardActionTriggerResponse(toast={"type": "error", "content": "系统异常，请稍后重试"})
 
 
@@ -377,8 +410,7 @@ def analyze_message(history):
             return {"requests": [{"approval_type": raw["approval_type"], "fields": raw.get("fields", {}), "missing": raw.get("missing", [])}], "unclear": raw.get("unclear", "")}
         return {"requests": [], "unclear": raw.get("unclear", "无法识别审批类型。")}
     except Exception as e:
-        print(f"AI分析失败: {e}")
-        traceback.print_exc()
+        logger.exception("AI分析失败: %s", e)
         return {"requests": [], "unclear": "AI助手暂时无法响应，请稍后再试。"}
 
 
@@ -454,7 +486,7 @@ def build_form(approval_type, fields, token, file_codes=None):
     approval_code = APPROVAL_CODES[approval_type]
     cached = get_form_fields(approval_type, approval_code, token)
     if not cached:
-        print(f"无法获取{approval_type}的字段结构")
+        logger.warning("无法获取 %s 的字段结构", approval_type)
         return None
 
     file_codes = file_codes or {}
@@ -623,7 +655,7 @@ def _infer_purchase_type_from_cost_detail(cost_detail):
         out = res.json()["choices"][0]["message"]["content"].strip()
         return out.split("\n")[0].strip() if out else ""
     except Exception as e:
-        print(f"推断采购类别失败: {e}")
+        logger.warning("推断采购类别失败: %s", e)
         return ""
 
 
@@ -643,7 +675,7 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
         return False, "无法构建表单，请检查审批字段配置", {}, ""
 
     form_data = json.dumps(form_list, ensure_ascii=False)
-    print(f"提交表单[{approval_type}]: {form_data}")
+    logger.info("提交表单[%s]: %s", approval_type, form_data)
 
     summary = _form_summary(form_list, cached or {})
 
@@ -658,7 +690,7 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
         timeout=15
     )
     data = res.json()
-    print(f"创建审批响应: {data}")
+    logger.info("创建审批响应: %s", data)
 
     success = data.get("code") == 0
     msg = data.get("msg", "")
@@ -781,11 +813,12 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
     send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
 
-    file_content = download_message_file(message_id, file_key, "file")
+    file_content, dl_err = download_message_file(message_id, file_key, "file")
     if not file_content:
-        send_message(open_id, "文件下载失败，请重新发送文件。")
+        err_detail = f"（{dl_err}）" if dl_err else ""
+        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
         return
-    print(f"用印文件: 已下载 {file_name}, 大小={len(file_content)} bytes")
+    logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
 
     file_code, upload_err = upload_approval_file(file_name, file_content)
     if not file_code:
@@ -813,14 +846,14 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     # 合并：文件基础信息 + 文件内容 AI 识别（使用通用提取器，含 OCR，适用所有有附件识别需求的工单）+ 首次消息已提取字段（后者优先）
     extractor = get_file_extractor("用印申请")
     if not extractor:
-        print("用印提取: 未找到 extractor，请检查 approval_types 注册")
+        logger.warning("用印提取: 未找到 extractor，请检查 approval_types 注册")
     if not DEEPSEEK_API_KEY:
-        print("用印提取: DEEPSEEK_API_KEY 未配置，无法调用 AI 识别")
+        logger.warning("用印提取: DEEPSEEK_API_KEY 未配置，无法调用 AI 识别")
     ai_fields = extractor(file_content, file_name, {"company": company_opts or None, "seal_type": seal_opts or None}, get_token) if extractor else {}
     if ai_fields:
         print(f"用印文件识别结果: {ai_fields}")
     elif extractor:
-        print(f"用印文件识别: 未识别到字段，文件名={file_name}，请检查 Railway 日志中是否有「用印提取」或「从文件内容推断」报错")
+        logger.warning("用印文件识别: 未识别到字段，文件名=%s", file_name)
     with _state_lock:
         data = SEAL_INITIAL_FIELDS.pop(open_id, {})
     initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
@@ -841,7 +874,8 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
 
     missing = [k for k in ["company", "seal_type", "reason"] if not doc_fields.get(k)]
     if missing and ai_fields:
-        print(f"用印合并后仍缺失 {missing}，doc_fields 相关: company={doc_fields.get('company')!r}, seal_type={doc_fields.get('seal_type')!r}, reason={doc_fields.get('reason')!r}")
+        logger.debug("用印合并后仍缺失 %s，doc_fields: company=%r, seal_type=%r, reason=%r",
+                     missing, doc_fields.get('company'), doc_fields.get('seal_type'), doc_fields.get('reason'))
     if not missing:
         # 全部可推断，直接创建工单
         _do_create_seal(open_id, user_id, doc_fields, file_code)
@@ -938,7 +972,7 @@ def _try_complete_seal(open_id, user_id, text):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         user_fields = json.loads(content)
     except Exception as e:
-        print(f"解析用印补充信息失败: {e}")
+        logger.warning("解析用印补充信息失败: %s", e)
         with _state_lock:
             entry = PENDING_SEAL.get(open_id)
             if not entry:
@@ -994,9 +1028,10 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
         return
 
     send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
-    file_content = download_message_file(message_id, file_key, "file")
+    file_content, dl_err = download_message_file(message_id, file_key, "file")
     if not file_content:
-        send_message(open_id, "文件下载失败，请重新发送文件。")
+        err_detail = f"（{dl_err}）" if dl_err else ""
+        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
         return
 
     file_code, upload_err = upload_approval_file(file_name, file_content)
@@ -1008,7 +1043,7 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
     extractor = get_file_extractor("开票申请")
     ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
     if ai_fields:
-        print(f"开票文件识别结果: {ai_fields}")
+        logger.info("开票文件识别结果: %s", ai_fields)
 
     # doc_fields 已在锁内快照
     for k, v in ai_fields.items():
@@ -1106,7 +1141,7 @@ def _try_complete_invoice(open_id, user_id, text):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         user_fields = json.loads(content)
     except Exception as e:
-        print(f"开票补充信息解析失败: {e}")
+        logger.warning("开票补充信息解析失败: %s", e)
         with _state_lock:
             retry_count = pending.get("retry_count", 0) + 1
             pending["retry_count"] = retry_count
@@ -1330,8 +1365,7 @@ def on_message(data):
                 CONVERSATIONS[open_id] = []
 
     except Exception as e:
-        print(f"处理消息出错: {e}")
-        traceback.print_exc()
+        logger.exception("处理消息出错: %s", e)
         if open_id:
             send_message(open_id, "系统出现异常，请稍后再试。")
 
@@ -1356,6 +1390,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
         elif path == "/debug-form":
             from urllib.parse import parse_qs
             qs = parse_qs((self.path.split("?") + ["?"])[1])
+            if SECRET_TOKEN:
+                token = (qs.get("token") or [""])[0]
+                if token != SECRET_TOKEN:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"Forbidden: invalid or missing token")
+                    return
             at = (qs.get("type") or [""])[0] or "采购申请"
             try:
                 code = APPROVAL_CODES.get(at, "")
@@ -1396,11 +1437,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
 def _start_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    print(f"健康检查服务已启动 :{port}")
+    logger.info("健康检查服务已启动 :%s", port)
     server.serve_forever()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _validate_env()
     threading.Thread(target=_start_health_server, daemon=True).start()
 
     # 飞书卡片回调以 CARD 消息类型推送，需当作 EVENT 处理以触发 on_card_action_confirm。
@@ -1435,5 +1482,5 @@ if __name__ == "__main__":
         event_handler=handler,
         log_level=lark.LogLevel.INFO
     )
-    print("飞书审批机器人已启动...")
+    logger.info("飞书审批机器人已启动...")
     ws_client.start()

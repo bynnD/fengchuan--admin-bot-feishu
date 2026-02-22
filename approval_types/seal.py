@@ -1,9 +1,12 @@
 # 用印申请
 
 import json
+import logging
 import os
 from file_extraction import extract_text_from_file
 from deepseek_client import call_deepseek_with_retry
+
+logger = logging.getLogger(__name__)
 
 NAME = "用印申请"
 APPROVAL_CODE = "FB855CD4-CA15-4A1B-8B7A-51A56171CE60"
@@ -68,7 +71,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
     file_text = extract_text_from_file(file_content, file_name, get_token)
     has_content = bool(file_text and len(file_text.strip()) > 10)
     if not has_content and file_name:
-        print(f"用印提取: 文件内容为空或过短，将仅根据文件名推断，len={len(file_text or '')}")
+        logger.debug("用印提取: 文件内容为空或过短，将仅根据文件名推断，len=%d", len(file_text or ''))
     combined = f"文件名：{base_name}\n\n" + (f"文件内容摘要：\n{file_text}" if has_content else "（文件内容无法提取，请仅根据文件名推断）")
     if not combined.strip() or len(combined.strip()) < 3:
         return {}
@@ -78,7 +81,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
     seal_str = "、".join(seal_opts) if seal_opts else "公章、合同章、法人章、财务章"
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
-        print("用印提取: DEEPSEEK_API_KEY 未配置")
+        logger.warning("用印提取: DEEPSEEK_API_KEY 未配置")
         return {}
     extra = "" if has_content else (
         "\n【重要】文件名中包含关键信息，如「扇贝&风船-流量广告合作协议」表示涉及风船公司、合同类文件。"
@@ -106,7 +109,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         out = json.loads(content)
         if not out:
-            print("用印提取: AI 返回空 JSON")
+            logger.warning("用印提取: AI 返回空 JSON")
             return {}
         result = {}
         for k, v in out.items():
@@ -125,6 +128,6 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         return result
     except Exception as e:
         import traceback
-        print(f"从文件内容推断用印信息失败: {e}")
+        logger.warning("从文件内容推断用印信息失败: %s", e)
         traceback.print_exc()
         return {}

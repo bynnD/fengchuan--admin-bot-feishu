@@ -4,7 +4,10 @@
 """
 
 import base64
+import logging
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 def feishu_ocr(image_content, get_token):
@@ -24,9 +27,9 @@ def feishu_ocr(image_content, get_token):
         if data.get("code") == 0:
             text_list = data.get("data", {}).get("text_list", [])
             return "\n".join(t for t in text_list if t) if text_list else ""
-        print(f"飞书 OCR 失败: {data.get('msg', '')}")
+        logger.warning("飞书 OCR 失败: %s", data.get('msg', ''))
     except Exception as e:
-        print(f"飞书 OCR 异常: {e}")
+        logger.warning("飞书 OCR 异常: %s", e)
     return ""
 
 
@@ -53,10 +56,10 @@ def extract_text_from_file(file_content, file_name, get_token):
                                 parts.append(cell.text)
                 text = "\n".join(parts)[:8000]
                 if not text.strip():
-                    print(f"Word 解析({file_name}): 段落和表格均为空")
+                    logger.debug("Word 解析(%s): 段落和表格均为空", file_name)
                 return text
             except Exception as doc_err:
-                print(f"Word 解析失败({file_name}): {doc_err}")
+                logger.warning("Word 解析失败(%s): %s", file_name, doc_err)
                 return ""
         if ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp"):
             return feishu_ocr(file_content, get_token)[:8000]
@@ -86,5 +89,5 @@ def extract_text_from_file(file_content, file_name, get_token):
             doc.close()
             return "\n".join(ocr_parts)[:8000] if ocr_parts else text[:8000]
     except Exception as e:
-        print(f"提取文件文本失败({file_name}): {e}")
+        logger.warning("提取文件文本失败(%s): %s", file_name, e)
     return ""

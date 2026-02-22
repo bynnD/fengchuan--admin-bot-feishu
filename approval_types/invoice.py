@@ -1,9 +1,12 @@
 # 开票申请
 
 import json
+import logging
 import os
 from file_extraction import extract_text_from_file
 from deepseek_client import call_deepseek_with_retry
+
+logger = logging.getLogger(__name__)
 
 NAME = "开票申请"
 APPROVAL_CODE = "624B0174-A255-4EA0-A790-0DE8F2B1F46B"
@@ -64,7 +67,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
 
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
-        print("开票提取: DEEPSEEK_API_KEY 未配置")
+        logger.warning("开票提取: DEEPSEEK_API_KEY 未配置")
         return {}
 
     prompt = (
@@ -99,6 +102,6 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         return result
     except Exception as e:
         import traceback
-        print(f"开票申请从文件提取失败: {e}")
+        logger.warning("开票申请从文件提取失败: %s", e)
         traceback.print_exc()
         return {}

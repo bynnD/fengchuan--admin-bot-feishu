@@ -13,6 +13,7 @@ used for creating approval sheet
 | 类型 | 提交方式 | 说明 |
 |------|----------|------|
 | 用印申请 | API 自动提交 | 固定流程，支持 API 创建 |
+| 开票申请 | API 自动提交 | 需上传结算单+合同，AI 自动识别 |
 | 采购申请 | API 自动提交 | 固定流程，支持 API 创建 |
 | 外出报备 | 链接手动发起 | 报备单（仅报备不审批），飞书 API 不支持，需点击链接在飞书中填写 |
 
@@ -23,5 +24,17 @@ used for creating approval sheet
 六、后续流程 提交完成后，您只需等待主管审批即可，机器人会提示您“等待主管审批”。
 
 如需新增审批类型或调整规则，管理员可通过配置文件快速修改，无需改动核心流程。
+
+## 部署配置
+
+**必需环境变量**：
+- `FEISHU_APP_ID`、`FEISHU_APP_SECRET`：飞书应用凭证
+- `DEEPSEEK_API_KEY`：DeepSeek API 密钥，用于 AI 识别
+
+**可选环境变量**：
+- `SECRET_TOKEN`：若设置，访问 `/debug-form` 需带 `?token=xxx` 校验
+- `MAX_FILE_SIZE`：文件大小限制（字节），默认 50MB
+- `FEISHU_APPROVAL_APP_ID`：飞书审批应用 ID，用于打开审批详情页
+- `PORT`：健康检查服务端口，默认 8080
 
 如有更多问题，欢迎随时继续提问。

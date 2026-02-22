@@ -6,9 +6,12 @@
 """
 
 import json
+import logging
 import os
 import threading
 import httpx
+
+logger = logging.getLogger(__name__)
 
 _cache_lock = threading.RLock()  # RLock 支持同一线程重入，避免 _load_disk_cache 与 get_form_fields 嵌套调用死锁
 
@@ -29,7 +32,7 @@ def _load_disk_cache_unsafe():
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"读取缓存文件失败: {e}")
+            logger.warning("读取缓存文件失败: %s", e)
     return {}
 
 
@@ -39,7 +42,7 @@ def _save_disk_cache_unsafe(cache):
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存缓存文件失败: {e}")
+        logger.warning("保存缓存文件失败: %s", e)
 
 
 def _load_disk_cache():
@@ -64,7 +67,7 @@ def _fetch_from_api(approval_code, token):
         )
         data = res.json()
         if data.get("code") != 0:
-            print(f"获取审批定义失败({approval_code}): {data.get('msg')}")
+            logger.warning("获取审批定义失败(%s): %s", approval_code, data.get("msg"))
             return None
 
         form_str = data.get("data", {}).get("form", "[]")
@@ -117,7 +120,7 @@ def _fetch_from_api(approval_code, token):
                             ]
                     if not info["sub_fields"]:
                         raw_preview = json.dumps(item, ensure_ascii=False)[:400]
-                        print(f"fieldList {field_id}({field_name}) 无有效子字段，原始 item 预览: {raw_preview}")
+                        logger.debug("fieldList %s(%s) 无有效子字段，原始 item 预览: %s", field_id, field_name, raw_preview)
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):
@@ -128,11 +131,11 @@ def _fetch_from_api(approval_code, token):
                 info["options"] = opts
             fields[field_id] = info
 
-        print(f"已获取字段结构({approval_code}): {list(fields.keys())}")
+        logger.info("已获取字段结构(%s): %s", approval_code, list(fields.keys()))
         return fields
 
     except Exception as e:
-        print(f"获取审批定义异常({approval_code}): {e}")
+        logger.warning("获取审批定义异常(%s): %s", approval_code, e)
         return None
 
 
@@ -148,7 +151,7 @@ def get_form_fields(approval_type, approval_code, token):
         disk_cache = _load_disk_cache_unsafe()
         if approval_type in disk_cache:
             _memory_cache[approval_type] = disk_cache[approval_type]
-            print(f"从缓存加载字段结构: {approval_type}")
+            logger.info("从缓存加载字段结构: %s", approval_type)
             return disk_cache[approval_type]
 
     fields = _fetch_from_api(approval_code, token)
@@ -179,7 +182,7 @@ def invalidate_cache(approval_type):
         if approval_type in disk_cache:
             del disk_cache[approval_type]
             _save_disk_cache_unsafe(disk_cache)
-            print(f"已清除字段缓存: {approval_type}，下次将重新获取")
+            logger.info("已清除字段缓存: %s，下次将重新获取", approval_type)
 
 
 def _fetch_approval_definition_full(approval_code, token):
@@ -195,7 +198,7 @@ def _fetch_approval_definition_full(approval_code, token):
             return None
         return data.get("data", {})
     except Exception as e:
-        print(f"获取审批定义异常({approval_code}): {e}")
+        logger.warning("获取审批定义异常(%s): %s", approval_code, e)
         return None
 
 
@@ -230,5 +233,5 @@ def is_free_process(approval_code, token):
     with _cache_lock:
         _free_process_cache[approval_code] = is_free
     if is_free:
-        print(f"预检: {approval_code} 为报备单(无审批节点)，将走链接流程")
+        logger.info("预检: %s 为报备单(无审批节点)，将走链接流程", approval_code)
     return is_free
