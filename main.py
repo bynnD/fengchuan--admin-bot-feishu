@@ -593,6 +593,8 @@ def build_form(approval_type, fields, token, file_codes=None):
                 field_info = {**field_info, "sub_fields": fallback_subs}
         value = _format_field_value(logical_key, raw, field_type, field_info)
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "amount", "radioV2", "fieldList", "checkboxV2") else "input"
+        if field_type in ("input", "textarea") and value == "":
+            value = "无"
         if field_type == "amount":
             try:
                 value = float(str(raw).replace(",", "").replace(" ", "")) if raw else 0.0
