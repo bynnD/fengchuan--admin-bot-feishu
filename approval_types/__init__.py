@@ -3,10 +3,10 @@
 新增工单：在此目录新建 py 文件，在 _TYPES 中注册，详见 README.md
 """
 
-from . import seal, purchase, outbound
+from . import seal, purchase, outbound, invoice
 
 # 注册所有工单类型模块
-_TYPES = [seal, purchase, outbound]
+_TYPES = [seal, purchase, outbound, invoice]
 
 # 聚合配置
 APPROVAL_CODES = {t.NAME: t.APPROVAL_CODE for t in _TYPES}

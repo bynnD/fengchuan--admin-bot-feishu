@@ -2,6 +2,7 @@ import os
 import re
 import json
 from urllib.parse import quote
+from collections import OrderedDict
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -21,9 +22,26 @@ FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
-PROCESSED_EVENTS = set()
+# 共享状态锁（SDK 可能多线程调用）
+_state_lock = threading.RLock()
+
+# 事件去重：带 TTL，最多保留 24 小时
+PROCESSED_EVENTS = OrderedDict()  # event_id -> timestamp
+PROCESSED_EVENTS_TTL = 24 * 3600
+PROCESSED_EVENTS_MAX = 50000
+
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
+
+# 待办 TTL（秒）
+PENDING_TTL = 30 * 60  # 30 分钟
+SEAL_INITIAL_TTL = 30 * 60  # 30 分钟
+
+# 限流：每用户最小间隔（秒）
+RATE_LIMIT_SEC = 2
+
+# 取消/重置意图关键词
+CANCEL_PHRASES = ("取消", "算了", "不办了", "重新来", "重置", "不要了", "放弃", "不弄了")
 
 client = lark.Client.builder() \
     .app_id(FEISHU_APP_ID) \
@@ -44,6 +62,59 @@ def get_token():
     _token_cache["token"] = data["tenant_access_token"]
     _token_cache["expires_at"] = now + data.get("expire", 7200)
     return _token_cache["token"]
+
+
+def _event_processed(event_id):
+    """检查事件是否已处理。已处理返回 True，未处理则标记并返回 False"""
+    now = time.time()
+    with _state_lock:
+        if event_id in PROCESSED_EVENTS:
+            return True
+        to_remove = [eid for eid, ts in PROCESSED_EVENTS.items() if now - ts > PROCESSED_EVENTS_TTL]
+        for eid in to_remove:
+            del PROCESSED_EVENTS[eid]
+        while len(PROCESSED_EVENTS) >= PROCESSED_EVENTS_MAX:
+            PROCESSED_EVENTS.popitem(last=False)
+        PROCESSED_EVENTS[event_id] = now
+        return False
+
+
+def _clean_expired_pending(open_id=None):
+    """清理过期的 PENDING_* 和 SEAL_INITIAL_FIELDS。open_id 为 None 时清理所有用户"""
+    now = time.time()
+    to_notify = []
+    with _state_lock:
+        for oid in list(PENDING_SEAL.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL else []):
+            if oid in PENDING_SEAL and now - PENDING_SEAL[oid].get("created_at", 0) > PENDING_TTL:
+                del PENDING_SEAL[oid]
+                to_notify.append((oid, "用印申请已超时，请重新发起。"))
+        for oid in list(PENDING_INVOICE.keys()) if open_id is None else ([open_id] if open_id in PENDING_INVOICE else []):
+            if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
+                del PENDING_INVOICE[oid]
+                to_notify.append((oid, "开票申请已超时，请重新发起。"))
+        for oid in list(SEAL_INITIAL_FIELDS.keys()) if open_id is None else ([open_id] if open_id in SEAL_INITIAL_FIELDS else []):
+            data = SEAL_INITIAL_FIELDS.get(oid)
+            created = data.get("created_at", 0) if isinstance(data, dict) else 0
+            if created and now - created > SEAL_INITIAL_TTL:
+                del SEAL_INITIAL_FIELDS[oid]
+    for oid, msg in to_notify:
+        send_message(oid, msg)
+
+
+def _is_cancel_intent(text):
+    """识别用户是否想取消当前流程"""
+    t = (text or "").strip()
+    if len(t) < 2:
+        return False
+    return any(p in t for p in CANCEL_PHRASES)
+
+
+def _is_retryable_error(msg):
+    """判断是否为可重试的错误（网络/超时等）"""
+    if not msg:
+        return True
+    msg_lower = msg.lower()
+    return any(k in msg_lower for k in ("timeout", "网络", "连接", "超时", "稍后", "retry"))
 
 
 def download_message_file(message_id, file_key, file_type="file"):
@@ -562,8 +633,14 @@ def _on_message_read(_data):
 
 
 PENDING_SEAL = {}
-# 用印申请：用户首次消息中已提取的字段（如「盖公章」），等收到文件后合并
+# 用印申请：用户首次消息中已提取的字段，等收到文件后合并。结构 {open_id: {"fields": {...}, "created_at": ts}}
 SEAL_INITIAL_FIELDS = {}
+
+# 限流：open_id -> 上次消息时间
+_user_last_msg = {}
+
+# 开票申请：需结算单+合同双附件，分步收集
+PENDING_INVOICE = {}
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
@@ -599,6 +676,23 @@ def _get_seal_form_options():
                     texts.append(str(t))
         if texts:
             result[logical_key] = texts
+    return result
+
+
+def _get_invoice_attachment_field_ids():
+    """从开票申请表单缓存中按名称查找结算单、合同附件字段 ID"""
+    token = get_token()
+    cached = get_form_fields("开票申请", APPROVAL_CODES.get("开票申请", ""), token)
+    if not cached:
+        return {}
+    result = {}
+    for fid, info in cached.items():
+        if info.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file"):
+            name = info.get("name", "")
+            if "结算" in name or "结算单" in name:
+                result["settlement"] = fid
+            elif "合同" in name:
+                result["contract"] = fid
     return result
 
 
@@ -652,7 +746,9 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         print(f"用印文件识别结果: {ai_fields}")
     elif extractor:
         print(f"用印文件识别: 未识别到字段，文件名={file_name}，请检查 Railway 日志中是否有「用印提取」或「从文件内容推断」报错")
-    initial_fields = SEAL_INITIAL_FIELDS.pop(open_id, {})
+    with _state_lock:
+        data = SEAL_INITIAL_FIELDS.pop(open_id, {})
+    initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
     doc_fields = {**doc_fields, **ai_fields}
     # 仅当首次消息有有效值时才覆盖，避免空值覆盖 AI 识别结果
     for k, v in initial_fields.items():
@@ -675,11 +771,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         _do_create_seal(open_id, user_id, doc_fields, file_code)
         return
 
-    PENDING_SEAL[open_id] = {
-        "doc_fields": doc_fields,
-        "file_code": file_code,
-        "user_id": user_id,
-    }
+    with _state_lock:
+        PENDING_SEAL[open_id] = {
+            "doc_fields": doc_fields,
+            "file_code": file_code,
+            "user_id": user_id,
+            "created_at": time.time(),
+        }
 
     # 只列出缺失项
     labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
@@ -714,10 +812,11 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
     admin_comment = get_admin_comment("用印申请", all_fields)
     success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=file_codes)
 
-    if open_id in PENDING_SEAL:
-        del PENDING_SEAL[open_id]
-    if open_id in CONVERSATIONS:
-        CONVERSATIONS[open_id] = []
+    with _state_lock:
+        if open_id in PENDING_SEAL:
+            del PENDING_SEAL[open_id]
+        if open_id in CONVERSATIONS:
+            CONVERSATIONS[open_id] = []
 
     if success:
         instance_code = resp_data.get("instance_code", "")
@@ -729,13 +828,26 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
             send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
     else:
         send_message(open_id, f"· 用印申请：❌ 提交失败 - {msg}")
+        if not _is_retryable_error(msg):
+            with _state_lock:
+                if open_id in PENDING_SEAL:
+                    del PENDING_SEAL[open_id]
+            send_message(open_id, "请检查信息后重新发起申请。")
 
 
 def _try_complete_seal(open_id, user_id, text):
     """用户发送补充信息后，合并文件字段+用户字段，创建用印申请"""
-    pending = PENDING_SEAL.get(open_id)
+    with _state_lock:
+        pending = PENDING_SEAL.get(open_id)
     if not pending:
         return False
+
+    if _is_cancel_intent(text):
+        with _state_lock:
+            if open_id in PENDING_SEAL:
+                del PENDING_SEAL[open_id]
+        send_message(open_id, "已取消用印申请，如需办理请重新发起。")
+        return True
 
     doc_fields = pending["doc_fields"]
     file_code = pending.get("file_code")
@@ -774,7 +886,13 @@ def _try_complete_seal(open_id, user_id, text):
         user_fields = json.loads(content)
     except Exception as e:
         print(f"解析用印补充信息失败: {e}")
-        send_message(open_id, "无法理解您的输入，请重新描述用印公司、印章类型和用印事由。")
+        with _state_lock:
+            retry_count = PENDING_SEAL[open_id].get("retry_count", 0) + 1
+            PENDING_SEAL[open_id]["retry_count"] = retry_count
+        hint = "无法理解您的输入，请重新描述用印公司、印章类型和用印事由。"
+        if retry_count >= 3:
+            hint += "\n（若需放弃，可回复「取消」）"
+        send_message(open_id, hint)
         return True
 
     all_fields = {**doc_fields, **user_fields}
@@ -788,19 +906,199 @@ def _try_complete_seal(open_id, user_id, text):
             missing.append(FIELD_LABELS.get(key, key))
 
     if missing:
-        send_message(open_id, f"还缺少：{'、'.join(missing)}\n请补充。")
-        PENDING_SEAL[open_id]["doc_fields"] = all_fields
+        with _state_lock:
+            retry_count = PENDING_SEAL[open_id].get("retry_count", 0) + 1
+            PENDING_SEAL[open_id]["retry_count"] = retry_count
+            PENDING_SEAL[open_id]["doc_fields"] = all_fields
+        hint = f"还缺少：{'、'.join(missing)}\n请补充。"
+        if retry_count >= 3:
+            hint += "\n（若需放弃，可回复「取消」）"
+        send_message(open_id, hint)
         return True
 
     _do_create_seal(open_id, user_id, all_fields, file_code)
     return True
 
 
+def _handle_invoice_file(open_id, user_id, message_id, content_json):
+    """处理开票申请的文件上传：先结算单，后合同，自动提取字段"""
+    with _state_lock:
+        pending = PENDING_INVOICE.get(open_id)
+    if not pending:
+        return
+    step = pending.get("step", "")
+    file_key = content_json.get("file_key", "")
+    file_name = content_json.get("file_name", "未知文件")
+    if not file_key:
+        send_message(open_id, "无法获取文件，请重新发送。")
+        return
+
+    send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
+    file_content = download_message_file(message_id, file_key, "file")
+    if not file_content:
+        send_message(open_id, "文件下载失败，请重新发送文件。")
+        return
+
+    file_code, upload_err = upload_approval_file(file_name, file_content)
+    if not file_code:
+        err_detail = f"（{upload_err}）" if upload_err else ""
+        send_message(open_id, f"文件上传失败，请重新发送。{err_detail}")
+        return
+
+    extractor = get_file_extractor("开票申请")
+    ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
+    if ai_fields:
+        print(f"开票文件识别结果: {ai_fields}")
+
+    doc_fields = dict(pending.get("doc_fields", {}))
+    for k, v in ai_fields.items():
+        if v and str(v).strip():
+            doc_fields[k] = v
+
+    if step == "need_settlement":
+        with _state_lock:
+            pending["settlement_file_code"] = file_code
+            pending["doc_fields"] = doc_fields
+            pending["step"] = "need_contract"
+        send_message(open_id, f"已接收结算单：{file_name}\n请上传合同（Word/PDF/图片均可）。")
+        return
+
+    if step == "need_contract":
+        with _state_lock:
+            pending["contract_file_code"] = file_code
+            pending["doc_fields"] = doc_fields
+            pending["step"] = "user_fields"
+        summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
+        send_message(open_id, f"已接收合同：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
+                     "请补充以下必填项（一条消息说完即可）：\n"
+                     "1. 发票类型（如：增值税专用发票、普通发票等）\n"
+                     "2. 开票项目（如：技术服务费、广告费等）")
+        return
+
+    send_message(open_id, "开票申请已收到两个附件，请补充发票类型和开票项目。")
+    pending["step"] = "user_fields"
+
+
+def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
+    """开票申请字段齐全时创建工单"""
+    aid = _get_invoice_attachment_field_ids()
+    file_codes = {}
+    if aid.get("settlement") and settlement_code:
+        file_codes[aid["settlement"]] = [settlement_code]
+    if aid.get("contract") and contract_code:
+        file_codes[aid["contract"]] = [contract_code]
+    if not aid and (settlement_code or contract_code):
+        # 表单未缓存到附件字段时，尝试用第一个附件字段
+        token = get_token()
+        cached = get_form_fields("开票申请", APPROVAL_CODES["开票申请"], token)
+        attach_ids = [fid for fid, info in (cached or {}).items()
+                      if info.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file")]
+        codes = [c for c in [settlement_code, contract_code] if c]
+        for i, fid in enumerate(attach_ids[:2]):
+            if i < len(codes):
+                file_codes[fid] = [codes[i]]
+
+    admin_comment = get_admin_comment("开票申请", all_fields)
+    success, msg, resp_data, summary = create_approval(user_id, "开票申请", all_fields, file_codes=file_codes or None)
+
+    with _state_lock:
+        if open_id in PENDING_INVOICE:
+            del PENDING_INVOICE[open_id]
+        if open_id in CONVERSATIONS:
+            CONVERSATIONS[open_id] = []
+
+    if success:
+        instance_code = resp_data.get("instance_code", "")
+        if instance_code:
+            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            card_content = f"【开票申请】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看："
+            send_card_message(open_id, card_content, link, "查看工单", use_desktop_link=True)
+        else:
+            send_message(open_id, f"· 开票申请：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
+    else:
+        send_message(open_id, f"· 开票申请：❌ 提交失败 - {msg}")
+        if not _is_retryable_error(msg):
+            with _state_lock:
+                if open_id in PENDING_INVOICE:
+                    del PENDING_INVOICE[open_id]
+            send_message(open_id, "请检查信息后重新发起申请。")
+
+
+def _try_complete_invoice(open_id, user_id, text):
+    """用户补充发票类型、开票项目后，创建开票申请"""
+    with _state_lock:
+        pending = PENDING_INVOICE.get(open_id)
+    if not pending or pending.get("step") != "user_fields":
+        return False
+
+    if _is_cancel_intent(text):
+        with _state_lock:
+            if open_id in PENDING_INVOICE:
+                del PENDING_INVOICE[open_id]
+        send_message(open_id, "已取消开票申请，如需办理请重新发起。")
+        return True
+
+    doc_fields = pending.get("doc_fields", {})
+    settlement_code = pending.get("settlement_file_code")
+    contract_code = pending.get("contract_file_code")
+    if not settlement_code or not contract_code:
+        send_message(open_id, "开票申请需要结算单和合同两个附件，请重新发起并分别上传。")
+        return True
+
+    prompt = (
+        f"用户为开票申请补充了以下信息：\n{text}\n\n"
+        "请提取并返回JSON，必须包含：\n"
+        "- invoice_type: 发票类型（如增值税专用发票、普通发票等）\n"
+        "- invoice_items: 开票项目（如技术服务费、广告费等）\n"
+        "只返回JSON，不要其他内容。"
+    )
+    try:
+        res = httpx.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            },
+            timeout=15
+        )
+        res.raise_for_status()
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        user_fields = json.loads(content)
+    except Exception as e:
+        print(f"开票补充信息解析失败: {e}")
+        with _state_lock:
+            retry_count = pending.get("retry_count", 0) + 1
+            pending["retry_count"] = retry_count
+        hint = "无法识别您补充的信息，请明确说明：发票类型、开票项目。"
+        if retry_count >= 3:
+            hint += "\n（若需放弃，可回复「取消」）"
+        send_message(open_id, hint)
+        return True
+
+    all_fields = {**doc_fields, **user_fields}
+    missing = [k for k in ["invoice_type", "invoice_items"] if not all_fields.get(k)]
+    if missing:
+        with _state_lock:
+            retry_count = pending.get("retry_count", 0) + 1
+            pending["retry_count"] = retry_count
+        hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
+        if retry_count >= 3:
+            hint += "\n（若需放弃，可回复「取消」）"
+        send_message(open_id, hint)
+        return True
+
+    _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code)
+    return True
+
+
 def on_message(data):
     event_id = data.header.event_id
-    if event_id in PROCESSED_EVENTS:
+    if _event_processed(event_id):
         return
-    PROCESSED_EVENTS.add(event_id)
 
     open_id = None
     try:
@@ -811,12 +1109,28 @@ def on_message(data):
         message_id = event.message.message_id
         content_json = json.loads(event.message.content)
 
+        _clean_expired_pending(open_id)
+
+        now = time.time()
+        with _state_lock:
+            last = _user_last_msg.get(open_id, 0)
+            if now - last < RATE_LIMIT_SEC:
+                send_message(open_id, "操作过于频繁，请稍后再试。")
+                return
+            _user_last_msg[open_id] = now
+
         if msg_type == "file":
-            _handle_file_message(open_id, user_id, message_id, content_json)
+            with _state_lock:
+                is_invoice = open_id in PENDING_INVOICE
+            if is_invoice:
+                _handle_invoice_file(open_id, user_id, message_id, content_json)
+            else:
+                _handle_file_message(open_id, user_id, message_id, content_json)
             return
 
         if msg_type == "image":
             send_message(open_id, "如需用印申请，请发送需要盖章的文件（Word/PDF/图片均可，图片和扫描件将自动识别文字）。\n"
+                         "开票申请请先发送文字「开票申请」，再按提示上传结算单和合同。\n"
                          "其他审批请用文字描述。")
             return
 
@@ -825,8 +1139,14 @@ def on_message(data):
             send_message(open_id, "请发送文字消息描述您的审批需求。\n如需用印，请先上传需要盖章的文件。")
             return
 
-        if open_id in PENDING_SEAL:
+        with _state_lock:
+            in_seal = open_id in PENDING_SEAL
+            in_invoice = open_id in PENDING_INVOICE
+        if in_seal:
             if _try_complete_seal(open_id, user_id, text):
+                return
+        if in_invoice:
+            if _try_complete_invoice(open_id, user_id, text):
                 return
 
         if open_id not in CONVERSATIONS:
@@ -846,6 +1166,22 @@ def on_message(data):
             CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
             return
 
+        # P0: 用印+开票同时发起时，只处理用印，避免文件路由冲突
+        with _state_lock:
+            needs_seal = any(r.get("approval_type") == "用印申请" for r in requests) and open_id not in PENDING_SEAL
+            needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests) and open_id not in PENDING_INVOICE
+        if needs_seal and needs_invoice:
+            req_seal = next(r for r in requests if r.get("approval_type") == "用印申请")
+            initial = req_seal.get("fields", {})
+            if initial:
+                with _state_lock:
+                    SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
+            send_message(open_id, "您同时发起了用印申请和开票申请。请先完成用印申请（上传需要盖章的文件），完成后再发送「开票申请」。\n\n"
+                         "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
+            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请"})
+            requests = [r for r in requests if r.get("approval_type") not in ("用印申请", "开票申请")]
+            if not requests:
+                return
         for req in requests:
             at = req.get("approval_type", "")
             miss = req.get("missing", [])
@@ -854,12 +1190,30 @@ def on_message(data):
                 # 保存首次消息中已提取的字段（如「盖公章」），收到文件后合并
                 initial = req.get("fields", {})
                 if initial:
-                    SEAL_INITIAL_FIELDS[open_id] = initial
+                    with _state_lock:
+                        SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
                 send_message(open_id, "请补充以下信息：\n"
                              f"用印申请还缺少：上传用章文件\n"
                              f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
                 CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                 requests = [r for r in requests if r.get("approval_type") != "用印申请"]
+                if not requests:
+                    return
+            if at == "开票申请" and open_id not in PENDING_INVOICE:
+                with _state_lock:
+                    PENDING_INVOICE[open_id] = {
+                        "step": "need_settlement",
+                        "settlement_file_code": None,
+                        "contract_file_code": None,
+                        "doc_fields": {},
+                        "user_id": user_id,
+                        "created_at": time.time(),
+                    }
+                send_message(open_id, "请补充以下信息：\n"
+                             f"开票申请需要：上传结算单和合同\n"
+                             f"请先上传结算单（Word/PDF/图片均可），我会自动识别内容。")
+                CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
+                requests = [r for r in requests if r.get("approval_type") != "开票申请"]
                 if not requests:
                     return
             if at == "采购申请":
@@ -957,6 +1311,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             from approval_types import get_file_extractor, FILE_EXTRACTORS
             diag = {
                 "extractor_registered": get_file_extractor("用印申请") is not None,
+                "invoice_extractor": get_file_extractor("开票申请") is not None,
                 "file_extractors": list(FILE_EXTRACTORS.keys()),
                 "DEEPSEEK_API_KEY_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
                 "DEEPSEEK_API_KEY_len": len(os.environ.get("DEEPSEEK_API_KEY", "")),
