@@ -434,16 +434,18 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
             doc_fields = pending["doc_fields"]
             doc_fields[field] = val
-            doc_fields.setdefault("usage_method", "盖章")
             opts = _get_seal_form_options()
             lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+            usage_opts = opts.get("usage_method", ["盖章", "外带"])
 
             def _valid(k, v):
                 if k == "lawyer_reviewed":
                     return v and str(v).strip() in lawyer_opts
+                if k == "usage_method":
+                    return v and str(v).strip() in usage_opts
                 return bool(v)
 
-            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not _valid(k, doc_fields.get(k))]
+            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
             if not missing:
                 file_code = pending.get("file_code")
                 with _state_lock:
@@ -1021,7 +1023,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
                 doc_fields[k] = v
         else:
             doc_fields[k] = v
-    doc_fields.setdefault("usage_method", "盖章")
+    # 不在此处默认 usage_method，选项卡需用户显式选择「盖章」或「外带」后再进入确认
 
     with _state_lock:
         CONVERSATIONS.setdefault(open_id, [])
@@ -1033,8 +1035,10 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     def _valid(k, v):
         if k == "lawyer_reviewed":
             return v and str(v).strip() in lawyer_opts
+        if k == "usage_method":
+            return v and str(v).strip() in usage_opts
         return bool(v)
-    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not _valid(k, doc_fields.get(k))]
+    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
     if missing and ai_fields and ("company" in missing or "seal_type" in missing):
         logger.warning("用印合并异常: AI已识别 company=%r seal_type=%r 但仍被列为缺失，initial_fields=%r",
                        ai_fields.get("company"), ai_fields.get("seal_type"), initial_fields)
@@ -1051,16 +1055,17 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核时，发送选项卡；否则发送文本提示
-    if missing == ["lawyer_reviewed"]:
+    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
+    if set(missing) <= {"lawyer_reviewed", "usage_method"}:
         send_seal_options_card(open_id, user_id, doc_fields, file_code, file_name)
     else:
-        labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核"}
+        labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
             "company": f"{'、'.join(company_opts) if company_opts else '请输入'}",
             "seal_type": "、".join(seal_opts),
             "reason": "（请描述）",
             "lawyer_reviewed": f"{'、'.join(lawyer_opts)}（必填，请明确选择）",
+            "usage_method": f"{'、'.join(usage_opts)}（默认盖章）",
         }
         lines = [
             f"已接收文件：{file_name}",
@@ -1070,7 +1075,6 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
         ]
         for i, k in enumerate(missing, 1):
             lines.append(f"{i}. {labels[k]}：{hint_map.get(k, '')}")
-        lines.append(f"盖章还是外带：{'、'.join(usage_opts)}（默认盖章）")
         send_message(open_id, "\n".join(lines))
 
 
@@ -1166,20 +1170,25 @@ def _try_complete_seal(open_id, user_id, text):
         elif k == "lawyer_reviewed":
             if v in opts.get("lawyer_reviewed", ["是", "否"]):
                 all_fields[k] = v
-            # 无效值（如「缺失」）不写入，保留缺失状态
+        elif k == "usage_method":
+            if v in opts.get("usage_method", ["盖章", "外带"]):
+                all_fields[k] = v
         else:
             all_fields[k] = v
-    all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
+    # 不默认 usage_method，需用户显式选择或由选项卡选择
 
     lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+    usage_opts = opts.get("usage_method", ["盖章", "外带"])
 
     def _valid(k, v):
         if k == "lawyer_reviewed":
             return v and str(v).strip() in lawyer_opts
+        if k == "usage_method":
+            return v and str(v).strip() in usage_opts
         return bool(v)
 
-    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not _valid(k, all_fields.get(k))]
+    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, all_fields.get(k))]
 
     if missing:
         with _state_lock:
@@ -1189,8 +1198,9 @@ def _try_complete_seal(open_id, user_id, text):
             retry_count = entry.get("retry_count", 0) + 1
             entry["retry_count"] = retry_count
             entry["doc_fields"] = all_fields
-        if missing == ["lawyer_reviewed"]:
-            send_seal_options_card(open_id, user_id, all_fields, file_code, all_fields.get("document_name", ""))
+        if set(missing) <= {"lawyer_reviewed", "usage_method"}:
+            # 避免重复发送选项卡，仅提示用户点击上方卡片
+            send_message(open_id, "请点击上方卡片的选项完成「律师是否已审核」和「盖章还是外带」的选择。")
         else:
             hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
             if retry_count >= 3:
