@@ -1103,7 +1103,7 @@ def _try_complete_seal(open_id, user_id, text):
             retry_count = entry.get("retry_count", 0) + 1
             entry["retry_count"] = retry_count
             entry["doc_fields"] = all_fields
-        hint = f"还缺少：{'、'.join(missing)}\n请补充。"
+        hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
         send_message(open_id, hint)
