@@ -35,6 +35,20 @@ FIELD_LABELS_REVERSE = {v: k for k, v in FIELD_LABELS.items()}
 FIELD_LABELS_REVERSE.update(FIELD_NAME_ALIASES)
 IMAGE_SUPPORT_TYPES = {t.NAME for t in _TYPES if getattr(t, "SUPPORTS_IMAGE", False)}
 
+# 各类型使用简要说明 + 例句（用于首次/意图不明时的引导）
+# 例句必须包含用户必须在对话中说明的字段
+# (简要说明, 例句, 是否用「直接发送」- 简短关键词用 True)
+APPROVAL_USAGE_GUIDE = {
+    # 用印：律师已审核(是/否)必填，印章类型、用印事由可从文件识别
+    "用印申请": ("上传需盖章的文件（Word/PDF/图片），我会自动识别内容；律师是否已审核需明确说「是」或「否」", "帮我盖这份合同的公章，律师已审核是", False),
+    # 开票：发票类型、开票项目必填
+    "开票申请": ("发送后按提示上传结算单和合同；必须说明发票类型和开票项目", "我要开增值税发票，发票内容是技术服务费", False),
+    # 采购：物品名称、规格、数量、金额、期望交付时间
+    "采购申请": ("说明物品、规格、数量、金额、期望交付时间", "采购一台笔记本 ThinkPad X1 8000元，下周一到货", False),
+    # 外出：时间、地点、事由
+    "外出报备": ("说明开始日期、结束日期、外出地点、事由", "我2月24日9点要外出2个小时，去税务局办理税务变更", False),
+}
+
 # 有附件识别读取需求的工单类型 -> 文件内容提取器（均使用 file_extraction 的 OCR/文本提取）
 FILE_EXTRACTORS = {
     t.NAME: t.extract_fields_from_file

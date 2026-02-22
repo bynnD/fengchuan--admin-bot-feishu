@@ -9,7 +9,7 @@ import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 from approval_types import (
-    APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS,
+    APPROVAL_CODES, FIELD_LABELS, APPROVAL_FIELD_HINTS, APPROVAL_USAGE_GUIDE,
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment, get_file_extractor
 )
@@ -235,6 +235,25 @@ def _sanitize_message_text(text):
     if len(sanitized) > max_len:
         sanitized = sanitized[:max_len] + "\n...(内容过长已截断)"
     return sanitized.strip() or " "
+
+
+def _get_usage_guide_message():
+    """生成使用简要说明，含各类型例句，便于用户一条消息完成工单"""
+    lines = [
+        "你好！我是行政助理，可帮你快速提交审批，尽量一条消息说完需求即可。",
+        "",
+    ]
+    for name in APPROVAL_CODES.keys():
+        guide = APPROVAL_USAGE_GUIDE.get(name)
+        if not guide:
+            continue
+        brief, example, direct_send = guide
+        prefix = "例如，直接发送：" if direct_send else "例如，你可以这样说："
+        lines.append(f"【{name}】{brief}")
+        lines.append(f"  {prefix}{example}")
+        lines.append("")
+    lines.append("请直接告诉我你要办理哪种，或按例句格式描述。")
+    return "\n".join(lines)
 
 
 def send_message(open_id, text):
@@ -1278,14 +1297,12 @@ def on_message(data):
             return
 
         if msg_type == "image":
-            send_message(open_id, "如需用印申请，请发送需要盖章的文件（Word/PDF/图片均可，图片和扫描件将自动识别文字）。\n"
-                         "开票申请请先发送文字「开票申请」，再按提示上传结算单和合同。\n"
-                         "其他审批请用文字描述。")
+            send_message(open_id, _get_usage_guide_message())
             return
 
         text = content_json.get("text", "").strip()
         if not text:
-            send_message(open_id, "请发送文字消息描述您的审批需求。\n如需用印，请先上传需要盖章的文件。")
+            send_message(open_id, _get_usage_guide_message())
             return
 
         with _state_lock:
@@ -1311,8 +1328,7 @@ def on_message(data):
         unclear = result.get("unclear", "")
 
         if not requests:
-            types = "、".join(APPROVAL_CODES.keys())
-            reply = unclear if unclear else f"你好！我可以帮你提交以下审批：\n{types}\n\n请告诉我你需要办理哪种？"
+            reply = unclear if unclear else _get_usage_guide_message()
             send_message(open_id, reply)
             with _state_lock:
                 if open_id in CONVERSATIONS:
