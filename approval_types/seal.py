@@ -2,8 +2,8 @@
 
 import json
 import os
-import httpx
 from file_extraction import extract_text_from_file
+from deepseek_client import call_deepseek_with_retry
 
 NAME = "用印申请"
 APPROVAL_CODE = "FB855CD4-CA15-4A1B-8B7A-51A56171CE60"
@@ -94,17 +94,13 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         f"{extra}\n只返回JSON，不要其他内容。"
     )
     try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=15
+        res = call_deepseek_with_retry(
+            [{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            timeout=15,
+            max_retries=2,
+            api_key=api_key,
         )
-        res.raise_for_status()
         content = res.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()

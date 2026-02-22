@@ -13,6 +13,7 @@ from approval_types import (
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment, get_file_extractor
 )
 from field_cache import get_form_fields, invalidate_cache, is_free_process, mark_free_process
+from deepseek_client import call_deepseek_with_retry
 import datetime
 import time
 import traceback
@@ -33,6 +34,7 @@ PROCESSED_EVENTS_MAX = 50000
 
 CONVERSATIONS = {}
 _token_cache = {"token": None, "expires_at": 0}
+_token_lock = threading.Lock()
 
 # 待办 TTL（秒）
 PENDING_TTL = 30 * 60  # 30 分钟
@@ -52,17 +54,18 @@ client = lark.Client.builder() \
 
 def get_token():
     now = time.time()
-    if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
+    with _token_lock:
+        if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
+            return _token_cache["token"]
+        res = httpx.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+            timeout=10
+        )
+        data = res.json()
+        _token_cache["token"] = data["tenant_access_token"]
+        _token_cache["expires_at"] = now + data.get("expire", 7200)
         return _token_cache["token"]
-    res = httpx.post(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
-        timeout=10
-    )
-    data = res.json()
-    _token_cache["token"] = data["tenant_access_token"]
-    _token_cache["expires_at"] = now + data.get("expire", 7200)
-    return _token_cache["token"]
 
 
 def _event_processed(event_id):
@@ -101,6 +104,11 @@ def _clean_expired_pending(open_id=None):
         for cid in list(PENDING_CONFIRM.keys()):
             if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
                 del PENDING_CONFIRM[cid]
+        USER_STALE_TTL = 86400
+        stale_users = [uid for uid, ts in _user_last_msg.items() if now - ts > USER_STALE_TTL]
+        for uid in stale_users:
+            _user_last_msg.pop(uid, None)
+            CONVERSATIONS.pop(uid, None)
     for oid, msg in to_notify:
         send_message(oid, msg)
 
@@ -111,14 +119,6 @@ def _is_cancel_intent(text):
     if len(t) < 2:
         return False
     return any(p in t for p in CANCEL_PHRASES)
-
-
-def _is_retryable_error(msg):
-    """判断是否为可重试的错误（网络/超时等）"""
-    if not msg:
-        return True
-    msg_lower = msg.lower()
-    return any(k in msg_lower for k in ("timeout", "网络", "连接", "超时", "稍后", "retry"))
 
 
 def download_message_file(message_id, file_key, file_type="file"):
@@ -314,6 +314,9 @@ def on_card_action_confirm(data):
         admin_comment = pending.get("admin_comment", "")
         success, msg, resp_data, summary = create_approval(user_id, approval_type, fields, file_codes=file_codes)
         if success:
+            with _state_lock:
+                if open_id in CONVERSATIONS:
+                    CONVERSATIONS[open_id] = []
             instance_code = resp_data.get("instance_code", "")
             if instance_code:
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
@@ -362,17 +365,7 @@ def analyze_message(history):
     )
     messages = [{"role": "system", "content": system_prompt}] + history
     try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": messages,
-                "response_format": {"type": "json_object"}
-            },
-            timeout=30
-        )
-        res.raise_for_status()
+        res = call_deepseek_with_retry(messages, response_format={"type": "json_object"}, timeout=30)
         content = res.json()["choices"][0]["message"]["content"]
         content = content.strip()
         if content.startswith("```"):
@@ -626,17 +619,7 @@ def _infer_purchase_type_from_cost_detail(cost_detail):
         f"只返回一个最合适的类别词，不要其他内容。"
     )
     try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 20
-            },
-            timeout=10
-        )
-        res.raise_for_status()
+        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], timeout=10, max_retries=1)
         out = res.json()["choices"][0]["message"]["content"].strip()
         return out.split("\n")[0].strip() if out else ""
     except Exception as e:
@@ -849,11 +832,12 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
     doc_fields.setdefault("usage_method", "盖章")
     doc_fields.setdefault("lawyer_reviewed", "否")
 
-    CONVERSATIONS.setdefault(open_id, [])
-    CONVERSATIONS[open_id].append({
-        "role": "assistant",
-        "content": f"[已接收文件] 文件名称={doc_name}"
-    })
+    with _state_lock:
+        CONVERSATIONS.setdefault(open_id, [])
+        CONVERSATIONS[open_id].append({
+            "role": "assistant",
+            "content": f"[已接收文件] 文件名称={doc_name}"
+        })
 
     missing = [k for k in ["company", "seal_type", "reason"] if not doc_fields.get(k)]
     if missing and ai_fields:
@@ -908,8 +892,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_code):
     with _state_lock:
         if open_id in PENDING_SEAL:
             del PENDING_SEAL[open_id]
-        if open_id in CONVERSATIONS:
-            CONVERSATIONS[open_id] = []
+        # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
 
     send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
@@ -949,16 +932,7 @@ def _try_complete_seal(open_id, user_id, text):
         f"只返回JSON。若用户未提及某选项字段，使用默认值。"
     )
     try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=30
-        )
+        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=30)
         content = res.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -1083,8 +1057,7 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
     with _state_lock:
         if open_id in PENDING_INVOICE:
             del PENDING_INVOICE[open_id]
-        if open_id in CONVERSATIONS:
-            CONVERSATIONS[open_id] = []
+        # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
 
     send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
@@ -1118,17 +1091,7 @@ def _try_complete_invoice(open_id, user_id, text):
         "只返回JSON，不要其他内容。"
     )
     try:
-        res = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=15
-        )
-        res.raise_for_status()
+        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=15)
         content = res.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -1214,13 +1177,15 @@ def on_message(data):
             if _try_complete_invoice(open_id, user_id, text):
                 return
 
-        if open_id not in CONVERSATIONS:
-            CONVERSATIONS[open_id] = []
-        CONVERSATIONS[open_id].append({"role": "user", "content": text})
-        if len(CONVERSATIONS[open_id]) > 10:
-            CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+        with _state_lock:
+            if open_id not in CONVERSATIONS:
+                CONVERSATIONS[open_id] = []
+            CONVERSATIONS[open_id].append({"role": "user", "content": text})
+            if len(CONVERSATIONS[open_id]) > 10:
+                CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+            conv_copy = list(CONVERSATIONS[open_id])
 
-        result = analyze_message(CONVERSATIONS[open_id])
+        result = analyze_message(conv_copy)
         requests = result.get("requests", [])
         unclear = result.get("unclear", "")
 
@@ -1228,7 +1193,9 @@ def on_message(data):
             types = "、".join(APPROVAL_CODES.keys())
             reply = unclear if unclear else f"你好！我可以帮你提交以下审批：\n{types}\n\n请告诉我你需要办理哪种？"
             send_message(open_id, reply)
-            CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
+            with _state_lock:
+                if open_id in CONVERSATIONS:
+                    CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
             return
 
         # P0: 用印+开票同时发起时，只处理用印，避免文件路由冲突
@@ -1243,7 +1210,9 @@ def on_message(data):
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
             send_message(open_id, "您同时发起了用印申请和开票申请。请先完成用印申请（上传需要盖章的文件），完成后再发送「开票申请」。\n\n"
                          "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
-            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请"})
+            with _state_lock:
+                if open_id in CONVERSATIONS:
+                    CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请"})
             requests = [r for r in requests if r.get("approval_type") not in ("用印申请", "开票申请")]
             if not requests:
                 return
@@ -1260,7 +1229,9 @@ def on_message(data):
                 send_message(open_id, "请补充以下信息：\n"
                              f"用印申请还缺少：上传用章文件\n"
                              f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
-                CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
+                with _state_lock:
+                    if open_id in CONVERSATIONS:
+                        CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                 requests = [r for r in requests if r.get("approval_type") != "用印申请"]
                 if not requests:
                     return
@@ -1277,7 +1248,9 @@ def on_message(data):
                 send_message(open_id, "请补充以下信息：\n"
                              f"开票申请需要：上传结算单和合同\n"
                              f"请先上传结算单（Word/PDF/图片均可），我会自动识别内容。")
-                CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
+                with _state_lock:
+                    if open_id in CONVERSATIONS:
+                        CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
                 requests = [r for r in requests if r.get("approval_type") != "开票申请"]
                 if not requests:
                     return
@@ -1335,15 +1308,18 @@ def on_message(data):
 
         if not complete:
             send_message(open_id, "\n".join(replies))
-            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请补充信息"})
+            with _state_lock:
+                if open_id in CONVERSATIONS:
+                    CONVERSATIONS[open_id].append({"role": "assistant", "content": "请补充信息"})
             return
 
         header = f"✅ 已处理 {len(complete)} 个申请：\n\n" if len(complete) > 1 else ""
         body = header + "\n\n".join(replies)
         if body.strip():
             send_message(open_id, body)
-        if not incomplete:
-            CONVERSATIONS[open_id] = []
+        with _state_lock:
+            if not incomplete and open_id in CONVERSATIONS:
+                CONVERSATIONS[open_id] = []
 
     except Exception as e:
         print(f"处理消息出错: {e}")
@@ -1419,7 +1395,10 @@ def _start_health_server():
 if __name__ == "__main__":
     threading.Thread(target=_start_health_server, daemon=True).start()
 
-    # 飞书卡片回调以 CARD 消息类型推送，需当作 EVENT 处理以触发 on_card_action_confirm
+    # 飞书卡片回调以 CARD 消息类型推送，需当作 EVENT 处理以触发 on_card_action_confirm。
+    # 猴子补丁：将 _handle_data_frame 收到的 CARD 帧的 type 改为 EVENT，使 EventDispatcherHandler 路由到 on_card_action_confirm。
+    # 依赖：lark_oapi.ws.client.Client._handle_data_frame 的签名与实现。SDK 版本变更可能导致补丁失效。
+    # 固定版本见 requirements.txt：lark-oapi==1.4.24
     import lark_oapi.ws.client as _ws_client
     from lark_oapi.ws.enum import MessageType as _MT
     _orig_hdf = _ws_client.Client._handle_data_frame

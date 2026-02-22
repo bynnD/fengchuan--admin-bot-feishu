@@ -7,7 +7,10 @@
 
 import json
 import os
+import threading
 import httpx
+
+_cache_lock = threading.RLock()  # RLock 支持同一线程重入，避免 _load_disk_cache 与 get_form_fields 嵌套调用死锁
 
 # 优先使用 /app（Docker），否则用项目目录
 CACHE_FILE = os.path.join(
@@ -20,21 +23,23 @@ _free_process_cache = {}  # approval_code -> bool，缓存是否为报备单
 
 
 def _load_disk_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"读取缓存文件失败: {e}")
-    return {}
+    with _cache_lock:
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"读取缓存文件失败: {e}")
+        return {}
 
 
 def _save_disk_cache(cache):
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"保存缓存文件失败: {e}")
+    with _cache_lock:
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存缓存文件失败: {e}")
 
 
 def _fetch_from_api(approval_code, token):
@@ -124,24 +129,23 @@ def get_form_fields(approval_type, approval_code, token):
     获取指定审批类型的字段结构。
     优先读内存缓存 -> 磁盘缓存 -> API获取。
     """
-    # 1. 内存缓存
-    if approval_type in _memory_cache:
-        return _memory_cache[approval_type]
+    with _cache_lock:
+        if approval_type in _memory_cache:
+            return _memory_cache[approval_type]
 
-    # 2. 磁盘缓存
-    disk_cache = _load_disk_cache()
-    if approval_type in disk_cache:
-        _memory_cache[approval_type] = disk_cache[approval_type]
-        print(f"从缓存加载字段结构: {approval_type}")
-        return disk_cache[approval_type]
+        disk_cache = _load_disk_cache()
+        if approval_type in disk_cache:
+            _memory_cache[approval_type] = disk_cache[approval_type]
+            print(f"从缓存加载字段结构: {approval_type}")
+            return disk_cache[approval_type]
 
-    # 3. 从API获取
-    print(f"首次获取字段结构: {approval_type}")
     fields = _fetch_from_api(approval_code, token)
     if fields:
-        disk_cache[approval_type] = fields
-        _save_disk_cache(disk_cache)
-        _memory_cache[approval_type] = fields
+        with _cache_lock:
+            disk_cache = _load_disk_cache()
+            disk_cache[approval_type] = fields
+            _save_disk_cache(disk_cache)
+            _memory_cache[approval_type] = fields
         return fields
 
     return None
@@ -149,19 +153,21 @@ def get_form_fields(approval_type, approval_code, token):
 
 def mark_free_process(approval_code):
     """创建失败 1390013 时标记为报备单，下次预检直接返回 True"""
-    _free_process_cache[approval_code] = True
+    with _cache_lock:
+        _free_process_cache[approval_code] = True
 
 
 def invalidate_cache(approval_type):
     """提交失败时清除该类型的缓存，下次重新从API获取"""
-    if approval_type in _memory_cache:
-        del _memory_cache[approval_type]
+    with _cache_lock:
+        if approval_type in _memory_cache:
+            del _memory_cache[approval_type]
 
-    disk_cache = _load_disk_cache()
-    if approval_type in disk_cache:
-        del disk_cache[approval_type]
-        _save_disk_cache(disk_cache)
-        print(f"已清除字段缓存: {approval_type}，下次将重新获取")
+        disk_cache = _load_disk_cache()
+        if approval_type in disk_cache:
+            del disk_cache[approval_type]
+            _save_disk_cache(disk_cache)
+            print(f"已清除字段缓存: {approval_type}，下次将重新获取")
 
 
 def _fetch_approval_definition_full(approval_code, token):
@@ -187,18 +193,20 @@ def is_free_process(approval_code, token):
     报备单无审批节点，API 不支持创建，返回 1390013。
     结果缓存于内存，避免重复请求。
     """
-    if approval_code in _free_process_cache:
-        return _free_process_cache[approval_code]
+    with _cache_lock:
+        if approval_code in _free_process_cache:
+            return _free_process_cache[approval_code]
 
     definition = _fetch_approval_definition_full(approval_code, token)
     if not definition:
-        _free_process_cache[approval_code] = False  # 获取失败时按非报备处理，让 create 尝试
+        with _cache_lock:
+            _free_process_cache[approval_code] = False
         return False
 
-    # node_list 可能为 JSON 字符串
     node_list = definition.get("node_list")
     if node_list is None:
-        _free_process_cache[approval_code] = False  # 字段缺失时按非报备处理
+        with _cache_lock:
+            _free_process_cache[approval_code] = False
         return False
     if isinstance(node_list, str):
         try:
@@ -206,9 +214,9 @@ def is_free_process(approval_code, token):
         except json.JSONDecodeError:
             node_list = []
 
-    # 无审批节点或节点为空 → 报备单
     is_free = len(node_list) == 0
-    _free_process_cache[approval_code] = is_free
+    with _cache_lock:
+        _free_process_cache[approval_code] = is_free
     if is_free:
         print(f"预检: {approval_code} 为报备单(无审批节点)，将走链接流程")
     return is_free
