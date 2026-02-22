@@ -1029,13 +1029,13 @@ def _try_complete_seal(open_id, user_id, text):
     prompt = (
         f"用户为用印申请补充了以下信息：\n{text}\n\n"
         f"请提取并返回JSON，包含：\n"
-        f"- company: 用印公司{company_hint}\n"
-        f"- seal_type: 印章类型{seal_hint}\n"
-        f"- reason: 文件用途/用印事由\n"
+        f"- company: 用印公司{company_hint}（用户未提及则不返回，保留文件识别结果）\n"
+        f"- seal_type: 印章类型{seal_hint}（用户未提及则不返回，保留文件识别结果）\n"
+        f"- reason: 文件用途/用印事由（用户未提及则不返回）\n"
         f"- usage_method: 盖章或外带{usage_hint}\n"
         f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，若用户未提及则必须列为缺失\n"
         f"- remarks: 备注(如果有)\n"
-        f"只返回JSON。若用户未提及某选项字段，使用默认值。"
+        f"只返回JSON。company、seal_type、reason 若用户未明确提及，不要返回或返回空，系统将保留文件识别结果。"
     )
     try:
         res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=30)
@@ -1057,7 +1057,24 @@ def _try_complete_seal(open_id, user_id, text):
         send_message(open_id, hint)
         return True
 
-    all_fields = {**doc_fields, **user_fields}
+    # 合并：文件识别结果优先，用户补充的有效值可覆盖；避免 AI 返回空值覆盖文件识别结果
+    all_fields = dict(doc_fields)
+    company_opts = opts.get("company", [])
+    seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
+    for k, v in user_fields.items():
+        if not v or not str(v).strip():
+            continue
+        v = str(v).strip()
+        if k == "company":
+            if doc_fields.get("company") and (not company_opts or v not in company_opts):
+                continue  # 文件已识别且用户值无效，保留文件结果
+            all_fields[k] = v
+        elif k == "seal_type":
+            if doc_fields.get("seal_type") and (not seal_opts or v not in seal_opts):
+                continue  # 文件已识别且用户值无效，保留文件结果
+            all_fields[k] = v
+        else:
+            all_fields[k] = v
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
 
