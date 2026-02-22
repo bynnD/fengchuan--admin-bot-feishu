@@ -947,7 +947,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json):
             "content": f"[已接收文件] 文件名称={doc_name}"
         })
 
-    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not doc_fields.get(k)]
+    def _valid(k, v):
+        if k == "lawyer_reviewed":
+            return v and str(v).strip() in lawyer_opts
+        return bool(v)
+    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not _valid(k, doc_fields.get(k))]
     if missing and ai_fields and ("company" in missing or "seal_type" in missing):
         logger.warning("用印合并异常: AI已识别 company=%r seal_type=%r 但仍被列为缺失，initial_fields=%r",
                        ai_fields.get("company"), ai_fields.get("seal_type"), initial_fields)
@@ -1033,9 +1037,9 @@ def _try_complete_seal(open_id, user_id, text):
         f"- seal_type: 印章类型{seal_hint}（用户未提及则不返回，保留文件识别结果）\n"
         f"- reason: 文件用途/用印事由（用户未提及则不返回）\n"
         f"- usage_method: 盖章或外带{usage_hint}\n"
-        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，若用户未提及则必须列为缺失\n"
+        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，若用户未明确说「是」或「否」则不要返回此字段（切勿返回「缺失」等占位符）\n"
         f"- remarks: 备注(如果有)\n"
-        f"只返回JSON。company、seal_type、reason 若用户未明确提及，不要返回或返回空，系统将保留文件识别结果。"
+        f"只返回JSON。company、seal_type、reason 若用户未明确提及，不要返回或返回空。lawyer_reviewed 必须用户明确选择，否则不返回。"
     )
     try:
         res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=30)
@@ -1073,15 +1077,23 @@ def _try_complete_seal(open_id, user_id, text):
             if doc_fields.get("seal_type") and (not seal_opts or v not in seal_opts):
                 continue  # 文件已识别且用户值无效，保留文件结果
             all_fields[k] = v
+        elif k == "lawyer_reviewed":
+            if v in opts.get("lawyer_reviewed", ["是", "否"]):
+                all_fields[k] = v
+            # 无效值（如「缺失」）不写入，保留缺失状态
         else:
             all_fields[k] = v
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
 
-    missing = []
-    for key in ["company", "seal_type", "reason", "lawyer_reviewed"]:
-        if not all_fields.get(key):
-            missing.append(FIELD_LABELS.get(key, key))
+    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+
+    def _valid(k, v):
+        if k == "lawyer_reviewed":
+            return v and str(v).strip() in lawyer_opts
+        return bool(v)
+
+    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed"] if not _valid(k, all_fields.get(k))]
 
     if missing:
         with _state_lock:
