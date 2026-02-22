@@ -54,6 +54,9 @@ _token_lock = threading.Lock()
 # 待办 TTL（秒）
 PENDING_TTL = 30 * 60  # 30 分钟
 SEAL_INITIAL_TTL = 30 * 60  # 30 分钟
+# 用户先上传附件但未说明意图时暂存，等用户说明用印/开票后再处理
+PENDING_FILE_UNCLEAR = {}
+FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
 
 # 限流：每用户最小间隔（秒）
 RATE_LIMIT_SEC = 2
@@ -131,6 +134,9 @@ def _clean_expired_pending(open_id=None):
             created = data.get("created_at", 0) if isinstance(data, dict) else 0
             if created and now - created > SEAL_INITIAL_TTL:
                 del SEAL_INITIAL_FIELDS[oid]
+        for oid in list(PENDING_FILE_UNCLEAR.keys()) if open_id is None else ([open_id] if open_id in PENDING_FILE_UNCLEAR else []):
+            if oid in PENDING_FILE_UNCLEAR and now - PENDING_FILE_UNCLEAR[oid].get("created_at", 0) > PENDING_TTL:
+                del PENDING_FILE_UNCLEAR[oid]
         for cid in list(PENDING_CONFIRM.keys()):
             if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
                 del PENDING_CONFIRM[cid]
@@ -316,6 +322,54 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
         logger.error("发送卡片消息失败: %s", resp.msg)
 
 
+def send_file_intent_options_card(open_id, file_name):
+    """发送文件意图选择卡片：用印申请 / 开票申请，3 分钟内未说明意图时使用"""
+    text = (
+        f"已收到文件「{file_name}」。\n\n"
+        f"请选择您需要办理的业务："
+    )
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "用印申请（盖章）"}, "type": "primary",
+                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "用印申请"}}]},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "开票申请"}, "type": "default",
+                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "开票申请"}}]},
+            ]},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送文件意图选项卡片失败: %s", resp.msg)
+
+
+def _schedule_file_intent_card(open_id):
+    """3 分钟后若用户仍未说明意图，发送意图选择选项卡"""
+
+    def _send():
+        with _state_lock:
+            pending = PENDING_FILE_UNCLEAR.get(open_id)
+        if not pending:
+            return
+        file_name = pending.get("file_name", "未知文件")
+        send_file_intent_options_card(open_id, file_name)
+
+    timer = threading.Timer(FILE_INTENT_WAIT_SEC, _send)
+    timer.daemon = True
+    timer.start()
+
+
 def send_seal_options_card(open_id, user_id, doc_fields, file_code, file_name):
     """发送用印补充选项卡片：律师是否已审核、盖章还是外带，用户点击选择"""
     opts = _get_seal_form_options()
@@ -422,6 +476,31 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
+        # 文件意图选择卡片：用印申请 / 开票申请（3 分钟内未说明意图时弹出）
+        if value.get("action") == "file_intent":
+            intent = value.get("intent", "")
+            with _state_lock:
+                pending_file = PENDING_FILE_UNCLEAR.pop(open_id, None)
+            if not pending_file:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+            if intent == "用印申请":
+                with _state_lock:
+                    SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
+                _handle_file_message(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请，正在处理"}})
+            if intent == "开票申请":
+                with _state_lock:
+                    PENDING_INVOICE[open_id] = {
+                        "step": "need_settlement",
+                        "settlement_file_code": None,
+                        "contract_file_code": None,
+                        "doc_fields": {},
+                        "user_id": user_id,
+                        "created_at": time.time(),
+                    }
+                _handle_invoice_file(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         # 用印选项卡片：律师是否已审核、盖章还是外带
         if value.get("action") == "seal_option":
             field = value.get("field")
@@ -1438,10 +1517,25 @@ def on_message(data):
         if msg_type == "file":
             with _state_lock:
                 is_invoice = open_id in PENDING_INVOICE
+                is_seal = open_id in PENDING_SEAL
+                expects_seal = open_id in SEAL_INITIAL_FIELDS  # 用户已说用印，在等上传
             if is_invoice:
                 _handle_invoice_file(open_id, user_id, message_id, content_json)
-            else:
+            elif is_seal or expects_seal:
                 _handle_file_message(open_id, user_id, message_id, content_json)
+            else:
+                # 用户先上传附件但未说明意图，先询问再处理
+                file_name = content_json.get("file_name", "未知文件")
+                with _state_lock:
+                    PENDING_FILE_UNCLEAR[open_id] = {
+                        "file_key": content_json.get("file_key", ""),
+                        "message_id": message_id,
+                        "file_name": file_name,
+                        "content_json": content_json,
+                        "created_at": time.time(),
+                    }
+                send_message(open_id, f"已收到文件「{file_name}」。请问您需要办理：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+                _schedule_file_intent_card(open_id)
             return
 
         if msg_type == "image":
@@ -1472,12 +1566,61 @@ def on_message(data):
         with _state_lock:
             in_seal = open_id in PENDING_SEAL
             in_invoice = open_id in PENDING_INVOICE
+            pending_file = PENDING_FILE_UNCLEAR.get(open_id)
         if in_seal:
             if _try_complete_seal(open_id, user_id, text):
                 return
         if in_invoice:
             if _try_complete_invoice(open_id, user_id, text):
                 return
+
+        # 用户先上传了附件但未说明意图，现在用文字说明
+        if pending_file:
+            if _is_cancel_intent(text):
+                with _state_lock:
+                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                send_message(open_id, "已取消。如需办理用印或开票，请重新上传文件并说明用途。")
+                return
+            with _state_lock:
+                CONVERSATIONS.setdefault(open_id, [])
+                CONVERSATIONS[open_id].append({"role": "user", "content": text})
+                if len(CONVERSATIONS[open_id]) > 10:
+                    CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+                conv_copy = list(CONVERSATIONS[open_id])
+            result = analyze_message(conv_copy)
+            requests = result.get("requests", [])
+            needs_seal = any(r.get("approval_type") == "用印申请" for r in requests)
+            needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
+            if needs_seal and not needs_invoice:
+                with _state_lock:
+                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                req_seal = next((r for r in requests if r.get("approval_type") == "用印申请"), None)
+                if req_seal and req_seal.get("fields"):
+                    with _state_lock:
+                        SEAL_INITIAL_FIELDS[open_id] = {"fields": req_seal["fields"], "created_at": time.time()}
+                _handle_file_message(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                return
+            if needs_invoice and not needs_seal:
+                with _state_lock:
+                    PENDING_FILE_UNCLEAR.pop(open_id, None)
+                req_inv = next((r for r in requests if r.get("approval_type") == "开票申请"), None)
+                doc_fields_init = {k: v for k, v in (req_inv.get("fields") or {}).items() if v and str(v).strip()} if req_inv else {}
+                with _state_lock:
+                    PENDING_INVOICE[open_id] = {
+                        "step": "need_settlement",
+                        "settlement_file_code": None,
+                        "contract_file_code": None,
+                        "doc_fields": doc_fields_init,
+                        "user_id": user_id,
+                        "created_at": time.time(),
+                    }
+                _handle_invoice_file(open_id, user_id, pending_file["message_id"], pending_file["content_json"])
+                return
+            if needs_seal and needs_invoice:
+                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请** 还是 **开票申请**？回复「用印」或「开票」。")
+                return
+            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+            return
 
         with _state_lock:
             if open_id not in CONVERSATIONS:
