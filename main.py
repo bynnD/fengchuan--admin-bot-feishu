@@ -327,7 +327,7 @@ def on_card_action_confirm(data):
     try:
         ev = data.event
         if not ev:
-            return P2CardActionTriggerResponse(toast={"type": "error", "content": "参数无效"})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         operator = ev.operator
         action = ev.action
         open_id = operator.open_id if operator else ""
@@ -335,13 +335,13 @@ def on_card_action_confirm(data):
         value = action.value if action and action.value else {}
         confirm_id = value.get("confirm_id", "")
         if not confirm_id:
-            return P2CardActionTriggerResponse(toast={"type": "error", "content": "参数无效"})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         with _state_lock:
             pending = PENDING_CONFIRM.pop(confirm_id, None)
         if not pending:
-            return P2CardActionTriggerResponse(toast={"type": "error", "content": "确认已过期，请重新发起"})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "确认已过期，请重新发起"}})
         if time.time() - pending.get("created_at", 0) > CONFIRM_TTL:
-            return P2CardActionTriggerResponse(toast={"type": "error", "content": "确认已超时，请重新发起"})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "确认已超时，请重新发起"}})
         approval_type = pending["approval_type"]
         fields = pending["fields"]
         file_codes = pending.get("file_codes")
@@ -357,11 +357,11 @@ def on_card_action_confirm(data):
                 send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n行政意见: {admin_comment}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
                 send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}\n行政意见: {admin_comment}")
-            return P2CardActionTriggerResponse(toast={"type": "success", "content": "工单已创建"})
-        return P2CardActionTriggerResponse(toast={"type": "error", "content": f"提交失败：{msg}"})
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "工单已创建"}})
+        return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": f"提交失败：{msg}"}})
     except Exception as e:
         logger.exception("卡片确认回调处理失败: %s", e)
-        return P2CardActionTriggerResponse(toast={"type": "error", "content": "系统异常，请稍后重试"})
+        return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "系统异常，请稍后重试"}})
 
 
 def analyze_message(history):
