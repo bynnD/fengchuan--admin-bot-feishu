@@ -1,9 +1,4 @@
 import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent / ".env")
-
 import re
 import json
 import uuid
@@ -36,7 +31,8 @@ logger = logging.getLogger(__name__)
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")  # 可选，用于 /debug-form 等调试接口认证
+SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")  # 调试接口认证，生产环境必须配置
+DEBUG_DISABLED = os.environ.get("DEBUG_DISABLED", "").lower() in ("1", "true", "yes")  # 生产环境建议设为 1 禁用调试接口
 
 # 飞书审批应用 ID（打开审批详情页用），可通过 FEISHU_APPROVAL_APP_ID 覆盖
 FEISHU_APPROVAL_APP_ID = os.environ.get("FEISHU_APPROVAL_APP_ID", "cli_9cb844403dbb9108")
@@ -941,7 +937,7 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
         return False, "无法构建表单，请检查审批字段配置", {}, ""
 
     form_data = json.dumps(form_list, ensure_ascii=False)
-    logger.info("提交表单[%s]: %s", approval_type, form_data)
+    logger.debug("提交表单[%s]: %s", approval_type, form_data)
 
     summary = _form_summary(form_list, cached or {})
 
@@ -956,7 +952,7 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
         timeout=15
     )
     data = res.json()
-    logger.info("创建审批响应: %s", data)
+    logger.debug("创建审批响应: %s", data)
 
     success = data.get("code") == 0
     msg = data.get("msg", "")
@@ -1872,17 +1868,40 @@ def on_message(data):
             send_message(open_id, "系统出现异常，请稍后再试。")
 
 
+def _check_debug_auth(handler):
+    """调试接口鉴权：DEBUG_DISABLED 时 404；无 SECRET_TOKEN 时 403"""
+    if DEBUG_DISABLED:
+        return "disabled"
+    if not SECRET_TOKEN:
+        return "no_token"
+    from urllib.parse import parse_qs
+    qs = parse_qs((handler.path.split("?") + ["?"])[1])
+    token = (qs.get("token") or [""])[0]
+    if token != SECRET_TOKEN:
+        return "forbidden"
+    return "ok"
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/debug-extract":
+            auth = _check_debug_auth(self)
+            if auth == "disabled":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if auth != "ok":
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"Forbidden: DEBUG_DISABLED=1 or SECRET_TOKEN required")
+                return
             from approval_types import get_file_extractor, FILE_EXTRACTORS
             diag = {
                 "extractor_registered": get_file_extractor("用印申请") is not None,
                 "invoice_extractor": get_file_extractor("开票申请") is not None,
                 "file_extractors": list(FILE_EXTRACTORS.keys()),
                 "DEEPSEEK_API_KEY_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
-                "DEEPSEEK_API_KEY_len": len(os.environ.get("DEEPSEEK_API_KEY", "")),
                 "hint": "若 extractor_registered 为 false 或 DEEPSEEK_API_KEY_set 为 false，则无法识别",
             }
             self.send_response(200)
@@ -1890,15 +1909,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(diag, ensure_ascii=False, indent=2).encode("utf-8"))
         elif path == "/debug-form":
+            auth = _check_debug_auth(self)
+            if auth == "disabled":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if auth != "ok":
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"Forbidden: DEBUG_DISABLED=1 or SECRET_TOKEN required")
+                return
             from urllib.parse import parse_qs
             qs = parse_qs((self.path.split("?") + ["?"])[1])
-            if SECRET_TOKEN:
-                token = (qs.get("token") or [""])[0]
-                if token != SECRET_TOKEN:
-                    self.send_response(403)
-                    self.end_headers()
-                    self.wfile.write(b"Forbidden: invalid or missing token")
-                    return
             at = (qs.get("type") or [""])[0] or "采购申请"
             try:
                 code = APPROVAL_CODES.get(at, "")
