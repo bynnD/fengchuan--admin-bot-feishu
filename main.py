@@ -2240,6 +2240,7 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     _validate_env()
+    invalidate_cache("用印申请")  # 启动时刷新用印表单结构，确保与飞书后台一致
     threading.Thread(target=_start_health_server, daemon=True).start()
     threading.Thread(target=_start_auto_approval_polling, daemon=True).start()
 
