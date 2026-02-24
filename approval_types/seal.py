@@ -36,6 +36,7 @@ FIELD_LABELS = {
     "document_type":   "文件类型",
     "lawyer_reviewed": "律师是否已审核",
     "remarks":         "备注",
+    "file_details":    "文件明细",  # 表格控件：每文件一行，列：文件名、律师审核、数量、盖章/外带
 }
 
 FIELD_ID_FALLBACK = {
@@ -50,8 +51,19 @@ FIELD_ID_FALLBACK = {
     "remarks":         "widget17375349954340001",
 }
 
-FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "remarks"]
+FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "file_details", "remarks"]
 DATE_FIELDS = set()
+
+# 文件明细表格：在用印表单中新增「表格」控件，命名为「文件明细」，列依次为：文件名、律师审核、数量、盖章/外带
+# 添加后删除 field_cache.json 或调用 invalidate_cache 以重新获取结构；若 API 未返回子字段，在此填写实际子字段 id
+FIELDLIST_SUBFIELDS_FALLBACK = {
+    "file_details": [
+        {"id": "widget_file_name", "type": "input", "name": "文件名"},
+        {"id": "widget_lawyer", "type": "input", "name": "律师审核"},
+        {"id": "widget_count", "type": "number", "name": "数量"},
+        {"id": "widget_usage", "type": "input", "name": "盖章/外带"},
+    ]
+}
 
 SUPPORTS_IMAGE = True
 

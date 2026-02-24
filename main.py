@@ -683,7 +683,7 @@ def on_card_action_confirm(data):
                 if _all_complete():
                     file_codes = pending.get("file_codes") or []
                     if file_items:
-                        # 多文件：聚合选项，只生成一张工单。每文件明细写入备注。
+                        # 多文件：聚合选项，只生成一张工单。每文件明细写入表格控件 file_details。
                         agg = dict(doc_fields)
                         lawyer_vals = [fi.get("lawyer_reviewed") for fi in file_items]
                         usage_vals = [fi.get("usage_method") for fi in file_items]
@@ -691,14 +691,15 @@ def on_card_action_confirm(data):
                         agg["usage_method"] = "外带" if any(v == "外带" for v in usage_vals) else "盖章"
                         total_copies = sum(int(fi.get("document_count") or "1") for fi in file_items)
                         agg["document_count"] = str(total_copies)
-                        lines = ["各文件明细："]
-                        for i, fi in enumerate(file_items, 1):
-                            fn = fi.get("file_name", f"文件{i}")
-                            lr = fi.get("lawyer_reviewed") or "否"
-                            um = fi.get("usage_method") or "盖章"
-                            dc = fi.get("document_count") or "1"
-                            lines.append(f"{i}. {fn}: 律师{'已' if lr == '是' else '未'}审核, {um}, {dc}份")
-                        agg["remarks"] = "\n".join(lines)
+                        agg["file_details"] = [
+                            {
+                                "文件名": fi.get("file_name", f"文件{i+1}"),
+                                "律师审核": fi.get("lawyer_reviewed") or "否",
+                                "数量": fi.get("document_count") or "1",
+                                "盖章/外带": fi.get("usage_method") or "盖章",
+                            }
+                            for i, fi in enumerate(file_items)
+                        ]
                         with _state_lock:
                             if open_id in PENDING_SEAL:
                                 del PENDING_SEAL[open_id]
