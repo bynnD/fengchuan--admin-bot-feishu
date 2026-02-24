@@ -401,6 +401,44 @@ def _schedule_file_intent_card(open_id):
             PENDING_FILE_UNCLEAR[open_id]["timer"] = timer
 
 
+def send_seal_files_confirm_card(open_id, file_names):
+    """发送用印文件收集确认卡片：展示已接收文件列表，底部「完成」按钮开始处理"""
+    if not file_names:
+        return
+    lines = [f"**已接收文件（共 {len(file_names)} 个）**\n"]
+    for i, fn in enumerate(file_names[:10], 1):
+        lines.append(f"{i}. {fn}")
+    if len(file_names) > 10:
+        lines.append(f"... 等共 {len(file_names)} 个")
+    lines.append("\n继续上传更多文件，或点击下方「完成」开始处理。")
+    text = "\n".join(lines)
+    btn = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "完成"},
+        "type": "primary",
+        "behaviors": [{"type": "callback", "value": {"action": "seal_files_complete"}}],
+    }
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": [btn]},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送用印文件确认卡片失败: %s", resp.msg)
+
+
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_names=None):
     """发送用印补充选项卡片：律师审核、数量、盖章还是外带，单卡矩阵展示。file_codes 为 list，file_names 为多文件时各文件名列表"""
     opts = _get_seal_form_options()
@@ -524,6 +562,10 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
+        # 用印文件收集：点击「完成」开始批量处理
+        if value.get("action") == "seal_files_complete":
+            _process_seal_files_batch(open_id, user_id)
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在处理，请稍候"}})
         # 文件意图选择卡片：用印申请 / 开票申请（3 分钟内未说明意图时弹出）
         if value.get("action") == "file_intent":
             intent = value.get("intent", "")
@@ -1699,8 +1741,8 @@ def on_message(data):
                     entry["timer"] = threading.Timer(debounce, lambda _oid=open_id, _uid=user_id: _process_seal_files_batch(_oid, _uid))
                     entry["timer"].daemon = True
                     entry["timer"].start()
-                    files_count = count
-                send_message(open_id, f"已收到文件「{file_name}」（共 {files_count} 个）。继续上传或回复「完成」开始处理。")
+                    file_names_list = [f.get("file_name", "未知文件") for f in entry["files"]]
+                send_seal_files_confirm_card(open_id, file_names_list)
             else:
                 # 用户先上传附件但未说明意图，先询问再处理。支持多文件，追加到列表
                 file_name = content_json.get("file_name", "未知文件")
