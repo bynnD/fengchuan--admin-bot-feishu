@@ -441,10 +441,10 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, 
     count_opts = ["1", "2", "3", "4", "5"]
 
     def _btn(field, val, label=None, file_idx=None):
-        v = {"action": "seal_option", "field": field, "value": val}
+        v = {"action": "seal_option", "field": field, "value": str(val)}
         if file_idx is not None:
-            v["file_idx"] = file_idx
-        return {"tag": "button", "text": {"tag": "plain_text", "content": label or val}, "type": "default",
+            v["file_idx"] = int(file_idx)
+        return {"tag": "button", "text": {"tag": "plain_text", "content": label or str(val)}, "type": "default",
                 "behaviors": [{"type": "callback", "value": v}]}
 
     if file_items and len(file_items) > 1:
@@ -609,9 +609,8 @@ def on_card_action_confirm(data):
             doc_fields = pending["doc_fields"]
             file_items = pending.get("file_items")
             file_codes = pending.get("file_codes") or []
-            opts = _get_seal_form_options()
-            lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-            usage_opts = opts.get("usage_method", ["盖章", "外带"])
+            lawyer_opts = ["是", "否", "已审核", "未审核"]
+            usage_opts = ["盖章", "外带"]
 
             def _v(k, v):
                 v = str(v).strip() if v else ""
@@ -706,7 +705,12 @@ def on_card_action_confirm(data):
                     value = getattr(value, "__dict__", {}) or {}
                 field = value.get("field") if isinstance(value, dict) else None
                 val = value.get("value") if isinstance(value, dict) else None
-                file_idx = value.get("file_idx") if isinstance(value, dict) else None  # 多文件时每行独立
+                file_idx = value.get("file_idx") if isinstance(value, dict) else None
+                if file_idx is not None:
+                    try:
+                        file_idx = int(file_idx)
+                    except (TypeError, ValueError):
+                        file_idx = None
                 if not field or val is None or val == "":
                     logger.warning("seal_option 缺少 field 或 value: %s", value)
                     return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
@@ -722,9 +726,9 @@ def on_card_action_confirm(data):
                     file_items[file_idx][field] = val
                 else:
                     doc_fields[field] = val
-                opts = _get_seal_form_options()
-                lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-                usage_opts = opts.get("usage_method", ["盖章", "外带"])
+                # 使用固定选项避免 _get_seal_form_options 网络请求导致回调超时（飞书要求 3 秒内响应）
+                lawyer_opts = ["是", "否", "已审核", "未审核"]
+                usage_opts = ["盖章", "外带"]
 
                 def _valid(k, v):
                     if k == "lawyer_reviewed":
@@ -2322,7 +2326,7 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     _validate_env()
-    invalidate_cache("用印申请")  # 启动时刷新用印表单结构，确保与飞书后台一致
+    # 不在此处 invalidate 用印缓存，避免首次卡片回调时因拉取表单结构超时（飞书要求 3 秒内响应）
     threading.Thread(target=_start_health_server, daemon=True).start()
     threading.Thread(target=_start_auto_approval_polling, daemon=True).start()
 
