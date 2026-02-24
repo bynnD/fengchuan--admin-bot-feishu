@@ -1312,6 +1312,31 @@ def _try_complete_seal(open_id, user_id, text):
     if not pending:
         return False
 
+    doc_fields = pending["doc_fields"]
+    opts = _get_seal_form_options()
+    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+
+    def _valid(k, v):
+        if k == "lawyer_reviewed":
+            return v and str(v).strip() in lawyer_opts
+        if k == "usage_method":
+            return v and str(v).strip() in usage_opts
+        return bool(v)
+
+    # 兜底：用户发「确认」「提交」且律师审核、盖章方式已选，直接进入确认
+    if text.strip() in ("确认", "提交", "完成"):
+        if _valid("lawyer_reviewed", doc_fields.get("lawyer_reviewed")) and _valid("usage_method", doc_fields.get("usage_method")):
+            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
+            if not missing:
+                file_codes = pending.get("file_codes") or []
+                with _state_lock:
+                    if open_id in PENDING_SEAL:
+                        del PENDING_SEAL[open_id]
+                _do_create_seal(open_id, user_id, doc_fields, file_codes)
+                send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+                return True
+
     if _is_cancel_intent(text):
         with _state_lock:
             if open_id in PENDING_SEAL:
@@ -1319,9 +1344,6 @@ def _try_complete_seal(open_id, user_id, text):
         send_message(open_id, "已取消用印申请，如需办理请重新发起。")
         return True
 
-    doc_fields = pending["doc_fields"]
-
-    opts = _get_seal_form_options()
     company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
     seal_hint = f"（选项：{'/'.join(opts.get('seal_type', ['公章','合同章','法人章','财务章']))}）"
     usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带']))}，默认盖章）"
@@ -1635,7 +1657,11 @@ def on_message(data):
         now = time.time()
         with _state_lock:
             last = _user_last_msg.get(open_id, 0)
-            if now - last < RATE_LIMIT_SEC:
+            in_seal = open_id in PENDING_SEAL
+            text_for_limit = (content_json.get("text") or "").strip() if msg_type == "text" else ""
+            # 用印/开票流程中发「确认」「提交」「完成」时豁免限流，避免卡片点击后快速操作被拦截
+            exempt = in_seal and text_for_limit in ("确认", "提交", "完成")
+            if not exempt and now - last < RATE_LIMIT_SEC:
                 send_message(open_id, "操作过于频繁，请稍后再试。")
                 return
             _user_last_msg[open_id] = now
@@ -1668,17 +1694,8 @@ def on_message(data):
                         except Exception:
                             pass
                     count = len(entry["files"])
-                    if count == 1:
-                        # 单文件立即处理
-                        entry = PENDING_SEAL_FILES.pop(open_id, None)
-                        if entry and entry.get("files"):
-                            files_for_handle = [
-                                {"message_id": f.get("message_id"), "content_json": f.get("content_json") or {}, "file_name": f.get("file_name", "未知文件")}
-                                for f in entry["files"]
-                            ]
-                            _handle_file_message(open_id, user_id, None, None, files_list=files_for_handle)
-                        return
-                    debounce = SEAL_FILES_DEBOUNCE_SEC
+                    # 统一收集后批量处理，单卡展示所有文件，避免每文件一张卡
+                    debounce = 2 if count == 1 else SEAL_FILES_DEBOUNCE_SEC
                     entry["timer"] = threading.Timer(debounce, lambda _oid=open_id, _uid=user_id: _process_seal_files_batch(_oid, _uid))
                     entry["timer"].daemon = True
                     entry["timer"].start()
