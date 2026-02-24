@@ -439,51 +439,73 @@ def send_seal_files_confirm_card(open_id, file_names):
         logger.error("发送用印文件确认卡片失败: %s", resp.msg)
 
 
-def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_names=None):
-    """发送用印补充选项卡片：律师审核、数量、盖章还是外带，单卡矩阵展示。file_codes 为 list，file_names 为多文件时各文件名列表"""
+def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=None):
+    """发送用印补充选项卡片：律师审核、数量、盖章还是外带。file_items 非空时为矩阵式，每文件一行独立选项"""
     opts = _get_seal_form_options()
     lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
     usage_opts = opts.get("usage_method", ["盖章", "外带"])
     doc_name = doc_fields.get("document_name", file_name.rsplit(".", 1)[0] if file_name else "")
     count_opts = ["1", "2", "3", "4", "5"]
 
-    # 矩阵式：文件列表 + 律师审核 + 数量 + 盖章外带
-    if file_names and len(file_names) > 1:
-        lines = [f"**已接收文件（共 {len(file_names)} 个）**\n"]
-        for i, fn in enumerate(file_names[:10], 1):
-            lines.append(f"{i}. {fn}")
-        if len(file_names) > 10:
-            lines.append(f"... 等共 {len(file_names)} 个")
-        lines.append("\n请点击下方选项完成补充：")
-        text = "\n".join(lines)
-    else:
-        text = f"已接收文件：{file_name}\n· 文件名称：{doc_name}\n\n请点击下方选项完成补充："
+    def _btn(field, val, label=None, file_idx=None):
+        v = {"action": "seal_option", "field": field, "value": val}
+        if file_idx is not None:
+            v["file_idx"] = file_idx
+        return {"tag": "button", "text": {"tag": "plain_text", "content": label or val}, "type": "default",
+                "behaviors": [{"type": "callback", "value": v}]}
 
-    lawyer_btns = [
-        {"tag": "button", "text": {"tag": "plain_text", "content": v}, "type": "primary" if v == "是" else "default",
-         "behaviors": [{"type": "callback", "value": {"action": "seal_option", "field": "lawyer_reviewed", "value": v}}]}
-        for v in lawyer_opts
-    ]
-    usage_btns = [
-        {"tag": "button", "text": {"tag": "plain_text", "content": v}, "type": "default",
-         "behaviors": [{"type": "callback", "value": {"action": "seal_option", "field": "usage_method", "value": v}}]}
-        for v in usage_opts
-    ]
-    count_btns = [
-        {"tag": "button", "text": {"tag": "plain_text", "content": v + "份"}, "type": "default",
-         "behaviors": [{"type": "callback", "value": {"action": "seal_option", "field": "document_count", "value": v}}]}
-        for v in count_opts
-    ]
-    elements = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-        {"tag": "hr"},
-        {"tag": "div", "text": {"tag": "plain_text", "content": "律师是否已审核（必填，请明确选择）", "lines": 1}},
-        {"tag": "action", "actions": lawyer_btns},
-        {"tag": "div", "text": {"tag": "plain_text", "content": "数量（每份文件盖章份数，默认1份）", "lines": 1}},
-        {"tag": "action", "actions": count_btns},
-        {"tag": "div", "text": {"tag": "plain_text", "content": "盖章还是外带（默认盖章）", "lines": 1}},
-        {"tag": "action", "actions": usage_btns},
-    ]
+    if file_items and len(file_items) > 1:
+        # 矩阵式：每文件一行，含 律师审核 | 数量 | 盖章外带
+        lines = [f"**已接收文件（共 {len(file_items)} 个）**\n请为每个文件选择选项："]
+        text = "\n".join(lines)
+        elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}, {"tag": "hr"}]
+        for i, fi in enumerate(file_items[:15]):  # 最多 15 行，避免卡片过长
+            fn = fi.get("file_name", f"文件{i+1}")
+            if len(fn) > 30:
+                fn = fn[:27] + "..."
+            lawyer_btns = [_btn("lawyer_reviewed", v, v, i) for v in lawyer_opts]
+            count_btns = [_btn("document_count", v, v + "份", i) for v in count_opts]
+            usage_btns = [_btn("usage_method", v, v, i) for v in usage_opts]
+            cur_lawyer = fi.get("lawyer_reviewed") or ""
+            cur_count = fi.get("document_count") or "1"
+            cur_usage = fi.get("usage_method") or ""
+            for b in lawyer_btns:
+                if b["text"]["content"] == cur_lawyer:
+                    b["type"] = "primary"
+            for b in count_btns:
+                if b["text"]["content"] == cur_count + "份":
+                    b["type"] = "primary"
+            for b in usage_btns:
+                if b["text"]["content"] == cur_usage:
+                    b["type"] = "primary"
+            elements.extend([
+                {"tag": "div", "text": {"tag": "plain_text", "content": f"📄 {i+1}. {fn}", "lines": 1}},
+                {"tag": "div", "text": {"tag": "plain_text", "content": "  律师审核", "lines": 1}},
+                {"tag": "action", "actions": lawyer_btns},
+                {"tag": "div", "text": {"tag": "plain_text", "content": "  数量", "lines": 1}},
+                {"tag": "action", "actions": count_btns},
+                {"tag": "div", "text": {"tag": "plain_text", "content": "  盖章/外带", "lines": 1}},
+                {"tag": "action", "actions": usage_btns},
+                {"tag": "hr"},
+            ])
+        if len(file_items) > 15:
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"*... 等共 {len(file_items)} 个文件*"}})
+    else:
+        # 单文件或全局选项
+        text = f"已接收文件：{file_name}\n· 文件名称：{doc_name}\n\n请点击下方选项完成补充："
+        lawyer_btns = [_btn("lawyer_reviewed", v) for v in lawyer_opts]
+        usage_btns = [_btn("usage_method", v) for v in usage_opts]
+        count_btns = [_btn("document_count", v, v + "份") for v in count_opts]
+        elements = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "hr"},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "律师是否已审核（必填，请明确选择）", "lines": 1}},
+            {"tag": "action", "actions": lawyer_btns},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "数量（每份文件盖章份数，默认1份）", "lines": 1}},
+            {"tag": "action", "actions": count_btns},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "盖章还是外带（默认盖章）", "lines": 1}},
+            {"tag": "action", "actions": usage_btns},
+        ]
     card = {
         "config": {"wide_screen_mode": True},
         "elements": elements,
@@ -601,41 +623,97 @@ def on_card_action_confirm(data):
                     _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-        # 用印选项卡片：律师是否已审核、盖章还是外带
+        # 用印选项卡片：律师是否已审核、盖章还是外带（支持 file_idx 实现每文件独立选项）
         if value.get("action") == "seal_option":
-            field = value.get("field")
-            val = value.get("value")
-            if not field or not val:
-                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-            with _state_lock:
-                pending = PENDING_SEAL.get(open_id)
-            if not pending:
-                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
-            doc_fields = pending["doc_fields"]
-            doc_fields[field] = val
-            opts = _get_seal_form_options()
-            lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-            usage_opts = opts.get("usage_method", ["盖章", "外带"])
-
-            def _valid(k, v):
-                if k == "lawyer_reviewed":
-                    return v and str(v).strip() in lawyer_opts
-                if k == "usage_method":
-                    return v and str(v).strip() in usage_opts
-                if k == "document_count":
-                    return v and str(v).strip() in ("1", "2", "3", "4", "5")
-                return bool(v)
-
-            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
-            if not missing:
-                file_codes = pending.get("file_codes") or []
+            try:
+                logger.info("卡片回调 seal_option: value=%s (type=%s)", value, type(value).__name__)
+                # 飞书可能将 value 序列化为字符串，确保解析为 dict
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value) if value else {}
+                    except json.JSONDecodeError:
+                        value = {}
+                elif value is not None and not isinstance(value, dict) and hasattr(value, "__dict__"):
+                    value = getattr(value, "__dict__", {}) or {}
+                field = value.get("field") if isinstance(value, dict) else None
+                val = value.get("value") if isinstance(value, dict) else None
+                file_idx = value.get("file_idx") if isinstance(value, dict) else None  # 多文件时每行独立
+                if not field or val is None or val == "":
+                    logger.warning("seal_option 缺少 field 或 value: %s", value)
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
+                val = str(val).strip()
                 with _state_lock:
-                    if open_id in PENDING_SEAL:
-                        del PENDING_SEAL[open_id]
-                _do_create_seal(open_id, user_id, doc_fields, file_codes)
-                send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
-                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
-            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
+                    pending = PENDING_SEAL.get(open_id)
+                if not pending:
+                    logger.warning("seal_option 会话已过期: open_id=%s", open_id)
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+                doc_fields = pending["doc_fields"]
+                file_items = pending.get("file_items")  # 多文件矩阵时每文件独立选项
+                if file_items is not None and file_idx is not None and 0 <= file_idx < len(file_items):
+                    file_items[file_idx][field] = val
+                else:
+                    doc_fields[field] = val
+                opts = _get_seal_form_options()
+                lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+                usage_opts = opts.get("usage_method", ["盖章", "外带"])
+
+                def _valid(k, v):
+                    if k == "lawyer_reviewed":
+                        return v and str(v).strip() in lawyer_opts
+                    if k == "usage_method":
+                        return v and str(v).strip() in usage_opts
+                    if k == "document_count":
+                        return v and str(v).strip() in ("1", "2", "3", "4", "5")
+                    return bool(v)
+
+                def _all_complete():
+                    if file_items:
+                        for fi in file_items:
+                            if not _valid("lawyer_reviewed", fi.get("lawyer_reviewed")) or not _valid("usage_method", fi.get("usage_method")):
+                                return False
+                        return True
+                    return (
+                        _valid("lawyer_reviewed", doc_fields.get("lawyer_reviewed"))
+                        and _valid("usage_method", doc_fields.get("usage_method"))
+                    )
+
+                base_missing = [k for k in ["company", "seal_type", "reason"] if not (doc_fields.get(k) and str(doc_fields.get(k)).strip())]
+                if base_missing:
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
+                if _all_complete():
+                    file_codes = pending.get("file_codes") or []
+                    if file_items:
+                        # 多文件：聚合选项，只生成一张工单。每文件明细写入备注。
+                        agg = dict(doc_fields)
+                        lawyer_vals = [fi.get("lawyer_reviewed") for fi in file_items]
+                        usage_vals = [fi.get("usage_method") for fi in file_items]
+                        agg["lawyer_reviewed"] = "是" if any(v == "是" for v in lawyer_vals) else "否"
+                        agg["usage_method"] = "外带" if any(v == "外带" for v in usage_vals) else "盖章"
+                        total_copies = sum(int(fi.get("document_count") or "1") for fi in file_items)
+                        agg["document_count"] = str(total_copies)
+                        lines = ["各文件明细："]
+                        for i, fi in enumerate(file_items, 1):
+                            fn = fi.get("file_name", f"文件{i}")
+                            lr = fi.get("lawyer_reviewed") or "否"
+                            um = fi.get("usage_method") or "盖章"
+                            dc = fi.get("document_count") or "1"
+                            lines.append(f"{i}. {fn}: 律师{'已' if lr == '是' else '未'}审核, {um}, {dc}份")
+                        agg["remarks"] = "\n".join(lines)
+                        with _state_lock:
+                            if open_id in PENDING_SEAL:
+                                del PENDING_SEAL[open_id]
+                        _do_create_seal(open_id, user_id, agg, file_codes)
+                    else:
+                        with _state_lock:
+                            if open_id in PENDING_SEAL:
+                                del PENDING_SEAL[open_id]
+                        _do_create_seal(open_id, user_id, doc_fields, file_codes)
+                    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
+                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
+            except Exception as e:
+                logger.exception("seal_option 处理异常: %s", e)
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": f"操作失败：{str(e)[:50]}"}})
 
         confirm_id = value.get("confirm_id", "")
         if not confirm_id:
@@ -1294,10 +1372,24 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         _do_create_seal(open_id, user_id, doc_fields, file_codes)
         return
 
+    # 多文件时构建 file_items，支持每文件独立选项（律师审核、数量、盖章外带）
+    file_items = None
+    if files_list and len(files_list) > 1 and file_codes and len(file_codes) == len(files_list):
+        file_items = []
+        for i, f in enumerate(files_list):
+            fn = f.get("file_name", f.get("content_json", {}).get("file_name", ""))
+            file_items.append({
+                "file_name": fn,
+                "file_code": file_codes[i] if i < len(file_codes) else None,
+                "lawyer_reviewed": None,
+                "document_count": "1",
+                "usage_method": None,
+            })
     with _state_lock:
         PENDING_SEAL[open_id] = {
             "doc_fields": doc_fields,
             "file_codes": file_codes,
+            "file_items": file_items,
             "user_id": user_id,
             "created_at": time.time(),
         }
@@ -1305,8 +1397,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
     # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
         doc_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择，避免从文本推断后直接进入确认
-        file_names = [f.get("file_name", f.get("content_json", {}).get("file_name", "")) for f in files_list] if files_list and len(files_list) > 1 else None
-        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_names=file_names)
+        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=file_items)
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
@@ -1701,8 +1792,8 @@ def on_message(data):
             last = _user_last_msg.get(open_id, 0)
             in_seal = open_id in PENDING_SEAL
             text_for_limit = (content_json.get("text") or "").strip() if msg_type == "text" else ""
-            # 用印/开票流程中发「确认」「提交」「完成」时豁免限流，避免卡片点击后快速操作被拦截
-            exempt = in_seal and text_for_limit in ("确认", "提交", "完成")
+            # 文件上传、用印流程中的完成操作：豁免限流，避免批量上传 20 个文件时只处理 3 个
+            exempt = (msg_type == "file") or (in_seal and text_for_limit in ("确认", "提交", "完成"))
             if not exempt and now - last < RATE_LIMIT_SEC:
                 send_message(open_id, "操作过于频繁，请稍后再试。")
                 return
