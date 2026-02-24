@@ -402,7 +402,7 @@ def _schedule_file_intent_card(open_id):
 
 
 def send_seal_files_confirm_card(open_id, file_names):
-    """发送用印文件收集确认卡片：展示已接收文件列表，底部「完成」按钮开始处理"""
+    """发送用印文件收集确认卡片：展示已接收文件列表，无按钮，由 debounce 自动触发处理"""
     if not file_names:
         return
     lines = [f"**已接收文件（共 {len(file_names)} 个）**\n"]
@@ -410,19 +410,12 @@ def send_seal_files_confirm_card(open_id, file_names):
         lines.append(f"{i}. {fn}")
     if len(file_names) > 10:
         lines.append(f"... 等共 {len(file_names)} 个")
-    lines.append("\n继续上传更多文件，或点击下方「完成」开始处理。")
+    lines.append("\n继续上传更多文件，或等待自动处理。")
     text = "\n".join(lines)
-    btn = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "完成"},
-        "type": "primary",
-        "behaviors": [{"type": "callback", "value": {"action": "seal_files_complete"}}],
-    }
     card = {
         "config": {"wide_screen_mode": True},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-            {"tag": "action", "actions": [btn]},
         ],
     }
     body = CreateMessageRequestBody.builder() \
@@ -659,7 +652,8 @@ def on_card_action_confirm(data):
 
                 def _valid(k, v):
                     if k == "lawyer_reviewed":
-                        return v and str(v).strip() in lawyer_opts
+                        v = str(v).strip() if v else ""
+                        return v in lawyer_opts or (v == "是" and "已审核" in lawyer_opts) or (v == "否" and "未审核" in lawyer_opts)
                     if k == "usage_method":
                         return v and str(v).strip() in usage_opts
                     if k == "document_count":
@@ -687,7 +681,7 @@ def on_card_action_confirm(data):
                         agg = dict(doc_fields)
                         lawyer_vals = [fi.get("lawyer_reviewed") for fi in file_items]
                         usage_vals = [fi.get("usage_method") for fi in file_items]
-                        agg["lawyer_reviewed"] = "是" if any(v == "是" for v in lawyer_vals) else "否"
+                        agg["lawyer_reviewed"] = "已审核" if any(v in ("是", "已审核") for v in lawyer_vals) else "未审核"
                         agg["usage_method"] = "外带" if any(v == "外带" for v in usage_vals) else "盖章"
                         total_copies = sum(int(fi.get("document_count") or "1") for fi in file_items)
                         agg["document_count"] = str(total_copies)
@@ -1074,6 +1068,11 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
     token = get_token()
 
     fields = dict(fields)
+    if approval_type == "用印申请":
+        from approval_types import seal
+        lr = fields.get("lawyer_reviewed")
+        if lr and hasattr(seal, "LAWYER_REVIEWED_VALUE_MAP"):
+            fields["lawyer_reviewed"] = seal.LAWYER_REVIEWED_VALUE_MAP.get(str(lr).strip(), lr)
     if approval_type == "采购申请" and not fields.get("purchase_type") and fields.get("cost_detail"):
         inferred = _infer_purchase_type_from_cost_detail(fields["cost_detail"])
         if inferred:
@@ -1164,12 +1163,12 @@ CONFIRM_TTL = 15 * 60  # 15 分钟
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
-# 用印申请需从模版读取选项的字段
+# 用印申请需从模版读取选项的字段（与 seal.FIELD_ID_FALLBACK 一致）
 SEAL_OPTION_FIELDS = {
     "company": "widget17375357884790001",
-    "usage_method": "widget17375347703620001",
+    "usage_method": "widget17334699216260001",   # 盖章或外带印章
     "seal_type": "widget15754438920110001",
-    "lawyer_reviewed": "widget17375349618880001",
+    "lawyer_reviewed": "widget17334701422160001",
 }
 
 

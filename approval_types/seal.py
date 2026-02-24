@@ -39,17 +39,24 @@ FIELD_LABELS = {
     "file_details":    "文件明细",  # 表格控件：每文件一行，列：文件名、律师审核、数量、盖章/外带
 }
 
+# 与飞书表单实际控件 ID 一致（从审批实例 form 获取）
 FIELD_ID_FALLBACK = {
-    "company":         "widget17375357884790001",
-    "usage_method":    "widget17375347703620001",
-    "reason":          "widget0",
-    "seal_type":       "widget15754438920110001",
-    "document_name":   "widget3",
-    "document_count":  "widget4",
-    "document_type":   "widget17375354078970001",
-    "lawyer_reviewed": "widget17375349618880001",
-    "remarks":         "widget17375349954340001",
+    "usage_method":    "widget17334699216260001",   # 盖章或外带印章
+    "seal_type":       "widget15754438920110001",   # 印章类型
+    "document_name":   "widget3",                    # 文件名称
+    "document_count":  "widget4",                    # 文件数量
+    "document_type":   "widget17334700336550001",   # 文件类型
+    "lawyer_reviewed": "widget17334701422160001",   # 律师是否已审核
+    "company":         "widget17375357884790001",    # 用印公司（若表单有）
+    "reason":          "widget0",                     # 文件用途（若表单有）
+    "remarks":         "widget17375349954340001",    # 备注（若表单有）
 }
+
+# 表单字段名与逻辑键映射（表单名「盖章或外带印章」对应 usage_method）
+FIELD_NAME_ALIASES = {"盖章或外带印章": "usage_method"}
+
+# 律师审核：对话中用「是」/「否」，表单可能用「已审核」/「未审核」，提交时映射
+LAWYER_REVIEWED_VALUE_MAP = {"是": "已审核", "否": "未审核"}
 
 FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "file_details", "remarks"]
 DATE_FIELDS = set()
