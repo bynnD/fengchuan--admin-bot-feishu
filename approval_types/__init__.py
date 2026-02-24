@@ -3,10 +3,10 @@
 新增工单：在此目录新建 py 文件，在 _TYPES 中注册，详见 README.md
 """
 
-from . import seal, purchase, outbound, invoice
+from . import seal, purchase, outbound, invoice, reception_material
 
 # 注册所有工单类型模块
-_TYPES = [seal, purchase, outbound, invoice]
+_TYPES = [seal, purchase, outbound, invoice, reception_material]
 
 # 聚合配置
 APPROVAL_CODES = {t.NAME: t.APPROVAL_CODE for t in _TYPES}
@@ -47,6 +47,8 @@ APPROVAL_USAGE_GUIDE = {
     "采购申请": ("说明物品、规格、数量、金额、期望交付时间", "采购一台笔记本 ThinkPad X1 8000元，下周一到货", False),
     # 外出：时间、地点、事由
     "外出报备": ("说明开始日期、结束日期、外出地点、事由", "我2月24日9点要外出2个小时，去税务局办理税务变更", False),
+    # 招待/团建物资领用：物品用途、领用日期、物品明细（名称/数量）
+    "招待/团建物资领用": ("说明物品用途、领用日期、物品明细（名称和数量）", "宴请客户，领用国缘双开6瓶红酒4瓶共10瓶", False),
 }
 
 # 有附件识别读取需求的工单类型 -> 文件内容提取器（均使用 file_extraction 的 OCR/文本提取）

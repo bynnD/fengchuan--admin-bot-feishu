@@ -1,5 +1,6 @@
 # PyYAML 用于加载 approval_rules.yaml
 PyYAML>=6.0
+python-dotenv>=1.0
 
 # 固定版本：项目对 lark_oapi.ws.client.Client._handle_data_frame 做了猴子补丁，
 # 将 CARD 类型消息转为 EVENT 以触发 on_card_action_confirm。SDK 升级可能改变内部实现导致补丁失效。
