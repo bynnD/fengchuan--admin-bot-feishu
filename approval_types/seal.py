@@ -9,7 +9,7 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "用印申请"
-APPROVAL_CODE = "FB855CD4-CA15-4A1B-8B7A-51A56171CE60"
+APPROVAL_CODE = "58F1B962-73D4-408F-8B1B-3FB1776CF2B8"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 有附件识别读取需求，使用通用文件内容提取（含 OCR）
 

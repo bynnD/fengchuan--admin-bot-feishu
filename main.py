@@ -620,7 +620,9 @@ def analyze_message(history):
         f"格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\"}}]。"
         f"缺少名称/规格/数量/金额任一项就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')。"
         f"purchase_type(采购类别)可根据采购物品自动推断，如办公电脑、办公桌→办公用品，设备、机器→设备类等。\n"
-        f"7. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
+        f"7. 招待/团建物资领用：item_detail是物品明细列表(必填)，每项含名称、数量。"
+        f"格式为[{{\"名称\":\"矿泉水\",\"数量\":\"2\"}}]。缺少名称或数量任一项就把item_detail列入missing。\n"
+        f"8. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
         f"document_name/document_type不需要用户说，会从上传文件自动获取。"
         f"lawyer_reviewed(律师是否已审核)必须用户明确提供「是」或「否」，未明确说明则放入 missing。"
         f"若用户明确说「盖公章」「要盖公章」「公章」等，必须将 seal_type 提取为「公章」，不要放入 missing。"
@@ -1800,6 +1802,12 @@ def on_message(data):
                     if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
                         if "cost_detail" not in miss:
                             miss.append("cost_detail")
+                            req["missing"] = miss
+                if at == "招待/团建物资领用":
+                    idetail = fields_check.get("item_detail")
+                    if not idetail or (isinstance(idetail, list) and len(idetail) == 0) or idetail == "":
+                        if "item_detail" not in miss:
+                            miss.append("item_detail")
                             req["missing"] = miss
                 remaining_requests.append(req)
 
