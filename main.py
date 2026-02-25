@@ -392,15 +392,23 @@ def _schedule_file_intent_card(open_id):
             PENDING_FILE_UNCLEAR[open_id]["timer"] = timer
 
 
+def _escape_lark_md(s):
+    """转义 lark_md 中的特殊字符，避免被解析为链接等语法导致卡片报错"""
+    if not s:
+        return s
+    return str(s).replace("[", "\\[").replace("]", "\\]")
+
+
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
     """发送用印补充选项卡片：律师是否已审核、盖章还是外带，用户点击选择。file_codes 为 list"""
     opts = _get_seal_form_options()
-    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+    # 不同租户的审批表单字段 ID 可能不同，若 API 未返回选项则用默认值，避免空 actions 导致卡片报错
+    lawyer_opts = opts.get("lawyer_reviewed") or ["是", "否"]
+    usage_opts = opts.get("usage_method") or ["盖章", "外带"]
     doc_name = doc_fields.get("document_name", file_name.rsplit(".", 1)[0] if file_name else "")
     text = (
-        f"已接收文件：{file_name}\n"
-        f"· 文件名称：{doc_name}\n\n"
+        f"已接收文件：{_escape_lark_md(file_name)}\n"
+        f"· 文件名称：{_escape_lark_md(doc_name)}\n\n"
         f"请点击下方选项完成补充："
     )
     lawyer_btns = [
@@ -451,7 +459,7 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             "admin_comment": admin_comment,
             "created_at": time.time(),
         }
-    text = f"【{approval_type}】\n\n{summary}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
+    text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
     btn_config = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": "确认提交"},
@@ -667,6 +675,12 @@ _FIELDLIST_ALIAS = {
     "数量": ["quantity", "qty", "count", "num"],
     "金额": ["amount", "price", "cost", "单价", "总价", "费用"],
     "是否有库存": ["has_stock", "in_stock", "库存", "stock"],
+    # 用印申请表格结构
+    "文件名称": ["document_name", "doc_name", "文件名"],
+    "文件类型": ["document_type", "doc_type", "类型"],
+    "用印公司": ["company", "公司"],
+    "印章类型": ["seal_type", "seal", "印章"],
+    "用印事由": ["reason", "事由", "用途"],
 }
 
 
@@ -1239,6 +1253,16 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None):
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
+
+    # 表格结构：将扁平字段转为 seal_detail 表格行（参照采购申请 cost_detail）
+    all_fields["seal_detail"] = [{
+        "文件名称": all_fields.get("document_name", ""),
+        "文件类型": all_fields.get("document_type", ""),
+        "用印公司": all_fields.get("company", ""),
+        "印章类型": all_fields.get("seal_type", ""),
+        "用印事由": all_fields.get("reason", ""),
+        "数量": all_fields.get("document_count", "1"),
+    }]
 
     codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
     fc = {ATTACHMENT_FIELD_ID: codes} if codes else {}

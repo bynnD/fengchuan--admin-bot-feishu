@@ -36,7 +36,11 @@ FIELD_LABELS = {
     "document_type":   "文件类型",
     "lawyer_reviewed": "律师是否已审核",
     "remarks":         "备注",
+    "seal_detail":     "用印明细",  # 表格结构时使用，每行：文件名称、文件类型、用印公司、印章类型、用印事由、数量
 }
+
+# 表单字段名可能为「用印明细」「文件明细」等，均映射到 seal_detail
+FIELD_NAME_ALIASES = {"用印明细": "seal_detail", "文件明细": "seal_detail"}
 
 FIELD_ID_FALLBACK = {
     "company":         "widget17375357884790001",
@@ -48,9 +52,23 @@ FIELD_ID_FALLBACK = {
     "document_type":   "widget17375354078970001",
     "lawyer_reviewed": "widget17375349618880001",
     "remarks":         "widget17375349954340001",
+    "seal_detail":     "widget17719721160210001",  # 表格结构时的主字段 ID，可从 /debug-form?type=用印申请 获取
 }
 
-FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "remarks"]
+# 表格结构时，field_cache 无法从 API 解析 sub_fields 时使用。
+# 子字段 id 需与飞书表单一致，可通过 GET /debug-form?type=用印申请 查看 raw_item 获取
+FIELDLIST_SUBFIELDS_FALLBACK = {
+    "seal_detail": [
+        {"id": "widget17719721160210002", "type": "input", "name": "文件名称"},
+        {"id": "widget17719721160210003", "type": "input", "name": "文件类型"},
+        {"id": "widget17719721160210004", "type": "input", "name": "用印公司"},
+        {"id": "widget17719721160210005", "type": "input", "name": "印章类型"},
+        {"id": "widget17719721160210006", "type": "textarea", "name": "用印事由"},
+        {"id": "widget17719721160210007", "type": "number", "name": "数量"},
+    ]
+}
+
+FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "remarks", "seal_detail"]
 DATE_FIELDS = set()
 
 SUPPORTS_IMAGE = True

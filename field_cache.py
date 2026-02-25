@@ -85,14 +85,15 @@ def _fetch_from_api(approval_code, token):
                 continue
             info = {"name": field_name, "type": field_type}
             if field_type == "fieldList":
-                sub_items = item.get("children") or item.get("value") or item.get("option") or []
+                # 飞书 fieldList 子字段可能在 children、ext、value、option 中，参考采购申请/招待领用
+                sub_items = item.get("children") or item.get("ext") or item.get("value") or item.get("option") or []
                 if isinstance(sub_items, str):
                     try:
                         parsed = json.loads(sub_items) if sub_items else []
                         if isinstance(parsed, dict):
                             sub_items = (
-                                parsed.get("children") or parsed.get("list") or parsed.get("fields")
-                                or parsed.get("value") or []
+                                parsed.get("children") or parsed.get("ext") or parsed.get("list")
+                                or parsed.get("fields") or parsed.get("value") or []
                             )
                             # value1-1 等格式：取第一页结构作为子字段定义
                             if not sub_items and parsed:
