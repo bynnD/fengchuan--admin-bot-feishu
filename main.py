@@ -454,6 +454,27 @@ def _build_seal_options_card(doc_fields, file_name):
     }
 
 
+def _update_seal_card_delayed(token, open_id, doc_fields, file_name):
+    """延时更新用印选项卡片，用于显示选中状态。需在回调同步返回之后调用。"""
+    if not token or not open_id:
+        return
+    time.sleep(0.5)  # 确保晚于同步返回
+    try:
+        card = _build_seal_options_card(doc_fields, file_name)
+        body = {"token": token, "card": {"open_ids": [open_id], "config": card.get("config", {}), "elements": card.get("elements", [])}}
+        resp = httpx.post(
+            "https://open.feishu.cn/open-apis/interactive/v1/card/update",
+            headers={"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"},
+            json=body,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning("延时更新用印卡片失败: code=%s msg=%s", data.get("code"), data.get("msg"))
+    except Exception as e:
+        logger.warning("延时更新用印卡片异常: %s", e)
+
+
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
     """发送用印补充选项卡片：律师是否已审核、盖章形式、文件数量，选完后点击提交。file_codes 为 list"""
     card = _build_seal_options_card(doc_fields, file_name)
@@ -567,9 +588,7 @@ def on_card_action_confirm(data):
                     threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-        # 用印选项卡片：律师是否已审核、盖章形式、文件数量。回调内仅更新内存并返回 toast
-        # 注：曾尝试在回调中返回更新后的卡片以显示选中状态，但飞书对 card 格式要求严格，易触发 200672，
-        # 故暂不返回 card，仅 toast。选项已正确记录，提交时会校验。
+        # 用印选项卡片：律师是否已审核、盖章形式、文件数量。回调内更新内存，返回 toast，并延时更新卡片以显示选中状态
         if value.get("action") == "seal_option":
             field = value.get("field")
             val = value.get("value")
@@ -584,6 +603,15 @@ def on_card_action_confirm(data):
                 doc_fields[field] = val
             elif field in ("lawyer_reviewed", "usage_method"):
                 doc_fields[field] = val
+            # 延时更新卡片以显示选中状态（同步返回 card 易触发 200672，改用延时更新接口）
+            update_token = getattr(ev, "token", None) or ""
+            if update_token:
+                _doc = dict(doc_fields)
+                _fname = pending.get("file_name", "")
+                threading.Thread(
+                    target=lambda: _update_seal_card_delayed(update_token, open_id, _doc, _fname),
+                    daemon=True,
+                ).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
         # 用印提交：选完后点击提交，创建工单
@@ -1139,6 +1167,32 @@ def _resolve_document_type_for_seal(document_type):
     return last or SEAL_DOC_TYPE_OTHER_VALUE
 
 
+def _resolve_radio_option_for_seal(field_id, raw_value, default_first=True):
+    """
+    将文本值解析为用印表单 radioV2 控件的有效 option value。
+    用于 seal_type、usage_method 等 fieldList 子字段。
+    """
+    opts = get_sub_field_options("用印申请", field_id, APPROVAL_CODES["用印申请"], get_token)
+    if not opts:
+        invalidate_cache("用印申请")
+        opts = get_sub_field_options("用印申请", field_id, APPROVAL_CODES["用印申请"], get_token)
+    if not opts:
+        return ""
+    raw = str(raw_value or "").strip()
+    for o in opts:
+        if not isinstance(o, dict):
+            continue
+        opt_val = o.get("value") or o.get("key", "")
+        opt_text = o.get("text", "")
+        if raw and (raw == opt_val or raw == opt_text):
+            return opt_val or opt_text
+        if raw and raw in (opt_text, opt_val):
+            return opt_val or opt_text
+    if default_first and opts and isinstance(opts[0], dict):
+        return opts[0].get("value") or opts[0].get("key", "")
+    return ""
+
+
 def _get_seal_form_options():
     """从工单模版读取用印申请的选项，返回 {逻辑键: [选项文本列表]}"""
     token = get_token()
@@ -1372,21 +1426,25 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     all_fields.setdefault("usage_method", "纸质章")
     all_fields.setdefault("document_count", "1")
     codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
-    # 盖章形式：表单选项为「纸质章/电子章/外带印章」，直接使用用户选择
-    seal_form_type = all_fields.get("usage_method", "纸质章")
-    if seal_form_type not in ("纸质章", "电子章", "外带印章"):
-        seal_form_type = "纸质章"
-    # 表格行：附件在行内，需将 file_codes 放入行数据
-    # 文件类型：表单选项为业务分类（非 PDF/Word 等格式），需解析为有效选项值
+    # 盖章形式、印章类型：需解析为表单 option value（飞书要求传 value 非 text）
+    seal_form_type = _resolve_radio_option_for_seal(
+        "widget17334699216260001", all_fields.get("usage_method", "纸质章"), default_first=True
+    )
+    if not seal_form_type:
+        seal_form_type = _resolve_radio_option_for_seal("widget17334699216260001", "纸质章", default_first=True)
+    resolved_seal_type = _resolve_radio_option_for_seal("widget15754438920110001", all_fields.get("seal_type", ""), default_first=True)
+    lawyer_raw = str(all_fields.get("lawyer_reviewed", "")).strip()
+    lawyer_val = "已审核" if lawyer_raw in ("是", "yes", "已审核") else "未审核"
+    resolved_lawyer = _resolve_radio_option_for_seal("widget17334701422160001", lawyer_val, default_first=True)
     resolved_doc_type = _resolve_document_type_for_seal(all_fields.get("document_type", ""))
     all_fields["seal_detail"] = [{
         "文件名称": all_fields.get("document_name", ""),
         "用印事由": all_fields.get("reason", ""),
         "文件类型": resolved_doc_type,
-        "印章类型": all_fields.get("seal_type", ""),
+        "印章类型": resolved_seal_type,
         "盖章形式": seal_form_type,
         "文件数量": all_fields.get("document_count", "1"),
-        "律师是否已审核": "已审核" if str(all_fields.get("lawyer_reviewed", "")).strip() in ("是", "yes", "已审核") else "未审核",
+        "律师是否已审核": resolved_lawyer or lawyer_val,
         "上传用章文件": codes,
     }]
     with _state_lock:
