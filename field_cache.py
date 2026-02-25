@@ -122,6 +122,15 @@ def _fetch_from_api(approval_code, token):
                     if not info["sub_fields"]:
                         raw_preview = json.dumps(item, ensure_ascii=False)[:400]
                         logger.debug("fieldList %s(%s) 无有效子字段，原始 item 预览: %s", field_id, field_name, raw_preview)
+                # ext 可能只含部分子字段（如数量），value 第一行才有完整结构，优先使用
+                val = item.get("value")
+                if isinstance(val, list) and val and isinstance(val[0], list) and val[0]:
+                    first_row = val[0]
+                    if len(first_row) > len(info.get("sub_fields", [])):
+                        info["sub_fields"] = [
+                            {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
+                            for s in first_row if isinstance(s, dict) and s.get("id")
+                        ]
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):

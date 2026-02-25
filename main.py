@@ -564,7 +564,7 @@ def on_card_action_confirm(data):
                     return v and str(v).strip() in usage_opts
                 return bool(v)
 
-            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
+            missing = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
             if not missing:
                 file_codes = pending.get("file_codes") or []
                 with _state_lock:
@@ -681,6 +681,8 @@ _FIELDLIST_ALIAS = {
     "用印公司": ["company", "公司"],
     "印章类型": ["seal_type", "seal", "印章"],
     "用印事由": ["reason", "事由", "用途"],
+    "盖章形式": ["usage_method", "盖章或外带"],
+    "文件数量": ["document_count", "数量"],
 }
 
 
@@ -710,8 +712,18 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
                     if isinstance(item, dict):
                         row = []
                         for sf in sub_fields:
-                            val = _match_sub_field(sf.get("name", ""), item)
-                            row.append({"id": sf["id"], "type": sf.get("type", "input"), "value": val})
+                            sf_name = sf.get("name", "")
+                            sf_type = sf.get("type", "input")
+                            # 附件类型在行内时，value 需为 list，不能转 str
+                            if sf_type in ("attachmentV2", "attach", "attachV2") and sf_name in item:
+                                val = item[sf_name]
+                                if isinstance(val, list):
+                                    pass  # 保持 list
+                                else:
+                                    val = [val] if val else []
+                            else:
+                                val = _match_sub_field(sf_name, item)
+                            row.append({"id": sf["id"], "type": sf_type, "value": val})
                         rows.append(row)
                     elif isinstance(item, list):
                         rows.append(item)
@@ -727,6 +739,8 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
         return []
     if logical_key in DATE_FIELDS and raw_value:
         return f"{raw_value}T00:00:00+08:00" if "T" not in str(raw_value) else str(raw_value)
+    if field_type == "checkboxV2" and isinstance(raw_value, list):
+        return raw_value
     return str(raw_value) if raw_value else ""
 
 
@@ -818,19 +832,26 @@ def build_form(approval_type, fields, token, file_codes=None):
             opts = field_info.get("options", [])
             if opts and isinstance(opts, list):
                 raw_str = str(raw).strip()
+                # 用印申请「律师是否已审核」：表单选项为「已审核/未审核」，用户说「是/否」时需映射
+                if logical_key == "lawyer_reviewed" and raw_str in ("是", "yes"):
+                    raw_str = "已审核"
+                elif logical_key == "lawyer_reviewed" and raw_str in ("否", "no"):
+                    raw_str = "未审核"
                 matched = False
                 for opt in opts:
                     if isinstance(opt, dict):
-                        if opt.get("value") == raw_str or opt.get("text") == raw_str:
-                            raw = opt.get("value", raw_str)
+                        opt_val = opt.get("value") or opt.get("key", "")
+                        opt_text = opt.get("text", "")
+                        if opt_val == raw_str or opt_text == raw_str:
+                            raw = opt_val or opt_text
                             matched = True
                             break
-                        if raw_str and raw_str in (opt.get("text", ""), opt.get("value", "")):
-                            raw = opt.get("value", raw_str)
+                        if raw_str and raw_str in (opt_text, opt_val):
+                            raw = opt_val or opt_text
                             matched = True
                             break
                 if not matched:
-                    raw = opts[0].get("value", "") if isinstance(opts[0], dict) else ""
+                    raw = (opts[0].get("value") or opts[0].get("key", "")) if isinstance(opts[0], dict) else ""
         # fieldList 无 sub_fields 时使用配置的 fallback（如采购费用明细）
         if field_type == "fieldList" and not (field_info.get("sub_fields")):
             fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
@@ -1028,12 +1049,12 @@ CONFIRM_TTL = 15 * 60  # 15 分钟
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
-# 用印申请需从模版读取选项的字段
+# 用印申请选项字段（表格结构时选项在 sub_fields 内，此处作 fallback）
 SEAL_OPTION_FIELDS = {
-    "company": "widget17375357884790001",
-    "usage_method": "widget17375347703620001",
-    "seal_type": "widget15754438920110001",
-    "lawyer_reviewed": "widget17375349618880001",
+    "usage_method": "widget17334699216260001",   # 盖章形式：纸质章/电子章
+    "seal_type": "widget15754438920110001",     # 印章类型
+    "document_type": "widget17334700336550001", # 文件类型
+    "lawyer_reviewed": "widget17334701422160001",  # 律师是否已审核
 }
 
 
@@ -1063,20 +1084,28 @@ def _get_seal_form_options():
     return result
 
 
+# 开票申请附件字段 ID（6692F47D 表单仅一个「上传开票证明文件」，结算单+合同合并上传）
+INVOICE_ATTACHMENT_FIELD_ID = "widget16457795866320001"
+
+
 def _get_invoice_attachment_field_ids():
-    """从开票申请表单缓存中按名称查找结算单、合同附件字段 ID"""
+    """从开票申请表单缓存中查找附件字段。新表单仅一个「上传开票证明文件」，结算单+合同合并"""
     token = get_token()
     cached = get_form_fields("开票申请", APPROVAL_CODES.get("开票申请", ""), token)
     if not cached:
-        return {}
+        return {"unified": INVOICE_ATTACHMENT_FIELD_ID}
     result = {}
     for fid, info in cached.items():
         if info.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file"):
             name = info.get("name", "")
             if "结算" in name or "结算单" in name:
                 result["settlement"] = fid
-            elif "合同" in name:
+            elif "合同" in name and "开票证明" not in name:
                 result["contract"] = fid
+            elif "开票证明" in name or "上传开票" in name:
+                result["unified"] = fid
+    if not result:
+        result["unified"] = INVOICE_ATTACHMENT_FIELD_ID
     return result
 
 
@@ -1207,10 +1236,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         if k == "usage_method":
             return v and str(v).strip() in usage_opts
         return bool(v)
-    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
-    if missing and ai_fields and ("company" in missing or "seal_type" in missing):
-        logger.warning("用印合并异常: AI已识别 company=%r seal_type=%r 但仍被列为缺失，initial_fields=%r",
-                       ai_fields.get("company"), ai_fields.get("seal_type"), initial_fields)
+    # 表单无「用印公司」字段，不要求必填；reason 会合并到 document_name
+    missing = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
+    if missing and ai_fields and "seal_type" in missing:
+        logger.warning("用印合并异常: AI已识别 seal_type=%r 但仍被列为缺失，initial_fields=%r",
+                       ai_fields.get("seal_type"), initial_fields)
     if not missing:
         # 全部可推断，直接创建工单
         _do_create_seal(open_id, user_id, doc_fields, file_codes)
@@ -1249,23 +1279,26 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None):
-    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单。file_codes 为 list，支持多文件"""
+    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单。表单为 fieldList 表格结构。"""
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "盖章")
     all_fields.setdefault("document_count", "1")
-
-    # 表格结构：将扁平字段转为 seal_detail 表格行（参照采购申请 cost_detail）
+    codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
+    # 盖章形式：表单选项为「纸质章/电子章」，映射 盖章->纸质章 外带->电子章
+    usage = all_fields.get("usage_method", "盖章")
+    seal_form_type = "纸质章" if usage in ("盖章", "纸质章") else ("电子章" if usage == "外带" else usage)
+    # 表格行：附件在行内，需将 file_codes 放入行数据
     all_fields["seal_detail"] = [{
         "文件名称": all_fields.get("document_name", ""),
-        "文件类型": all_fields.get("document_type", ""),
-        "用印公司": all_fields.get("company", ""),
-        "印章类型": all_fields.get("seal_type", ""),
         "用印事由": all_fields.get("reason", ""),
-        "数量": all_fields.get("document_count", "1"),
+        "文件类型": all_fields.get("document_type", ""),
+        "印章类型": all_fields.get("seal_type", ""),
+        "盖章形式": seal_form_type,
+        "文件数量": all_fields.get("document_count", "1"),
+        "律师是否已审核": "已审核" if str(all_fields.get("lawyer_reviewed", "")).strip() in ("是", "yes", "已审核") else "未审核",
+        "上传用章文件": codes,
     }]
-
-    codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
-    fc = {ATTACHMENT_FIELD_ID: codes} if codes else {}
+    fc = {"widget15828104903330001": codes} if codes else {}
     admin_comment = get_admin_comment("用印申请", all_fields)
     summary = format_fields_summary(all_fields, "用印申请")
     send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
@@ -1368,7 +1401,7 @@ def _try_complete_seal(open_id, user_id, text):
             return v and str(v).strip() in usage_opts
         return bool(v)
 
-    missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, all_fields.get(k))]
+    missing = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, all_fields.get(k))]
 
     if missing:
         with _state_lock:
@@ -1500,21 +1533,28 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
 
 def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
     """开票申请字段齐全时，发送确认卡片，用户点击确认后创建工单"""
+    all_fields = dict(all_fields)
+    all_fields.setdefault("proof_file_type", ["合同"])
+    all_fields.setdefault("contract_sealed", "已盖章")
     aid = _get_invoice_attachment_field_ids()
     file_codes = {}
-    if aid.get("settlement") and settlement_code:
-        file_codes[aid["settlement"]] = [settlement_code]
-    if aid.get("contract") and contract_code:
-        file_codes[aid["contract"]] = [contract_code]
-    if not aid and (settlement_code or contract_code):
+    if aid.get("unified"):
+        codes = [c for c in [settlement_code, contract_code] if c]
+        if codes:
+            file_codes[aid["unified"]] = codes
+    else:
+        if aid.get("settlement") and settlement_code:
+            file_codes[aid["settlement"]] = [settlement_code]
+        if aid.get("contract") and contract_code:
+            file_codes[aid["contract"]] = [contract_code]
+    if not file_codes and (settlement_code or contract_code):
         token = get_token()
         cached = get_form_fields("开票申请", APPROVAL_CODES["开票申请"], token)
         attach_ids = [fid for fid, info in (cached or {}).items()
                       if info.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file")]
         codes = [c for c in [settlement_code, contract_code] if c]
-        for i, fid in enumerate(attach_ids[:2]):
-            if i < len(codes):
-                file_codes[fid] = [codes[i]]
+        if attach_ids:
+            file_codes[attach_ids[0]] = codes
 
     admin_comment = get_admin_comment("开票申请", all_fields)
     summary = format_fields_summary(all_fields, "开票申请")

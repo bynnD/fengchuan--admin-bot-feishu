@@ -36,39 +36,39 @@ FIELD_LABELS = {
     "document_type":   "文件类型",
     "lawyer_reviewed": "律师是否已审核",
     "remarks":         "备注",
-    "seal_detail":     "用印明细",  # 表格结构时使用，每行：文件名称、文件类型、用印公司、印章类型、用印事由、数量
+    "seal_detail":     "明细",
 }
 
-# 表单字段名可能为「用印明细」「文件明细」等，均映射到 seal_detail
-FIELD_NAME_ALIASES = {"用印明细": "seal_detail", "文件明细": "seal_detail"}
+# 表单为 fieldList 表格，字段名映射
+FIELD_NAME_ALIASES = {
+    "明细": "seal_detail",
+    "盖章或外带印章": "usage_method",
+    "盖章形式": "usage_method",
+    "盖章或外带": "usage_method",
+    "文件数量": "document_count",
+    "用印事由": "reason",
+}
 
+# 表格主字段 ID（58F1B962 审批定义 - 明细 fieldList）
 FIELD_ID_FALLBACK = {
-    "company":         "widget17375357884790001",
-    "usage_method":    "widget17375347703620001",
-    "reason":          "widget0",
-    "seal_type":       "widget15754438920110001",
-    "document_name":   "widget3",
-    "document_count":  "widget4",
-    "document_type":   "widget17375354078970001",
-    "lawyer_reviewed": "widget17375349618880001",
-    "remarks":         "widget17375349954340001",
-    "seal_detail":     "widget17719721160210001",  # 表格结构时的主字段 ID，可从 /debug-form?type=用印申请 获取
+    "seal_detail":     "widget17719721160210001",   # 明细 fieldList
 }
 
-# 表格结构时，field_cache 无法从 API 解析 sub_fields 时使用。
-# 子字段 id 需与飞书表单一致，可通过 GET /debug-form?type=用印申请 查看 raw_item 获取
+# 表格子字段（从 value 第一行解析），附件在行内
 FIELDLIST_SUBFIELDS_FALLBACK = {
     "seal_detail": [
-        {"id": "widget17719721160210002", "type": "input", "name": "文件名称"},
-        {"id": "widget17719721160210003", "type": "input", "name": "文件类型"},
-        {"id": "widget17719721160210004", "type": "input", "name": "用印公司"},
-        {"id": "widget17719721160210005", "type": "input", "name": "印章类型"},
-        {"id": "widget17719721160210006", "type": "textarea", "name": "用印事由"},
-        {"id": "widget17719721160210007", "type": "number", "name": "数量"},
+        {"id": "widget3", "type": "input", "name": "文件名称"},
+        {"id": "widget0", "type": "textarea", "name": "用印事由"},
+        {"id": "widget17334700336550001", "type": "radioV2", "name": "文件类型"},
+        {"id": "widget15754438920110001", "type": "radioV2", "name": "印章类型"},
+        {"id": "widget17334699216260001", "type": "radioV2", "name": "盖章形式"},
+        {"id": "widget4", "type": "number", "name": "文件数量"},
+        {"id": "widget17334701422160001", "type": "radioV2", "name": "律师是否已审核"},
+        {"id": "widget15828104903330001", "type": "attachmentV2", "name": "上传用章文件"},
     ]
 }
 
-FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "remarks", "seal_detail"]
+FIELD_ORDER = ["seal_detail"]
 DATE_FIELDS = set()
 
 SUPPORTS_IMAGE = True

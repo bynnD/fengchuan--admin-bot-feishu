@@ -9,7 +9,7 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "开票申请"
-APPROVAL_CODE = "692F47D-F6CF-4342-8DAC-32CE84F39E6F"
+APPROVAL_CODE = "6692F47D-F6CF-4342-8DAC-32CE84F39E6F"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 从结算单和合同自动提取字段
 
@@ -36,6 +36,9 @@ FIELD_LABELS = {
     "contract_no":   "合同编号",
     "settlement_no": "结算单编号",
     "remarks":       "备注",
+    "business_type": "业务类型",
+    "proof_file_type": "开票证明文件类型",
+    "contract_sealed": "开票合同是否盖章",
 }
 
 # 表单字段名可能为「购方名称」「开票抬头」「客户/开票名称」等，均映射到 buyer_name；
@@ -45,10 +48,21 @@ FIELD_NAME_ALIASES = {
     "购方税号": "tax_id", "税务登记证号": "tax_id", "社会统一信用代码": "tax_id",
     "税务登记证号/社会统一信用代码": "tax_id",
     "开票金额": "amount", "发票金额": "amount",
+    "开票证明文件类型（可多选）": "proof_file_type",
+    "开票合同是否盖章": "contract_sealed",
 }
-# 表单字段 ID 占位，实际值由 get_form_fields 缓存或 debug-form 获取后填写
-FIELD_ID_FALLBACK = {}
-FIELD_ORDER = ["invoice_type", "invoice_items", "amount", "buyer_name", "tax_id", "contract_no", "settlement_no", "remarks"]
+# 与 6692F47D 审批定义一致
+FIELD_ID_FALLBACK = {
+    "buyer_name":      "widget17334740014470001",   # 客户/开票名称
+    "tax_id":          "widget17334740172520001",   # 税务登记证号/社会统一信用代码
+    "invoice_type":    "widget16457794296140001",   # 发票类型
+    "invoice_items":   "widget17660282371600001",   # 开票项目
+    "amount":          "widget17334740447380001",   # 开票金额
+    "business_type":   "widget17660274322300001",   # 业务类型
+    "proof_file_type": "widget17660291688960001",   # 开票证明文件类型（可多选）
+    "contract_sealed": "widget17334733872820001",   # 开票合同是否盖章
+}
+FIELD_ORDER = ["invoice_type", "invoice_items", "amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_sealed", "contract_no", "settlement_no", "remarks"]
 DATE_FIELDS = set()
 SUPPORTS_IMAGE = True
 
