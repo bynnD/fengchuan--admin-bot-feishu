@@ -456,16 +456,16 @@ def _send_seal_options_text(open_id, user_id, doc_fields, file_codes, file_name,
         lines = [
             f"已接收文件：{file_name}",
             f"默认：律师{'已' if lr == '是' else '未'}审核，{dc}份，{um}",
-            "回复「**确认提交**」创建工单；或说明修改项",
+            "回复「**确认提交**」创建工单；或说明修改，如「律师未审核」「2份」「外带」",
         ]
     send_message(open_id, "\n".join(lines))
 
 
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=None):
-    """发送用印补充选项卡片：律师审核、数量、盖章还是外带。file_items 非空时为矩阵式，每文件一行独立选项"""
-    opts = _get_seal_form_options()
-    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+    """发送用印补充选项卡片：律师审核、数量、盖章还是外带。file_items 非空时为矩阵式，每文件一行独立选项。
+    使用固定选项避免 _get_seal_form_options 网络请求，确保卡片发送与回调均快速响应。"""
+    lawyer_opts = ["是", "否"]
+    usage_opts = ["盖章", "外带"]
     doc_name = doc_fields.get("document_name", file_name.rsplit(".", 1)[0] if file_name else "")
     count_opts = ["1", "2", "3", "4", "5"]
 
@@ -481,7 +481,7 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, 
         lines = [f"**已接收文件（共 {len(file_items)} 个）**\n请为每个文件选择选项（默认：律师已审核、盖章）："]
         text = "\n".join(lines)
         elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}, {"tag": "hr"}]
-        for i, fi in enumerate(file_items[:15]):  # 最多 15 行，避免卡片过长
+        for i, fi in enumerate(file_items[:8]):  # 最多 8 行，控制卡片规模避免回调异常
             fn = fi.get("file_name", f"文件{i+1}")
             if len(fn) > 30:
                 fn = fn[:27] + "..."
@@ -510,8 +510,8 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, 
                 {"tag": "action", "actions": usage_btns},
                 {"tag": "hr"},
             ])
-        if len(file_items) > 15:
-            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"*... 等共 {len(file_items)} 个文件*"}})
+        if len(file_items) > 8:
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"*... 等共 {len(file_items)} 个文件，超出部分将使用默认选项*"}})
         elements.append({
             "tag": "action",
             "actions": [{
@@ -654,6 +654,14 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
+        elif value is not None and not isinstance(value, dict):
+            # SDK 可能返回对象，转为 dict
+            if hasattr(value, "__dict__"):
+                value = getattr(value, "__dict__", {}) or {}
+            elif hasattr(value, "model_dump"):
+                value = value.model_dump() if callable(value.model_dump) else {}
+            else:
+                value = {}
         # 用印选项卡片：点击「确认提交」手动触发生成工单
         if value.get("action") == "seal_confirm_submit":
             with _state_lock:
@@ -747,15 +755,6 @@ def on_card_action_confirm(data):
         # 用印选项卡片：律师是否已审核、盖章还是外带（支持 file_idx 实现每文件独立选项）
         if value.get("action") == "seal_option":
             try:
-                logger.info("卡片回调 seal_option: value=%s (type=%s)", value, type(value).__name__)
-                # 飞书可能将 value 序列化为字符串，确保解析为 dict
-                if isinstance(value, str):
-                    try:
-                        value = json.loads(value) if value else {}
-                    except json.JSONDecodeError:
-                        value = {}
-                elif value is not None and not isinstance(value, dict) and hasattr(value, "__dict__"):
-                    value = getattr(value, "__dict__", {}) or {}
                 field = value.get("field") if isinstance(value, dict) else None
                 val = value.get("value") if isinstance(value, dict) else None
                 file_idx = value.get("file_idx") if isinstance(value, dict) else None
@@ -1533,7 +1532,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡片（单/多文件均用卡片，回调内异步处理避免 200340）
+    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡片
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
         doc_fields.setdefault("lawyer_reviewed", "是")
         doc_fields.setdefault("usage_method", "盖章")
