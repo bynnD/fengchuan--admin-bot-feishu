@@ -107,10 +107,25 @@ def _fetch_from_api(approval_code, token):
                         sub_items = []
                 if not isinstance(sub_items, list):
                     sub_items = []
-                info["sub_fields"] = [
-                    {"id": s.get("id") or s.get("widget_id") or s.get("field_id"), "type": s.get("type", "input"), "name": s.get("name") or s.get("title") or s.get("label", "")}
-                    for s in sub_items if isinstance(s, dict) and (s.get("id") or s.get("widget_id") or s.get("field_id"))
-                ]
+                info["sub_fields"] = []
+                for s in sub_items:
+                    if not isinstance(s, dict) or not (s.get("id") or s.get("widget_id") or s.get("field_id")):
+                        continue
+                    sf = {
+                        "id": s.get("id") or s.get("widget_id") or s.get("field_id"),
+                        "type": s.get("type", "input"),
+                        "name": s.get("name") or s.get("title") or s.get("label", ""),
+                    }
+                    if sf["type"] in ("radioV2", "radio", "checkboxV2", "checkbox"):
+                        opts = s.get("option", [])
+                        if isinstance(opts, str):
+                            try:
+                                opts = json.loads(opts) if opts else []
+                            except json.JSONDecodeError:
+                                opts = []
+                        if opts:
+                            sf["options"] = opts
+                    info["sub_fields"].append(sf)
                 if not info["sub_fields"] and sub_items:
                     if isinstance(sub_items[0], list) and sub_items[0]:
                         first_row = sub_items[0]
@@ -127,10 +142,21 @@ def _fetch_from_api(approval_code, token):
                 if isinstance(val, list) and val and isinstance(val[0], list) and val[0]:
                     first_row = val[0]
                     if len(first_row) > len(info.get("sub_fields", [])):
-                        info["sub_fields"] = [
-                            {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
-                            for s in first_row if isinstance(s, dict) and s.get("id")
-                        ]
+                        info["sub_fields"] = []
+                        for s in first_row:
+                            if not isinstance(s, dict) or not s.get("id"):
+                                continue
+                            sf = {"id": s.get("id"), "type": s.get("type", "input"), "name": s.get("name", "")}
+                            if sf["type"] in ("radioV2", "radio", "checkboxV2", "checkbox"):
+                                opts = s.get("option", [])
+                                if isinstance(opts, str):
+                                    try:
+                                        opts = json.loads(opts) if opts else []
+                                    except json.JSONDecodeError:
+                                        opts = []
+                                if opts:
+                                    sf["options"] = opts
+                            info["sub_fields"].append(sf)
             if field_type in ("radioV2", "radio", "checkboxV2", "checkbox"):
                 opts = item.get("option", [])
                 if isinstance(opts, str):
@@ -180,6 +206,29 @@ def mark_free_process(approval_code):
     """创建失败 1390013 时标记为报备单，下次预检直接返回 True"""
     with _cache_lock:
         _free_process_cache[approval_code] = True
+
+
+def get_sub_field_options(approval_type, sub_field_id, approval_code, token):
+    """
+    获取 fieldList 中指定子字段的选项（用于 radioV2 等）。
+    返回 [{value, text}, ...] 或 []。
+    """
+    cached = get_form_fields(approval_type, approval_code, token)
+    if not cached:
+        return []
+    for field_id, info in cached.items():
+        if info.get("type") != "fieldList":
+            continue
+        for sf in (info.get("sub_fields") or []):
+            if sf.get("id") == sub_field_id:
+                opts = sf.get("options", [])
+                if isinstance(opts, str):
+                    try:
+                        opts = json.loads(opts) if opts else []
+                    except json.JSONDecodeError:
+                        return []
+                return opts if isinstance(opts, list) else []
+    return []
 
 
 def invalidate_cache(approval_type):
