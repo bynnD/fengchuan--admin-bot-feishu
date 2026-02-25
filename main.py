@@ -52,10 +52,12 @@ _token_cache = {"token": None, "expires_at": 0}
 _token_lock = threading.Lock()
 
 # 待办 TTL（秒）
-PENDING_TTL = 30 * 60  # 30 分钟
+PENDING_TTL = 60 * 60  # 60 分钟（用印选项卡片填写时间可能较长）
 SEAL_INITIAL_TTL = 30 * 60  # 30 分钟
 # 用户先上传附件但未说明意图时暂存，等用户说明用印/开票后再处理。支持多文件，结构 {open_id: {"files": [{...}], "created_at", "timer"}}
 PENDING_FILE_UNCLEAR = {}
+# 多文件用印排队：{open_id: {"items": [{file_name, file_code, doc_fields}, ...], "current_index": 0, "selections": [{lawyer, usage, count}, ...], "user_id", "created_at"}}
+PENDING_SEAL_QUEUE = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
 
 # 限流：每用户最小间隔（秒）
@@ -129,6 +131,10 @@ def _clean_expired_pending(open_id=None):
             if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_INVOICE[oid]
                 to_notify.append((oid, "开票申请已超时，请重新发起。"))
+        for oid in list(PENDING_SEAL_QUEUE.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL_QUEUE else []):
+            if oid in PENDING_SEAL_QUEUE and now - PENDING_SEAL_QUEUE[oid].get("created_at", 0) > PENDING_TTL:
+                del PENDING_SEAL_QUEUE[oid]
+                to_notify.append((oid, "用印申请已超时，请重新发起。"))
         for oid in list(SEAL_INITIAL_FIELDS.keys()) if open_id is None else ([open_id] if open_id in SEAL_INITIAL_FIELDS else []):
             data = SEAL_INITIAL_FIELDS.get(oid)
             created = data.get("created_at", 0) if isinstance(data, dict) else 0
@@ -399,6 +405,30 @@ def _escape_lark_md(s):
     return str(s).replace("[", "\\[").replace("]", "\\]")
 
 
+def _build_seal_queue_card(doc_fields, file_name, index, total, is_last):
+    """多文件排队模式：单份文件的选项卡片，底部为「下一份」或「完成」"""
+    card = _build_seal_options_card(doc_fields, file_name)
+    btn_label = "完成" if is_last else f"下一份（{index + 1}/{total}）"
+    btn_action = "seal_finish" if is_last else "seal_next"
+    for elem in card.get("elements", []):
+        if elem.get("tag") == "action" and elem.get("actions"):
+            acts = elem["actions"]
+            if acts and acts[-1].get("text", {}).get("content") == "提交":
+                elem["actions"] = [{
+                    "tag": "button", "text": {"tag": "plain_text", "content": btn_label},
+                    "type": "primary",
+                    "behaviors": [{"type": "callback", "value": {"action": btn_action}}],
+                }]
+                break
+    for elem in card.get("elements", []):
+        if elem.get("tag") == "div" and elem.get("text", {}).get("tag") == "lark_md":
+            c = elem["text"].get("content", "")
+            if "已接收文件" in c:
+                elem["text"]["content"] = f"**第 {index + 1}/{total} 份文件**\n\n" + c
+                break
+    return card
+
+
 def _build_seal_options_card(doc_fields, file_name):
     """根据 doc_fields 构建用印选项卡片，已选选项使用 type=primary 显示蓝色边框"""
     opts = _get_seal_form_options()
@@ -454,13 +484,13 @@ def _build_seal_options_card(doc_fields, file_name):
     }
 
 
-def _update_seal_card_delayed(token, open_id, doc_fields, file_name):
-    """延时更新用印选项卡片，用于显示选中状态。需在回调同步返回之后调用。"""
+def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None):
+    """延时更新用印选项卡片，用于显示选中状态。需在回调同步返回之后调用。card 可选，不传则从 doc_fields/file_name 构建。"""
     if not token or not open_id:
         return
     time.sleep(0.5)  # 确保晚于同步返回
     try:
-        card = _build_seal_options_card(doc_fields, file_name)
+        card = card or _build_seal_options_card(doc_fields, file_name)
         body = {"token": token, "card": {"open_ids": [open_id], "config": card.get("config", {}), "elements": card.get("elements", [])}}
         resp = httpx.post(
             "https://open.feishu.cn/open-apis/interactive/v1/card/update",
@@ -473,6 +503,58 @@ def _update_seal_card_delayed(token, open_id, doc_fields, file_name):
             logger.warning("延时更新用印卡片失败: code=%s msg=%s", data.get("code"), data.get("msg"))
     except Exception as e:
         logger.warning("延时更新用印卡片异常: %s", e)
+
+
+def _send_seal_queue_card(open_id, user_id, queue_data):
+    """发送排队模式下当前文件的选项卡片"""
+    items = queue_data.get("items", [])
+    idx = queue_data.get("current_index", 0)
+    if idx >= len(items):
+        return
+    item = items[idx]
+    card = _build_seal_queue_card(
+        item["doc_fields"], item["file_name"], idx, len(items), idx == len(items) - 1
+    )
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送用印排队卡片失败: %s", resp.msg)
+
+
+def _send_seal_final_card(open_id, total):
+    """发送最终提交卡片：以上 X 份文件均已选择完成"""
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"以上 **{total}** 份文件均已选择完成，请点击下方按钮生成一张工单。"}},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [{
+                "tag": "button", "text": {"tag": "plain_text", "content": "提交工单"},
+                "type": "primary",
+                "behaviors": [{"type": "callback", "value": {"action": "seal_submit_queue"}}],
+            }]},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送用印最终提交卡片失败: %s", resp.msg)
 
 
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
@@ -588,16 +670,33 @@ def on_card_action_confirm(data):
                     threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-        # 用印选项卡片：律师是否已审核、盖章形式、文件数量。回调内更新内存，返回 toast，并延时更新卡片以显示选中状态
+        # 用印选项卡片（含排队模式）：律师是否已审核、盖章形式、文件数量
         if value.get("action") == "seal_option":
             field = value.get("field")
             val = value.get("value")
             if not field or not val:
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
             with _state_lock:
+                queue_data = PENDING_SEAL_QUEUE.get(open_id)
                 pending = PENDING_SEAL.get(open_id)
+            if queue_data:
+                idx = queue_data.get("current_index", 0)
+                items = queue_data.get("items", [])
+                if idx < len(items):
+                    doc_fields = items[idx]["doc_fields"]
+                    if field == "document_count" and val in ("1", "2", "3", "4", "5"):
+                        doc_fields[field] = val
+                    elif field in ("lawyer_reviewed", "usage_method"):
+                        doc_fields[field] = val
+                    queue_data["created_at"] = time.time()
+                    update_token = getattr(ev, "token", None) or ""
+                    if update_token:
+                        qcard = _build_seal_queue_card(doc_fields, items[idx]["file_name"], idx, len(items), idx == len(items) - 1)
+                        threading.Thread(target=lambda c=qcard: _update_seal_card_delayed(update_token, open_id, None, None, card=c), daemon=True).start()
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
             if not pending:
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+            pending["created_at"] = time.time()  # 刷新会话，延长 TTL
             doc_fields = pending["doc_fields"]
             if field == "document_count" and val in ("1", "2", "3", "4", "5"):
                 doc_fields[field] = val
@@ -613,6 +712,73 @@ def on_card_action_confirm(data):
                     daemon=True,
                 ).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
+
+        # 多文件排队：下一份
+        if value.get("action") == "seal_next":
+            with _state_lock:
+                queue_data = PENDING_SEAL_QUEUE.get(open_id)
+            if not queue_data:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+            idx = queue_data.get("current_index", 0)
+            items = queue_data.get("items", [])
+            if idx >= len(items):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "数据异常"}})
+            doc_fields = items[idx]["doc_fields"]
+            lawyer = str(doc_fields.get("lawyer_reviewed", "")).strip()
+            usage = str(doc_fields.get("usage_method", "")).strip()
+            count = str(doc_fields.get("document_count", "1")).strip()
+            if lawyer not in ("是", "否"):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「律师是否已审核」"}})
+            if usage not in ("纸质章", "电子章", "外带印章"):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「盖章形式」"}})
+            if count not in ("1", "2", "3", "4", "5"):
+                doc_fields.setdefault("document_count", "1")
+            queue_data["selections"].append({"lawyer_reviewed": lawyer, "usage_method": usage, "document_count": count or "1"})
+            queue_data["current_index"] = idx + 1
+            queue_data["created_at"] = time.time()
+            _send_seal_queue_card(open_id, user_id, queue_data)
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已记录第 {idx + 1} 份，请选择第 {idx + 2} 份"}})
+
+        # 多文件排队：完成（最后一份）
+        if value.get("action") == "seal_finish":
+            with _state_lock:
+                queue_data = PENDING_SEAL_QUEUE.get(open_id)
+            if not queue_data:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+            idx = queue_data.get("current_index", 0)
+            items = queue_data.get("items", [])
+            if idx >= len(items):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "数据异常"}})
+            doc_fields = items[idx]["doc_fields"]
+            lawyer = str(doc_fields.get("lawyer_reviewed", "")).strip()
+            usage = str(doc_fields.get("usage_method", "")).strip()
+            count = str(doc_fields.get("document_count", "1")).strip()
+            if lawyer not in ("是", "否"):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「律师是否已审核」"}})
+            if usage not in ("纸质章", "电子章", "外带印章"):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「盖章形式」"}})
+            if count not in ("1", "2", "3", "4", "5"):
+                doc_fields.setdefault("document_count", "1")
+            queue_data["selections"].append({"lawyer_reviewed": lawyer, "usage_method": usage, "document_count": count or "1"})
+            queue_data["created_at"] = time.time()
+            _send_seal_final_card(open_id, len(items))
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "全部选择完成，请点击提交工单"}})
+
+        # 多文件排队：提交工单
+        if value.get("action") == "seal_submit_queue":
+            with _state_lock:
+                queue_data = PENDING_SEAL_QUEUE.pop(open_id, None)
+            if not queue_data:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
+            items = queue_data.get("items", [])
+            selections = queue_data.get("selections", [])
+            if len(selections) != len(items):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "数据异常，请重新发起"}})
+            def _do_seal_queue_async():
+                _do_create_seal_multi(open_id, queue_data["user_id"], items, selections)
+
+            threading.Thread(target=_do_seal_queue_async, daemon=True).start()
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
 
         # 用印提交：选完后点击提交，创建工单
         if value.get("action") == "seal_submit":
@@ -1246,11 +1412,18 @@ def _get_invoice_attachment_field_ids():
 
 def _handle_file_message(open_id, user_id, message_id, content_json, files_list=None):
     """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段。
-    files_list: 可选，多文件时传入 [{"message_id", "content_json", "file_name"}, ...]，单文件时用 message_id/content_json"""
-    if files_list:
-        file_codes_collect = []
-        doc_fields = None
-        first_file_name = ""
+    files_list: 可选，多文件时传入 [{"message_id", "content_json", "file_name"}, ...]，单文件时用 message_id/content_json
+    多文件时采用排队模式：先出第1张卡，选完点「下一份」出第2张，全部选完后出「提交工单」按钮。"""
+    if files_list and len(files_list) > 1:
+        # 多文件排队模式：先出第1张卡，选完「下一份」出第2张，全部选完出「提交工单」
+        opts = _get_seal_form_options()
+        seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
+        extractor = get_file_extractor("用印申请")
+        with _state_lock:
+            data = SEAL_INITIAL_FIELDS.pop(open_id, {})
+        initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
+        items = []
+        first_ai = {}
         for i, f in enumerate(files_list):
             msg_id = f.get("message_id")
             cj = f.get("content_json", {})
@@ -1262,59 +1435,67 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             send_message(open_id, f"正在处理文件「{fname}」（{i+1}/{len(files_list)}），请稍候...")
             file_content, dl_err = download_message_file(msg_id, fkey, "file")
             if not file_content:
-                err_detail = f"（{dl_err}）" if dl_err else ""
-                send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{err_detail}".strip())
+                send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{dl_err or ''}".strip())
                 return
-            logger.info("用印文件: 已下载 %s, 大小=%d bytes", fname, len(file_content))
             file_code, upload_err = upload_approval_file(fname, file_content)
             if not file_code:
-                err_detail = f"（{upload_err}）" if upload_err else ""
-                send_message(open_id, f"文件「{fname}」上传失败。{err_detail}".strip())
+                send_message(open_id, f"文件「{fname}」上传失败。{upload_err or ''}".strip())
                 return
-            file_codes_collect.append(file_code)
-            if i == 0:
-                first_file_name = fname
-        file_code = file_codes_collect[0] if len(file_codes_collect) == 1 else None
-        file_codes = file_codes_collect
-        file_name = first_file_name
-        # 获取首文件内容用于 AI 识别
-        file_content, _ = download_message_file(files_list[0]["message_id"], files_list[0]["content_json"].get("file_key", ""), "file")
-        if not file_content:
-            send_message(open_id, f"文件「{first_file_name}」下载失败，请重新发送。")
-            return
-        doc_name = first_file_name.rsplit(".", 1)[0] if "." in first_file_name else first_file_name
-        if len(files_list) > 1:
-            doc_name = "、".join(f.get("file_name", "").rsplit(".", 1)[0] for f in files_list[:5]) + (" 等" if len(files_list) > 5 else "")
-        doc_count = str(len(files_list))
-        ext = (first_file_name.rsplit(".", 1)[-1] or "").lower()
-        doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
-        doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
-        doc_fields = {"document_name": doc_name, "document_count": doc_count, "document_type": doc_type}
-    else:
-        file_key = content_json.get("file_key", "")
+            doc_name = fname.rsplit(".", 1)[0] if "." in fname else fname
+            ext = (fname.rsplit(".", 1)[-1] or "").lower()
+            doc_type = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}.get(ext, ext.upper() if ext else "")
+            doc_fields = {"document_name": doc_name, "document_count": "1", "document_type": doc_type}
+            if i == 0 and extractor and DEEPSEEK_API_KEY:
+                first_ai = extractor(file_content, fname, {"company": opts.get("company"), "seal_type": seal_opts}, get_token) or {}
+            doc_fields.update(first_ai)
+            for k, v in (initial_fields or {}).items():
+                if v and str(v).strip() and k not in ("usage_method",):
+                    doc_fields[k] = str(v).strip()
+            doc_fields.pop("usage_method", None)
+            items.append({"file_name": fname, "file_code": file_code, "doc_fields": doc_fields})
+        with _state_lock:
+            PENDING_SEAL_QUEUE[open_id] = {
+                "items": items,
+                "current_index": 0,
+                "selections": [],
+                "user_id": user_id,
+                "created_at": time.time(),
+            }
+        send_message(open_id, f"已接收 {len(items)} 个文件，请依次为每份文件选择选项。")
+        _send_seal_queue_card(open_id, user_id, PENDING_SEAL_QUEUE[open_id])
+        return
+
+    if files_list and len(files_list) == 1:
+        f = files_list[0]
+        message_id = f.get("message_id")
+        content_json = f.get("content_json", {})
+        file_name = f.get("file_name", content_json.get("file_name", "未知文件"))
+    # 单文件处理（来自 files_list[0] 或 直接上传的 message_id/content_json）
+    if not files_list:
         file_name = content_json.get("file_name", "未知文件")
-        if not file_key:
-            send_message(open_id, "无法获取文件，请重新发送。")
-            return
-        send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
-        file_content, dl_err = download_message_file(message_id, file_key, "file")
-        if not file_content:
-            err_detail = f"（{dl_err}）" if dl_err else ""
-            send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
-            return
-        logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
-        file_code, upload_err = upload_approval_file(file_name, file_content)
-        if not file_code:
-            err_detail = f"（{upload_err}）" if upload_err else ""
-            send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
-            return
-        file_codes = [file_code]
-        doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-        doc_count = "1"
-        ext = (file_name.rsplit(".", 1)[-1] or "").lower()
-        doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
-        doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
-        doc_fields = {"document_name": doc_name, "document_count": doc_count, "document_type": doc_type}
+    file_key = content_json.get("file_key", "")
+    if not file_key:
+        send_message(open_id, "无法获取文件，请重新发送。")
+        return
+    send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
+    file_content, dl_err = download_message_file(message_id, file_key, "file")
+    if not file_content:
+        err_detail = f"（{dl_err}）" if dl_err else ""
+        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
+        return
+    logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
+    file_code, upload_err = upload_approval_file(file_name, file_content)
+    if not file_code:
+        err_detail = f"（{upload_err}）" if upload_err else ""
+        send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
+        return
+    file_codes = [file_code]
+    doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+    doc_count = "1"
+    ext = (file_name.rsplit(".", 1)[-1] or "").lower()
+    doc_type_map = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}
+    doc_type = doc_type_map.get(ext, ext.upper() if ext else "")
+    doc_fields = {"document_name": doc_name, "document_count": doc_count, "document_type": doc_type}
 
     # 以下为共用逻辑（单文件与多文件）
 
@@ -1418,6 +1599,55 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         for k in missing:
             lines.append(f"· {labels.get(k, k)}：{hint_map.get(k, '')}")
         send_message(open_id, "\n".join(lines))
+
+
+def _do_create_seal_multi(open_id, user_id, items, selections):
+    """多文件排队完成后，合并为一张工单。items=[{file_name, file_code, doc_fields}, ...], selections=[{lawyer_reviewed, usage_method, document_count}, ...]"""
+    if not items or len(items) != len(selections):
+        send_message(open_id, "数据异常，请重新发起用印申请。")
+        return
+    # 取首文件的 seal_type、reason 等作为基准，每行用各自的 doc_fields + selection
+    base = dict(items[0]["doc_fields"])
+    base.pop("lawyer_reviewed", None)
+    base.pop("usage_method", None)
+    base.pop("document_count", None)
+    rows = []
+    for i, (item, sel) in enumerate(zip(items, selections)):
+        df = {**base, **item["doc_fields"], **sel}
+        resolved_usage = _resolve_radio_option_for_seal("widget17334699216260001", sel.get("usage_method", "纸质章"), default_first=True)
+        resolved_seal = _resolve_radio_option_for_seal("widget15754438920110001", df.get("seal_type", ""), default_first=True)
+        lawyer_val = "已审核" if str(sel.get("lawyer_reviewed", "")).strip() in ("是", "yes", "已审核") else "未审核"
+        resolved_lawyer = _resolve_radio_option_for_seal("widget17334701422160001", lawyer_val, default_first=True)
+        resolved_doc_type = _resolve_document_type_for_seal(df.get("document_type", ""))
+        usage_val = resolved_usage or _resolve_radio_option_for_seal("widget17334699216260001", "纸质章", default_first=True)
+        rows.append({
+            "文件名称": df.get("document_name", item["file_name"].rsplit(".", 1)[0] if "." in item["file_name"] else item["file_name"]),
+            "用印事由": df.get("reason", ""),
+            "文件类型": resolved_doc_type,
+            "印章类型": resolved_seal,
+            "盖章形式": usage_val or "纸质章",
+            "文件数量": sel.get("document_count", "1"),
+            "律师是否已审核": resolved_lawyer or lawyer_val,
+            "上传用章文件": [item["file_code"]],
+        })
+    all_fields = {**base, "seal_detail": rows}
+    all_fields.setdefault("document_name", "、".join(r["文件名称"] for r in rows[:3]) + (" 等" if len(rows) > 3 else ""))
+    # 附件已在每行 上传用章文件 中，无需单独传 file_codes
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=None)
+    with _state_lock:
+        if open_id in PENDING_SEAL_QUEUE:
+            del PENDING_SEAL_QUEUE[open_id]
+        if open_id in CONVERSATIONS:
+            CONVERSATIONS[open_id] = []
+    if success:
+        instance_code = resp_data.get("instance_code", "")
+        if instance_code:
+            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+            send_card_message(open_id, f"【用印申请】\n{summary}\n\n工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+        else:
+            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}")
+    else:
+        send_message(open_id, f"提交失败：{msg}")
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False):
