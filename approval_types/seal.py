@@ -14,7 +14,7 @@ LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 有附件识别读取需求，使用通用文件内容提取（含 OCR）
 
 FIELD_HINTS = (
-    "company(用印公司,从文件内容识别), usage_method(盖章或外带,默认盖章), "
+    "company(用印公司,从文件内容识别), usage_method(盖章形式:纸质章/电子章/外带印章,默认纸质章), "
     "reason(文件用途/用印事由,从文件内容识别), seal_type(印章类型,从文件内容识别:公章/合同章/法人章/财务章), "
     "lawyer_reviewed(律师是否已审核:是/否,用户必须明确提供), "
     "document_name(文件名称,从上传文档识别), document_count(文件数量,默认1), "
@@ -28,7 +28,7 @@ IMAGE_FIELDS = ["document_name", "document_type", "document_count", "company", "
 
 FIELD_LABELS = {
     "company":         "用印公司",
-    "usage_method":    "盖章或外带",
+    "usage_method":    "盖章形式",
     "reason":          "文件用途/用印事由",
     "seal_type":       "印章类型",
     "document_name":   "文件名称",
