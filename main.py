@@ -626,6 +626,17 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             PENDING_CONFIRM.pop(confirm_id, None)
 
 
+def _do_create_seal_async(open_id, user_id, all_fields, file_codes=None):
+    """在后台线程执行 _do_create_seal，避免卡片回调 3 秒超时"""
+    def _run():
+        try:
+            _do_create_seal(open_id, user_id, all_fields, file_codes)
+        except Exception as e:
+            logger.exception("异步创建用印工单失败: %s", e)
+            send_message(open_id, f"工单创建失败：{str(e)[:100]}，请重新发起。")
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def on_card_action_confirm(data):
     """处理用户点击确认按钮的回调，创建工单；也处理用印选项卡片的点击"""
     from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
@@ -683,7 +694,7 @@ def on_card_action_confirm(data):
                 with _state_lock:
                     if open_id in PENDING_SEAL:
                         del PENDING_SEAL[open_id]
-                _do_create_seal(open_id, user_id, agg, file_codes)
+                _do_create_seal_async(open_id, user_id, agg, file_codes)
             else:
                 # 单文件：空值视为默认（律师审核=是，盖章/外带=盖章）
                 with _state_lock:
@@ -692,9 +703,8 @@ def on_card_action_confirm(data):
                 fields = dict(doc_fields)
                 fields.setdefault("lawyer_reviewed", "是")
                 fields.setdefault("usage_method", "盖章")
-                _do_create_seal(open_id, user_id, fields, file_codes)
-            send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
-            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已提交，请确认工单信息"}})
+                _do_create_seal_async(open_id, user_id, fields, file_codes)
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已提交，请查收确认消息"}})
         # 用印文件收集：点击「完成」开始批量处理
         if value.get("action") == "seal_files_complete":
             _process_seal_files_batch(open_id, user_id)
@@ -825,14 +835,13 @@ def on_card_action_confirm(data):
                         with _state_lock:
                             if open_id in PENDING_SEAL:
                                 del PENDING_SEAL[open_id]
-                        _do_create_seal(open_id, user_id, agg, file_codes)
+                        _do_create_seal_async(open_id, user_id, agg, file_codes)
                     else:
                         with _state_lock:
                             if open_id in PENDING_SEAL:
                                 del PENDING_SEAL[open_id]
-                        _do_create_seal(open_id, user_id, doc_fields, file_codes)
-                    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
-                    return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
+                        _do_create_seal_async(open_id, user_id, doc_fields, file_codes)
+                    return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择，请查收确认消息"}})
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
             except Exception as e:
                 logger.exception("seal_option 处理异常: %s", e)
@@ -1524,11 +1533,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核、盖章还是外带时，发送选项（纯文本+确认，避免卡片回调 200340）
+    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡片（单/多文件均用卡片，回调内异步处理避免 200340）
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
         doc_fields.setdefault("lawyer_reviewed", "是")
         doc_fields.setdefault("usage_method", "盖章")
-        _send_seal_options_text(open_id, user_id, doc_fields, file_codes, file_name, file_items=file_items)
+        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=file_items)
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
