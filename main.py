@@ -56,6 +56,9 @@ PENDING_TTL = 60 * 60  # 60 分钟（用印选项卡片填写时间可能较长�
 SEAL_INITIAL_TTL = 30 * 60  # 30 分钟
 # 用户先上传附件但未说明意图时暂存，等用户说明用印/开票后再处理。支持多文件，结构 {open_id: {"files": [{...}], "created_at", "timer"}}
 PENDING_FILE_UNCLEAR = {}
+# 用印等待上传时收集多文件（防抖）：{open_id: {"files": [{...}], "user_id", "created_at", "timer"}}
+PENDING_SEAL_UPLOAD = {}
+SEAL_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新文件后批量处理
 # 多文件用印排队：{open_id: {"items": [{file_name, file_code, doc_fields}, ...], "current_index": 0, "selections": [{lawyer, usage, count}, ...], "user_id", "created_at"}}
 PENDING_SEAL_QUEUE = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
@@ -140,6 +143,14 @@ def _clean_expired_pending(open_id=None):
             created = data.get("created_at", 0) if isinstance(data, dict) else 0
             if created and now - created > SEAL_INITIAL_TTL:
                 del SEAL_INITIAL_FIELDS[oid]
+        for oid in list(PENDING_SEAL_UPLOAD.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL_UPLOAD else []):
+            if oid in PENDING_SEAL_UPLOAD and now - PENDING_SEAL_UPLOAD[oid].get("created_at", 0) > SEAL_INITIAL_TTL:
+                entry = PENDING_SEAL_UPLOAD.pop(oid, None)
+                if entry and entry.get("timer"):
+                    try:
+                        entry["timer"].cancel()
+                    except Exception:
+                        pass
         for oid in list(PENDING_FILE_UNCLEAR.keys()) if open_id is None else ([open_id] if open_id in PENDING_FILE_UNCLEAR else []):
             if oid in PENDING_FILE_UNCLEAR and now - PENDING_FILE_UNCLEAR[oid].get("created_at", 0) > PENDING_TTL:
                 entry = PENDING_FILE_UNCLEAR.pop(oid, None)
@@ -398,6 +409,42 @@ def _schedule_file_intent_card(open_id):
             PENDING_FILE_UNCLEAR[open_id]["timer"] = timer
 
 
+def _schedule_seal_upload_process(open_id, user_id):
+    """用印等待上传时，防抖后批量处理已收集的文件。多文件走排队模式，单文件走单卡模式。"""
+
+    def _process():
+        with _state_lock:
+            entry = PENDING_SEAL_UPLOAD.pop(open_id, None)
+        if not entry:
+            return
+        files = entry.get("files", [])
+        uid = entry.get("user_id", "")
+        if not files:
+            return
+        # 构建 files_list 格式
+        files_list = [
+            {"message_id": f.get("message_id"), "content_json": f.get("content_json", {}), "file_name": f.get("file_name", "未知文件")}
+            for f in files
+        ]
+        threading.Thread(target=lambda: _handle_file_message(open_id, uid, None, None, files_list=files_list), daemon=True).start()
+
+    with _state_lock:
+        if open_id not in PENDING_SEAL_UPLOAD:
+            return
+        old = PENDING_SEAL_UPLOAD[open_id]
+        if old and old.get("timer"):
+            try:
+                old["timer"].cancel()
+            except Exception:
+                pass
+    timer = threading.Timer(SEAL_UPLOAD_DEBOUNCE_SEC, _process)
+    timer.daemon = True
+    timer.start()
+    with _state_lock:
+        if open_id in PENDING_SEAL_UPLOAD:
+            PENDING_SEAL_UPLOAD[open_id]["timer"] = timer
+
+
 def _escape_lark_md(s):
     """转义 lark_md 中的特殊字符，避免被解析为链接等语法导致卡片报错"""
     if not s:
@@ -406,9 +453,9 @@ def _escape_lark_md(s):
 
 
 def _build_seal_queue_card(doc_fields, file_name, index, total, is_last):
-    """多文件排队模式：单份文件的选项卡片，底部为「下一份」或「完成」"""
+    """多文件排队模式：单份文件的选项卡片，前几张为「确认」，最后一张为「完成」；全部选完后出「提交工单」"""
     card = _build_seal_options_card(doc_fields, file_name)
-    btn_label = "完成" if is_last else f"下一份（{index + 1}/{total}）"
+    btn_label = "完成" if is_last else f"确认（{index + 1}/{total}）"
     btn_action = "seal_finish" if is_last else "seal_next"
     for elem in card.get("elements", []):
         if elem.get("tag") == "action" and elem.get("actions"):
@@ -424,6 +471,8 @@ def _build_seal_queue_card(doc_fields, file_name, index, total, is_last):
         if elem.get("tag") == "div" and elem.get("text", {}).get("tag") == "lark_md":
             c = elem["text"].get("content", "")
             if "已接收文件" in c:
+                hint = "选完后点击「完成」" if is_last else "选完后点击「确认」"
+                c = c.replace("选完后点击「提交」", hint)
                 elem["text"]["content"] = f"**第 {index + 1}/{total} 份文件**\n\n" + c
                 break
     return card
@@ -1461,6 +1510,8 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
                 "user_id": user_id,
                 "created_at": time.time(),
             }
+            if open_id in SEAL_INITIAL_FIELDS:
+                del SEAL_INITIAL_FIELDS[open_id]
         send_message(open_id, f"已接收 {len(items)} 个文件，请依次为每份文件选择选项。")
         _send_seal_queue_card(open_id, user_id, PENDING_SEAL_QUEUE[open_id])
         return
@@ -2055,11 +2106,27 @@ def on_message(data):
             with _state_lock:
                 is_invoice = open_id in PENDING_INVOICE
                 is_seal = open_id in PENDING_SEAL
+                in_seal_queue = open_id in PENDING_SEAL_QUEUE
                 expects_seal = open_id in SEAL_INITIAL_FIELDS  # 用户已说用印，在等上传
             if is_invoice:
                 _handle_invoice_file(open_id, user_id, message_id, content_json)
-            elif is_seal or expects_seal:
-                _handle_file_message(open_id, user_id, message_id, content_json)
+            elif is_seal or in_seal_queue:
+                send_message(open_id, "您当前有用印申请待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。")
+            elif expects_seal:
+                # 收集文件并防抖，多文件时批量进入排队模式（先出第1张卡，点「下一份」出第2张，最后「提交工单」）
+                file_name = content_json.get("file_name", "未知文件")
+                with _state_lock:
+                    if open_id not in PENDING_SEAL_UPLOAD:
+                        PENDING_SEAL_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                    PENDING_SEAL_UPLOAD[open_id]["files"].append({
+                        "message_id": message_id,
+                        "content_json": content_json,
+                        "file_name": file_name,
+                    })
+                    PENDING_SEAL_UPLOAD[open_id]["created_at"] = time.time()
+                count = len(PENDING_SEAL_UPLOAD[open_id]["files"])
+                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个）。正在处理，请稍候...")
+                _schedule_seal_upload_process(open_id, user_id)
             else:
                 # 用户先上传附件但未说明意图，先询问再处理。支持多文件，追加到列表
                 file_name = content_json.get("file_name", "未知文件")
