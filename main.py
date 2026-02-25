@@ -1287,27 +1287,33 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核、盖章形式时，发送选项卡片（需在事件订阅中勾选「接收消息卡片回调」）
-    if set(missing) <= {"lawyer_reviewed", "usage_method"}:
+    # 缺律师是否已审核或盖章形式时，发送选项卡片（点击选择，非文字回复）。需在事件订阅中勾选「接收消息卡片回调」
+    if "lawyer_reviewed" in missing or "usage_method" in missing:
         doc_fields.pop("usage_method", None)  # 强制用户通过卡片点击选择
         send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name)
+        other_missing = [m for m in missing if m not in ("lawyer_reviewed", "usage_method")]
+        if other_missing:
+            labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
+            hint_map = {
+                "company": f"{'、'.join(company_opts) if company_opts else '请输入'}",
+                "seal_type": "、".join(seal_opts),
+                "reason": "（请描述）",
+            }
+            lines = [f"此外还缺少：{'、'.join(labels.get(m, m) for m in other_missing)}，请补充说明。"]
+            for m in other_missing:
+                lines.append(f"· {labels.get(m, m)}：{hint_map.get(m, '')}")
+            send_message(open_id, "\n".join(lines))
     else:
-        labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章形式"}
+        # 仅缺 company/seal_type/reason，无律师/盖章
+        labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
         hint_map = {
             "company": f"{'、'.join(company_opts) if company_opts else '请输入'}",
             "seal_type": "、".join(seal_opts),
             "reason": "（请描述）",
-            "lawyer_reviewed": f"{'、'.join(lawyer_opts)}（必填，请明确选择）",
-            "usage_method": f"{'、'.join(usage_opts)}（默认纸质章）",
         }
-        lines = [
-            f"已接收文件：{file_name}",
-            f"· 文件名称: {doc_name}",
-            "",
-            "请补充以下信息（一条消息说完即可）：",
-        ]
-        for i, k in enumerate(missing, 1):
-            lines.append(f"{i}. {labels[k]}：{hint_map.get(k, '')}")
+        lines = [f"已接收文件：{file_name}", f"· 文件名称: {doc_name}", "", "请补充以下信息（一条消息说完即可）："]
+        for k in missing:
+            lines.append(f"· {labels.get(k, k)}：{hint_map.get(k, '')}")
         send_message(open_id, "\n".join(lines))
 
 
@@ -1386,8 +1392,8 @@ def _try_complete_seal(open_id, user_id, text):
         return bool(v)
 
     missing_before = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
-    # 仅缺律师/盖章形式时，直接发送选项卡片，请用户点击选择
-    if set(missing_before) <= {"lawyer_reviewed", "usage_method"}:
+    # 缺律师或盖章形式时，直接发送选项卡片，请用户点击选择（非文字回复）
+    if "lawyer_reviewed" in missing_before or "usage_method" in missing_before:
         file_name = pending.get("file_name") or doc_fields.get("document_name", "文件")
         send_seal_options_card(open_id, user_id, doc_fields, pending.get("file_codes") or [], file_name)
         return True
@@ -1464,7 +1470,7 @@ def _try_complete_seal(open_id, user_id, text):
             retry_count = entry.get("retry_count", 0) + 1
             entry["retry_count"] = retry_count
             entry["doc_fields"] = all_fields
-        if set(missing) <= {"lawyer_reviewed", "usage_method"}:
+        if "lawyer_reviewed" in missing or "usage_method" in missing:
             all_fields.pop("usage_method", None)  # 强制用户通过卡片点击选择
             file_name = pending.get("file_name") or all_fields.get("document_name", "文件")
             send_seal_options_card(open_id, user_id, all_fields, pending.get("file_codes") or [], file_name)
