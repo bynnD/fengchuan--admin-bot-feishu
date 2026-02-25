@@ -567,7 +567,9 @@ def on_card_action_confirm(data):
                     threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-        # 用印选项卡片：律师是否已审核、盖章形式、文件数量。回调内更新内存并返回更新后的卡片以显示选中状态
+        # 用印选项卡片：律师是否已审核、盖章形式、文件数量。回调内仅更新内存并返回 toast
+        # 注：曾尝试在回调中返回更新后的卡片以显示选中状态，但飞书对 card 格式要求严格，易触发 200672，
+        # 故暂不返回 card，仅 toast。选项已正确记录，提交时会校验。
         if value.get("action") == "seal_option":
             field = value.get("field")
             val = value.get("value")
@@ -582,12 +584,7 @@ def on_card_action_confirm(data):
                 doc_fields[field] = val
             elif field in ("lawyer_reviewed", "usage_method"):
                 doc_fields[field] = val
-            file_name = pending.get("file_name", "")
-            updated_card = _build_seal_options_card(doc_fields, file_name)
-            return P2CardActionTriggerResponse(d={
-                "toast": {"type": "success", "content": f"已选择：{val}"},
-                "card": {"type": "card", "data": updated_card},
-            })
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
         # 用印提交：选完后点击提交，创建工单
         if value.get("action") == "seal_submit":
