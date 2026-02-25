@@ -154,6 +154,9 @@ def _clean_expired_pending(open_id=None):
         for cid in list(PENDING_CONFIRM.keys()):
             if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
                 del PENDING_CONFIRM[cid]
+        for oid in list(PENDING_CONFIRM_TEXT.keys()):
+            if now - PENDING_CONFIRM_TEXT[oid].get("created_at", 0) > CONFIRM_TTL:
+                del PENDING_CONFIRM_TEXT[oid]
         USER_STALE_TTL = 86400
         stale_users = [uid for uid, ts in _user_last_msg.items() if now - ts > USER_STALE_TTL]
         for uid in stale_users:
@@ -432,6 +435,32 @@ def send_seal_files_confirm_card(open_id, file_names):
         logger.error("发送用印文件确认卡片失败: %s", resp.msg)
 
 
+def _send_seal_options_text(open_id, user_id, doc_fields, file_codes, file_name, file_items=None):
+    """发送用印选项提示（纯文本），用户回复「确认提交」触发，避免卡片回调 200340"""
+    if file_items and len(file_items) > 1:
+        lines = [f"**已接收文件（共 {len(file_items)} 个）**"]
+        for i, fi in enumerate(file_items[:15], 1):
+            fn = fi.get("file_name", f"文件{i}")
+            lr = fi.get("lawyer_reviewed") or "是"
+            dc = fi.get("document_count") or "1"
+            um = fi.get("usage_method") or "盖章"
+            lines.append(f"{i}. {fn}：律师{'已' if lr == '是' else '未'}审核，{dc}份，{um}")
+        if len(file_items) > 15:
+            lines.append(f"... 等共 {len(file_items)} 个")
+        lines.append("")
+        lines.append("以上为默认选项。回复「**确认提交**」创建工单；或回复修改说明，如「第2个要2份」「第3个律师未审核」")
+    else:
+        lr = doc_fields.get("lawyer_reviewed") or "是"
+        um = doc_fields.get("usage_method") or "盖章"
+        dc = doc_fields.get("document_count") or "1"
+        lines = [
+            f"已接收文件：{file_name}",
+            f"默认：律师{'已' if lr == '是' else '未'}审核，{dc}份，{um}",
+            "回复「**确认提交**」创建工单；或说明修改项",
+        ]
+    send_message(open_id, "\n".join(lines))
+
+
 def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=None):
     """发送用印补充选项卡片：律师审核、数量、盖章还是外带。file_items 非空时为矩阵式，每文件一行独立选项"""
     opts = _get_seal_form_options()
@@ -538,6 +567,20 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, 
     resp = client.im.v1.message.create(request)
     if not resp.success():
         logger.error("发送用印选项卡片失败: %s", resp.msg)
+
+
+def send_confirm_text(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
+    """发送工单确认文本，用户回复「确认」后创建工单（多文件用印避免回调超时 200340）"""
+    with _state_lock:
+        PENDING_CONFIRM_TEXT[open_id] = {
+            "user_id": user_id,
+            "approval_type": approval_type,
+            "fields": dict(fields),
+            "file_codes": dict(file_codes) if file_codes else None,
+            "admin_comment": admin_comment,
+            "created_at": time.time(),
+        }
+    send_message(open_id, f"【{approval_type}】\n\n{summary}\n\n请确认以上信息无误后，回复「**确认**」提交工单。")
 
 
 def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
@@ -1244,6 +1287,8 @@ PENDING_INVOICE = {}
 
 # 工单确认：用户点击确认按钮后创建。confirm_id -> {open_id, user_id, approval_type, fields, file_codes, admin_comment, created_at}
 PENDING_CONFIRM = {}
+# 文本确认：多文件用印为避免回调超时 200340，改为回复「确认」触发。open_id -> {user_id, approval_type, fields, file_codes, admin_comment, created_at}
+PENDING_CONFIRM_TEXT = {}
 CONFIRM_TTL = 15 * 60  # 15 分钟
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
@@ -1479,10 +1524,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
+    # 仅缺律师是否已审核、盖章还是外带时，发送选项（纯文本+确认，避免卡片回调 200340）
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
-        doc_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择，避免从文本推断后直接进入确认
-        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name, file_items=file_items)
+        doc_fields.setdefault("lawyer_reviewed", "是")
+        doc_fields.setdefault("usage_method", "盖章")
+        _send_seal_options_text(open_id, user_id, doc_fields, file_codes, file_name, file_items=file_items)
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
@@ -1504,7 +1550,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None):
-    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单。file_codes 为 list，支持多文件"""
+    """用印申请字段齐全时发送确认。单文件用卡片，多文件用文本（避免回调超时 200340）"""
     all_fields = dict(all_fields)
     all_fields.setdefault("lawyer_reviewed", "是")
     all_fields.setdefault("usage_method", "盖章")
@@ -1514,14 +1560,20 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None):
     fc = {ATTACHMENT_FIELD_ID: codes} if codes else {}
     admin_comment = get_admin_comment("用印申请", all_fields)
     summary = format_fields_summary(all_fields, "用印申请")
-    send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
+    is_multi = len(codes) > 1 or "file_details" in all_fields
+
+    if is_multi:
+        send_confirm_text(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
+    else:
+        send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
 
     with _state_lock:
         if open_id in PENDING_SEAL:
             del PENDING_SEAL[open_id]
-        # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
+        # 单文件：等用户点击卡片确认后再清空 CONVERSATIONS（见 on_card_action_confirm）
 
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+    if not is_multi:
+        send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -1543,18 +1595,50 @@ def _try_complete_seal(open_id, user_id, text):
             return v and str(v).strip() in usage_opts
         return bool(v)
 
-    # 兜底：用户发「确认」「提交」且律师审核、盖章方式已选，直接进入确认
-    if text.strip() in ("确认", "提交", "完成"):
-        if _valid("lawyer_reviewed", doc_fields.get("lawyer_reviewed")) and _valid("usage_method", doc_fields.get("usage_method")):
-            missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
-            if not missing:
-                file_codes = pending.get("file_codes") or []
-                with _state_lock:
-                    if open_id in PENDING_SEAL:
-                        del PENDING_SEAL[open_id]
-                _do_create_seal(open_id, user_id, doc_fields, file_codes)
-                send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
-                return True
+    # 兜底：用户发「确认」「确认提交」「提交」「完成」且律师审核、盖章方式已选，直接进入确认
+    t = text.strip()
+    if t in ("确认", "确认提交", "提交", "完成"):
+        file_items = pending.get("file_items")
+        if file_items:
+            # 多文件：每文件需有律师审核、盖章方式
+            lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+            usage_opts = opts.get("usage_method", ["盖章", "外带"])
+            all_ok = all(
+                (fi.get("lawyer_reviewed") or "是") in lawyer_opts and (fi.get("usage_method") or "盖章") in usage_opts
+                for fi in file_items
+            )
+            if not all_ok:
+                pass  # 继续走下方解析
+            else:
+                missing = [k for k in ["company", "seal_type", "reason"] if not _valid(k, doc_fields.get(k))]
+                if not missing:
+                    agg = dict(doc_fields)
+                    lawyer_vals = [fi.get("lawyer_reviewed") or "是" for fi in file_items]
+                    usage_vals = [fi.get("usage_method") or "盖章" for fi in file_items]
+                    agg["lawyer_reviewed"] = "已审核" if any(v in ("是", "已审核") for v in lawyer_vals) else "未审核"
+                    agg["usage_method"] = "外带" if any(v == "外带" for v in usage_vals) else "盖章"
+                    agg["document_count"] = str(sum(int(fi.get("document_count") or "1") for fi in file_items))
+                    agg["file_details"] = [
+                        {"文件名": fi.get("file_name", f"文件{i+1}"), "律师审核": fi.get("lawyer_reviewed") or "是", "数量": fi.get("document_count") or "1", "盖章/外带": fi.get("usage_method") or "盖章"}
+                        for i, fi in enumerate(file_items)
+                    ]
+                    file_codes = pending.get("file_codes") or []
+                    with _state_lock:
+                        if open_id in PENDING_SEAL:
+                            del PENDING_SEAL[open_id]
+                    _do_create_seal(open_id, user_id, agg, file_codes)
+                    return True
+        else:
+            # 单文件
+            if _valid("lawyer_reviewed", doc_fields.get("lawyer_reviewed")) and _valid("usage_method", doc_fields.get("usage_method")):
+                missing = [k for k in ["company", "seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
+                if not missing:
+                    file_codes = pending.get("file_codes") or []
+                    with _state_lock:
+                        if open_id in PENDING_SEAL:
+                            del PENDING_SEAL[open_id]
+                    _do_create_seal(open_id, user_id, doc_fields, file_codes)
+                    return True
 
     if _is_cancel_intent(text):
         with _state_lock:
@@ -1968,6 +2052,39 @@ def on_message(data):
             in_invoice = open_id in PENDING_INVOICE
             pf = PENDING_FILE_UNCLEAR.get(open_id)
             pending_file = pf if (pf and pf.get("files")) else None
+            pending_confirm = PENDING_CONFIRM_TEXT.get(open_id)
+        # 文本确认：多文件用印，用户回复「确认」创建工单
+        if pending_confirm:
+            if _is_cancel_intent(text):
+                with _state_lock:
+                    PENDING_CONFIRM_TEXT.pop(open_id, None)
+                send_message(open_id, "已取消，如需办理请重新发起。")
+                return
+            if text.strip() in ("确认", "确认提交"):
+                with _state_lock:
+                    p = PENDING_CONFIRM_TEXT.pop(open_id, None)
+                if p and (time.time() - p.get("created_at", 0)) <= CONFIRM_TTL:
+                    approval_type = p["approval_type"]
+                    fields = p["fields"]
+                    file_codes = p.get("file_codes")
+                    success, msg, resp_data, summary = create_approval(p["user_id"], approval_type, fields, file_codes=file_codes)
+                    if success:
+                        with _state_lock:
+                            if open_id in CONVERSATIONS:
+                                CONVERSATIONS[open_id] = []
+                        instance_code = resp_data.get("instance_code", "")
+                        if instance_code:
+                            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                            send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                        else:
+                            send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
+                    else:
+                        send_message(open_id, f"提交失败：{msg}")
+                else:
+                    send_message(open_id, "确认已超时，请重新发起。")
+                return
+            send_message(open_id, "请回复「确认」提交工单，或回复「取消」放弃。")
+            return
         if in_seal:
             if _try_complete_seal(open_id, user_id, text):
                 return
