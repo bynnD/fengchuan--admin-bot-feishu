@@ -9,7 +9,7 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "用印申请"
-APPROVAL_CODE = "58F1B962-73D4-408F-8B1B-3FB1776CF2B8"
+APPROVAL_CODE = "FB855CD4-CA15-4A1B-8B7A-51A56171CE60"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 有附件识别读取需求，使用通用文件内容提取（含 OCR）
 
@@ -36,41 +36,22 @@ FIELD_LABELS = {
     "document_type":   "文件类型",
     "lawyer_reviewed": "律师是否已审核",
     "remarks":         "备注",
-    "file_details":    "文件明细",  # 表格控件：每文件一行，列：文件名、律师审核、数量、盖章/外带
 }
 
-# 与飞书表单实际控件 ID 一致（从审批实例 form 获取）
 FIELD_ID_FALLBACK = {
-    "usage_method":    "widget17334699216260001",   # 盖章或外带印章
-    "seal_type":       "widget15754438920110001",   # 印章类型
-    "document_name":   "widget3",                    # 文件名称
-    "document_count":  "widget4",                    # 文件数量
-    "document_type":   "widget17334700336550001",   # 文件类型
-    "lawyer_reviewed": "widget17334701422160001",   # 律师是否已审核
-    "company":         "widget17375357884790001",    # 用印公司（若表单有）
-    "reason":          "widget0",                     # 文件用途（若表单有）
-    "remarks":         "widget17375349954340001",    # 备注（若表单有）
+    "company":         "widget17375357884790001",
+    "usage_method":    "widget17375347703620001",
+    "reason":          "widget0",
+    "seal_type":       "widget15754438920110001",
+    "document_name":   "widget3",
+    "document_count":  "widget4",
+    "document_type":   "widget17375354078970001",
+    "lawyer_reviewed": "widget17375349618880001",
+    "remarks":         "widget17375349954340001",
 }
 
-# 表单字段名与逻辑键映射（表单名「盖章或外带印章」对应 usage_method）
-FIELD_NAME_ALIASES = {"盖章或外带印章": "usage_method"}
-
-# 律师审核：对话中用「是」/「否」，表单可能用「已审核」/「未审核」，提交时映射
-LAWYER_REVIEWED_VALUE_MAP = {"是": "已审核", "否": "未审核"}
-
-FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "file_details", "remarks"]
+FIELD_ORDER = ["company", "usage_method", "reason", "seal_type", "document_name", "document_count", "document_type", "lawyer_reviewed", "remarks"]
 DATE_FIELDS = set()
-
-# 文件明细表格：在用印表单中新增「表格」控件，命名为「文件明细」，列依次为：文件名、律师审核、数量、盖章/外带
-# 添加后删除 field_cache.json 或调用 invalidate_cache 以重新获取结构；若 API 未返回子字段，在此填写实际子字段 id
-FIELDLIST_SUBFIELDS_FALLBACK = {
-    "file_details": [
-        {"id": "widget_file_name", "type": "input", "name": "文件名"},
-        {"id": "widget_lawyer", "type": "input", "name": "律师审核"},
-        {"id": "widget_count", "type": "number", "name": "数量"},
-        {"id": "widget_usage", "type": "input", "name": "盖章/外带"},
-    ]
-}
 
 SUPPORTS_IMAGE = True
 

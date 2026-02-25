@@ -99,8 +99,7 @@ feishu--admin-bot-main/
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `FEISHU_APPROVAL_APP_ID` | 飞书审批应用 ID，用于打开审批详情页 | cli_9cb844403dbb9108 |
-| `SECRET_TOKEN` | 调试接口认证 token，**生产环境必须配置** | - |
-| `DEBUG_DISABLED` | 设为 `1`/`true`/`yes` 时禁用调试接口，**生产环境建议启用** | - |
+| `SECRET_TOKEN` | 访问 `/debug-form` 的校验 token | - |
 | `MAX_FILE_SIZE` | 文件大小限制（字节） | 52428800（50MB） |
 | `PORT` | 健康检查服务端口 | 8080 |
 | `APPROVAL_RULES_FILE` | 自动审批规则文件路径 | approval_rules.yaml |
@@ -113,20 +112,6 @@ feishu--admin-bot-main/
 - 审批：查看、创建、更新、删除审批应用信息
 - 审批：审批任务操作、审批实例评论
 - 云文档：查看、编辑、下载云空间文件（用于用印附件下载）
-
----
-
-## 生产环境安全建议
-
-部署到服务器时，建议采取以下措施保护敏感配置：
-
-| 措施 | 说明 |
-|------|------|
-| **环境变量** | `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`DEEPSEEK_API_KEY` 仅通过环境变量注入，勿写入代码或提交到仓库 |
-| **SECRET_TOKEN** | 必须配置，用于访问 `/debug-form`、`/debug-extract`，建议使用 32 位以上随机字符串 |
-| **DEBUG_DISABLED** | 生产环境设为 `1`，彻底禁用调试接口，避免信息泄露 |
-| **.env 文件** | 若使用 `.env`，已加入 `.gitignore`，确保不提交到版本库 |
-| **日志级别** | 表单数据、API 响应已改为 `debug` 级别，生产环境可设 `LOG_LEVEL=INFO` 避免敏感信息落盘 |
 
 ---
 
@@ -178,7 +163,4 @@ docker run -e FEISHU_APP_ID=xxx -e FEISHU_APP_SECRET=xxx -e DEEPSEEK_API_KEY=xxx
 ## 调试接口
 
 - `GET /`：健康检查，返回 `ok`
-- `GET /debug-form?type=采购申请&token=xxx`：查看指定审批类型的表单字段结构（需配置 `SECRET_TOKEN` 并带 `token` 参数）
-- `GET /debug-extract?token=xxx`：查看附件识别器状态（需配置 `SECRET_TOKEN`）
-
-**安全说明**：调试接口需配置 `SECRET_TOKEN` 才能访问；生产环境建议设置 `DEBUG_DISABLED=1` 完全禁用。
+- `GET /debug-form?type=采购申请`：查看指定审批类型的表单字段结构（若配置 `SECRET_TOKEN`，需带 `?token=xxx`）

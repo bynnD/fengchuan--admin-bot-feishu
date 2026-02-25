@@ -9,7 +9,7 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "开票申请"
-APPROVAL_CODE = "6692F47D-F6CF-4342-8DAC-32CE84F39E6F"
+APPROVAL_CODE = "624B0174-A255-4EA0-A790-0DE8F2B1F46B"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 从结算单和合同自动提取字段
 
