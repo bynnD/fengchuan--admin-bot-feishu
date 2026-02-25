@@ -523,7 +523,7 @@ def on_card_action_confirm(data):
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
                 if files_list:
-                    _handle_file_message(open_id, user_id, None, None, files_list=files_list)
+                    threading.Thread(target=lambda: _handle_file_message(open_id, user_id, None, None, files_list=files_list), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请，正在处理"}})
             if intent == "开票申请":
                 files_list = pending_file.get("files", [])
@@ -538,10 +538,12 @@ def on_card_action_confirm(data):
                     }
                 if files_list:
                     f0 = files_list[0]
-                    _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
+                    msg_id, cj = f0["message_id"], f0["content_json"]
+                    threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         # 用印选项卡片：律师是否已审核、盖章还是外带
+        # 飞书卡片回调需 3 秒内返回，耗时操作（API 调用、发消息）必须异步执行，否则触发 200340
         if value.get("action") == "seal_option":
             field = value.get("field")
             val = value.get("value")
@@ -553,9 +555,8 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
             doc_fields = pending["doc_fields"]
             doc_fields[field] = val
-            opts = _get_seal_form_options()
-            lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-            usage_opts = opts.get("usage_method", ["盖章", "外带"])
+            lawyer_opts = ["是", "否"]
+            usage_opts = ["盖章", "外带"]
 
             def _valid(k, v):
                 if k == "lawyer_reviewed":
@@ -570,8 +571,12 @@ def on_card_action_confirm(data):
                 with _state_lock:
                     if open_id in PENDING_SEAL:
                         del PENDING_SEAL[open_id]
-                _do_create_seal(open_id, user_id, doc_fields, file_codes)
-                send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+
+                def _do_seal_async():
+                    _do_create_seal(open_id, user_id, doc_fields, file_codes)
+                    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+
+                threading.Thread(target=_do_seal_async, daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
@@ -588,19 +593,25 @@ def on_card_action_confirm(data):
         fields = pending["fields"]
         file_codes = pending.get("file_codes")
         admin_comment = pending.get("admin_comment", "")
-        success, msg, resp_data, summary = create_approval(user_id, approval_type, fields, file_codes=file_codes)
-        if success:
-            with _state_lock:
-                if open_id in CONVERSATIONS:
-                    CONVERSATIONS[open_id] = []
-            instance_code = resp_data.get("instance_code", "")
-            if instance_code:
-                link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+
+        def _create_and_notify():
+            nonlocal open_id
+            success, msg, resp_data, summary = create_approval(user_id, approval_type, fields, file_codes=file_codes)
+            if success:
+                with _state_lock:
+                    if open_id in CONVERSATIONS:
+                        CONVERSATIONS[open_id] = []
+                instance_code = resp_data.get("instance_code", "")
+                if instance_code:
+                    link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                    send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                else:
+                    send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
             else:
-                send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
-            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "工单已创建"}})
-        return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": f"提交失败：{msg}"}})
+                send_message(open_id, f"提交失败：{msg}")
+
+        threading.Thread(target=_create_and_notify, daemon=True).start()
+        return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在提交，请稍候"}})
     except Exception as e:
         logger.exception("卡片确认回调处理失败: %s", e)
         return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "系统异常，请稍后重试"}})
