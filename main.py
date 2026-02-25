@@ -399,51 +399,22 @@ def _escape_lark_md(s):
     return str(s).replace("[", "\\[").replace("]", "\\]")
 
 
-def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
-    """发送用印补充选项卡片：律师是否已审核、盖章还是外带，用户点击选择。file_codes 为 list"""
-    opts = _get_seal_form_options()
-    # 不同租户的审批表单字段 ID 可能不同，若 API 未返回选项则用默认值，避免空 actions 导致卡片报错
-    lawyer_opts = opts.get("lawyer_reviewed") or ["是", "否"]
-    usage_opts = opts.get("usage_method") or ["盖章", "外带"]
-    doc_name = doc_fields.get("document_name", file_name.rsplit(".", 1)[0] if file_name else "")
-    text = (
-        f"已接收文件：{_escape_lark_md(file_name)}\n"
-        f"· 文件名称：{_escape_lark_md(doc_name)}\n\n"
-        f"请点击下方选项完成补充："
-    )
-    lawyer_btns = [
-        {"tag": "button", "text": {"tag": "plain_text", "content": v}, "type": "primary" if v == "是" else "default",
-         "behaviors": [{"type": "callback", "value": {"action": "seal_option", "field": "lawyer_reviewed", "value": v}}]}
-        for v in lawyer_opts
-    ]
-    usage_btns = [
-        {"tag": "button", "text": {"tag": "plain_text", "content": v}, "type": "default",
-         "behaviors": [{"type": "callback", "value": {"action": "seal_option", "field": "usage_method", "value": v}}]}
-        for v in usage_opts
-    ]
-    card = {
-        "config": {"wide_screen_mode": True},
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-            {"tag": "hr"},
-            {"tag": "div", "text": {"tag": "plain_text", "content": "律师是否已审核（必填，请明确选择）", "lines": 1}},
-            {"tag": "action", "actions": lawyer_btns},
-            {"tag": "div", "text": {"tag": "plain_text", "content": "盖章还是外带（默认盖章）", "lines": 1}},
-            {"tag": "action", "actions": usage_btns},
-        ],
-    }
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(open_id) \
-        .msg_type("interactive") \
-        .content(json.dumps(card, ensure_ascii=False)) \
-        .build()
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("open_id") \
-        .request_body(body) \
-        .build()
-    resp = client.im.v1.message.create(request)
-    if not resp.success():
-        logger.error("发送用印选项卡片失败: %s", resp.msg)
+def _parse_seal_shortcuts(text):
+    """解析数字/符号快捷回复：1/2（律师是否已审核）、A/B（盖章/外带）。返回 (lawyer_reviewed, usage_method)，缺失为 None。"""
+    text = (text or "").strip()
+    if not text:
+        return None, None
+    tokens = re.split(r"[\s,，、]+", text)
+    lawyer, usage = None, None
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if t in ("1", "2"):
+            lawyer = "是" if t == "1" else "否"
+        elif t.upper() in ("A", "B"):
+            usage = "盖章" if t.upper() == "A" else "外带"
+    return lawyer, usage
 
 
 def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
@@ -542,44 +513,6 @@ def on_card_action_confirm(data):
                     threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-        # 用印选项卡片：律师是否已审核、盖章还是外带
-        # 飞书卡片回调需 3 秒内返回，耗时操作（API 调用、发消息）必须异步执行，否则触发 200340
-        if value.get("action") == "seal_option":
-            field = value.get("field")
-            val = value.get("value")
-            if not field or not val:
-                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
-            with _state_lock:
-                pending = PENDING_SEAL.get(open_id)
-            if not pending:
-                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
-            doc_fields = pending["doc_fields"]
-            doc_fields[field] = val
-            lawyer_opts = ["是", "否"]
-            usage_opts = ["盖章", "外带"]
-
-            def _valid(k, v):
-                if k == "lawyer_reviewed":
-                    return v and str(v).strip() in lawyer_opts
-                if k == "usage_method":
-                    return v and str(v).strip() in usage_opts
-                return bool(v)
-
-            missing = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
-            if not missing:
-                file_codes = pending.get("file_codes") or []
-                with _state_lock:
-                    if open_id in PENDING_SEAL:
-                        del PENDING_SEAL[open_id]
-
-                def _do_seal_async():
-                    _do_create_seal(open_id, user_id, doc_fields, file_codes)
-                    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
-
-                threading.Thread(target=_do_seal_async, daemon=True).start()
-                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{val}，请确认提交"}})
-            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
-
         confirm_id = value.get("confirm_id", "")
         if not confirm_id:
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
@@ -1229,10 +1162,10 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             if seal_opts and v in seal_opts:
                 doc_fields[k] = v
         elif k == "usage_method":
-            pass  # 不采纳 initial_fields 中的 usage_method，强制用户通过选项卡点击选择
+            pass  # 不采纳 initial_fields 中的 usage_method，需用户明确回复
         else:
             doc_fields[k] = v
-    # 不在此处默认 usage_method，选项卡需用户显式选择「盖章」或「外带」后再进入确认
+    # 不在此处默认 usage_method，需用户明确回复「盖章」或「外带」
 
     with _state_lock:
         CONVERSATIONS.setdefault(open_id, [])
@@ -1265,10 +1198,19 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             "created_at": time.time(),
         }
 
-    # 仅缺律师是否已审核、盖章还是外带时，发送选项卡；否则发送文本提示
+    # 仅缺律师是否已审核、盖章还是外带时，发送快捷回复提示（卡片回调在 WebSocket 下易触发 200340，改用文本）
     if set(missing) <= {"lawyer_reviewed", "usage_method"}:
-        doc_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择，避免从文本推断后直接进入确认
-        send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name)
+        lines = [
+            f"已接收文件：{file_name}",
+            f"· 文件名称: {doc_name}",
+            "",
+            "请回复数字/字母完成选择：",
+            "· 律师是否已审核：1（是）或 2（否）",
+            "· 盖章还是外带：A（盖章）或 B（外带）",
+            "",
+            "示例：回复「1 A」表示律师已审核、盖章",
+        ]
+        send_message(open_id, "\n".join(lines))
     else:
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由", "lawyer_reviewed": "律师是否已审核", "usage_method": "盖章还是外带"}
         hint_map = {
@@ -1337,8 +1279,47 @@ def _try_complete_seal(open_id, user_id, text):
         return True
 
     doc_fields = pending["doc_fields"]
-
     opts = _get_seal_form_options()
+    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
+    usage_opts = opts.get("usage_method", ["盖章", "外带"])
+
+    def _valid(k, v):
+        if k == "lawyer_reviewed":
+            return v and str(v).strip() in lawyer_opts
+        if k == "usage_method":
+            return v and str(v).strip() in usage_opts
+        return bool(v)
+
+    missing_before = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, doc_fields.get(k))]
+    # 仅缺律师/盖章时，优先尝试快捷解析（1/2、A/B），避免调用 AI
+    if set(missing_before) <= {"lawyer_reviewed", "usage_method"}:
+        lawyer_val, usage_val = _parse_seal_shortcuts(text)
+        merged = dict(doc_fields)
+        if lawyer_val:
+            merged["lawyer_reviewed"] = lawyer_val
+        if usage_val:
+            merged["usage_method"] = usage_val
+        missing_after = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, merged.get(k))]
+        if not missing_after:
+            file_codes = pending.get("file_codes") or []
+            _do_create_seal(open_id, user_id, merged, file_codes)
+            return True
+        if lawyer_val or usage_val:
+            # 部分解析成功，更新 doc_fields 并提示补全
+            with _state_lock:
+                entry = PENDING_SEAL.get(open_id)
+                if entry:
+                    entry["doc_fields"] = merged
+            lines = [
+                "请回复数字/字母完成选择：",
+                "· 律师是否已审核：1（是）或 2（否）",
+                "· 盖章还是外带：A（盖章）或 B（外带）",
+                "",
+                "示例：回复「1 A」表示律师已审核、盖章",
+            ]
+            send_message(open_id, "\n".join(lines))
+            return True
+
     company_hint = f"（选项：{'/'.join(opts.get('company', []))}）" if opts.get("company") else ""
     seal_hint = f"（选项：{'/'.join(opts.get('seal_type', ['公章','合同章','法人章','财务章']))}）"
     usage_hint = f"（选项：{'/'.join(opts.get('usage_method', ['盖章','外带']))}，默认盖章）"
@@ -1350,8 +1331,8 @@ def _try_complete_seal(open_id, user_id, text):
         f"- company: 用印公司{company_hint}（用户未提及则不返回，保留文件识别结果）\n"
         f"- seal_type: 印章类型{seal_hint}（用户未提及则不返回，保留文件识别结果）\n"
         f"- reason: 文件用途/用印事由（用户未提及则不返回）\n"
-        f"- usage_method: 盖章或外带{usage_hint}\n"
-        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，若用户未明确说「是」或「否」则不要返回此字段（切勿返回「缺失」等占位符）\n"
+        f"- usage_method: 盖章或外带{usage_hint}，A或「盖章」→盖章、B或「外带」→外带\n"
+        f"- lawyer_reviewed: 律师是否已审核{lawyer_hint}，1或「是」→是、2或「否」→否，若用户未明确则不要返回（切勿返回「缺失」等占位符）\n"
         f"- remarks: 备注(如果有)\n"
         f"只返回JSON。company、seal_type、reason 若用户未明确提及，不要返回或返回空。lawyer_reviewed 必须用户明确选择，否则不返回。"
     )
@@ -1392,26 +1373,16 @@ def _try_complete_seal(open_id, user_id, text):
                 continue  # 文件已识别且用户值无效，保留文件结果
             all_fields[k] = v
         elif k == "lawyer_reviewed":
-            if v in opts.get("lawyer_reviewed", ["是", "否"]):
-                all_fields[k] = v
+            vv = "是" if v in ("1", "是", "yes") else ("否" if v in ("2", "否", "no") else v)
+            if vv in opts.get("lawyer_reviewed", ["是", "否"]):
+                all_fields[k] = vv
         elif k == "usage_method":
-            if v in opts.get("usage_method", ["盖章", "外带"]):
-                all_fields[k] = v
+            vv = "盖章" if str(v).upper() in ("A", "盖章") else ("外带" if str(v).upper() in ("B", "外带") else v)
+            if vv in opts.get("usage_method", ["盖章", "外带"]):
+                all_fields[k] = vv
         else:
             all_fields[k] = v
     all_fields.setdefault("document_count", "1")
-    # 不默认 usage_method，需用户显式选择或由选项卡选择
-
-    lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
-    usage_opts = opts.get("usage_method", ["盖章", "外带"])
-
-    def _valid(k, v):
-        if k == "lawyer_reviewed":
-            return v and str(v).strip() in lawyer_opts
-        if k == "usage_method":
-            return v and str(v).strip() in usage_opts
-        return bool(v)
-
     missing = [k for k in ["seal_type", "reason", "lawyer_reviewed", "usage_method"] if not _valid(k, all_fields.get(k))]
 
     if missing:
@@ -1423,9 +1394,14 @@ def _try_complete_seal(open_id, user_id, text):
             entry["retry_count"] = retry_count
             entry["doc_fields"] = all_fields
         if set(missing) <= {"lawyer_reviewed", "usage_method"}:
-            all_fields.pop("usage_method", None)  # 强制用户通过选项卡点击选择
-            # 避免重复发送选项卡，仅提示用户点击上方卡片
-            send_message(open_id, "请点击上方卡片的选项完成「律师是否已审核」和「盖章还是外带」的选择。")
+            lines = [
+                "请回复数字/字母完成选择：",
+                "· 律师是否已审核：1（是）或 2（否）",
+                "· 盖章还是外带：A（盖章）或 B（外带）",
+                "",
+                "示例：回复「1 A」表示律师已审核、盖章",
+            ]
+            send_message(open_id, "\n".join(lines))
         else:
             hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
             if retry_count >= 3:
