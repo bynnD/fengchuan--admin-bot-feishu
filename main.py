@@ -205,13 +205,13 @@ def _try_modify_confirm(open_id, user_id, text):
         with _state_lock:
             PENDING_CONFIRM.pop(confirm_id, None)
             OPEN_ID_TO_CONFIRM.pop(open_id, None)
-        send_message(open_id, "确认已超时，请重新发起。")
+        send_message(open_id, "确认已超时，请重新发起。", use_red=True)
         return True
     if _is_cancel_intent(text):
         with _state_lock:
             PENDING_CONFIRM.pop(confirm_id, None)
             OPEN_ID_TO_CONFIRM.pop(open_id, None)
-        send_message(open_id, "已取消，如需提交请重新发起。")
+        send_message(open_id, "已取消，如需提交请重新发起。", use_red=True)
         return True
     approval_type = pending["approval_type"]
     fields = dict(pending["fields"])
@@ -235,10 +235,10 @@ def _try_modify_confirm(open_id, user_id, text):
         updates = json.loads(content) if content else {}
     except Exception as e:
         logger.warning("解析修改意图失败: %s", e)
-        send_message(open_id, "未能识别您的修改内容，请明确说明要修改的字段及新值，如「把开票金额改成1000」。")
+        send_message(open_id, "未能识别您的修改内容，请明确说明要修改的字段及新值，如「把开票金额改成1000」。", use_red=True)
         return True
     if not updates or not isinstance(updates, dict):
-        send_message(open_id, "如需修改，请明确说明要改的字段及新值。确认无误请直接点击卡片上的「确认提交」按钮。")
+        send_message(open_id, "如需修改，请明确说明要改的字段及新值。确认无误请直接点击卡片上的「确认提交」按钮。", use_red=True)
         return True
     for k, v in updates.items():
         if k in fields and v is not None:
@@ -251,7 +251,7 @@ def _try_modify_confirm(open_id, user_id, text):
     admin_comment = get_admin_comment(approval_type, fields)
     summary = format_fields_summary(fields, approval_type)
     send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=pending.get("file_codes"))
-    send_message(open_id, "已按您的要求修改，请再次确认信息无误后点击「确认提交」。")
+    send_message(open_id, "已按您的要求修改，请再次确认信息无误后点击「确认提交」。", use_red=True)
     return True
 
 
@@ -332,7 +332,7 @@ def _handle_split_file_intents(open_id, user_id, files_list, intents):
                     item["resource_type"] = f["resource_type"]
                 PENDING_INVOICE_UPLOAD[open_id]["files"].append(item)
         if len(invoice_files) > 1:
-            send_message(open_id, "每次仅支持开一张发票，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
+            send_message(open_id, "每次仅支持开一张发票，已为您处理第一个文件。如需为其他文件开票，请单独发起。", use_red=True)
         _schedule_invoice_upload_process(open_id, user_id, immediate=True)
     if seal_files and invoice_files:
         send_message(open_id, f"已接收：{len(seal_files)} 份用印、{len(invoice_files)} 份开票，将分别处理。")
@@ -452,13 +452,77 @@ def _get_usage_guide_message():
     return "\n".join(lines)
 
 
-def send_message(open_id, text):
+def _process_approval_type_click(open_id, user_id, approval_type, example_text):
+    """用户从工单类型选择卡片点击后，用例句走 AI 分析并处理（采购、外出、招待等）"""
+    with _state_lock:
+        conv_copy = list(CONVERSATIONS.get(open_id, []))
+    result = analyze_message(conv_copy)
+    requests = [r for r in result.get("requests", []) if r.get("approval_type") == approval_type]
+    if not requests:
+        send_message(open_id, f"未能识别{approval_type}相关信息，请补充说明。", use_red=True)
+        return
+    req = requests[0]
+    miss = req.get("missing", [])
+    fields_check = req.get("fields", {})
+    if approval_type == "采购申请":
+        cd = fields_check.get("cost_detail")
+        if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
+            if "cost_detail" not in miss:
+                miss.append("cost_detail")
+                req["missing"] = miss
+    if approval_type == "招待/团建物资领用":
+        idetail = fields_check.get("item_detail")
+        if not idetail or (isinstance(idetail, list) and len(idetail) == 0) or idetail == "":
+            if "item_detail" not in miss:
+                miss.append("item_detail")
+                req["missing"] = miss
+    remaining_requests = [req]
+    complete = [r for r in remaining_requests if not r.get("missing")]
+    incomplete = [(r["approval_type"], r.get("missing", [])) for r in remaining_requests if r.get("missing")]
+    for r in complete:
+        at = r.get("approval_type")
+        fields = r.get("fields", {})
+        admin_comment = get_admin_comment(at, fields)
+        summary = format_fields_summary(fields, at)
+        if at in LINK_ONLY_TYPES:
+            link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES[at]}"
+            send_card_message(open_id, f"【{at}】\n{summary}\n\n请点击下方按钮发起工单（需在飞书客户端内打开）。", link, f"打开{at}审批表单")
+        else:
+            token = get_token()
+            if is_free_process(APPROVAL_CODES[at], token):
+                link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES[at]}"
+                send_card_message(open_id, f"【{at}】\n{summary}\n\n该类型暂不支持自动创建，请点击下方按钮在飞书中发起。", link, f"打开{at}审批表单")
+            else:
+                send_confirm_card(open_id, at, summary, admin_comment, user_id, fields)
+    if incomplete:
+        parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]
+        send_message(open_id, "请补充以下信息：\n" + "\n".join(parts), use_red=True)
+    with _state_lock:
+        if open_id in CONVERSATIONS:
+            CONVERSATIONS[open_id].append({"role": "assistant", "content": "已处理" if complete else "请补充信息"})
+
+
+def send_message(open_id, text, use_red=False):
+    """发送消息。use_red=True 时以红色字体呈现（用于提示用户的语句）"""
     text = _sanitize_message_text(text)
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(open_id) \
-        .msg_type("text") \
-        .content(json.dumps({"text": text}, ensure_ascii=False)) \
-        .build()
+    if use_red:
+        safe = _escape_lark_md(text).replace("<", "&lt;").replace(">", "&gt;")
+        content = f"<font color='red'>{safe}</font>"
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content}}],
+        }
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(open_id) \
+            .msg_type("interactive") \
+            .content(json.dumps(card, ensure_ascii=False)) \
+            .build()
+    else:
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(open_id) \
+            .msg_type("text") \
+            .content(json.dumps({"text": text}, ensure_ascii=False)) \
+            .build()
     request = CreateMessageRequest.builder() \
         .receive_id_type("open_id") \
         .request_body(body) \
@@ -505,6 +569,38 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
     resp = client.im.v1.message.create(request)
     if not resp.success():
         logger.error("发送卡片消息失败: %s", resp.msg)
+
+
+def send_approval_type_options_card(open_id):
+    """发送工单类型选择卡片，用户点击即可选择，无需文字输入"""
+    text = "你好！我是行政助理，可帮你快速提交审批。\n\n请选择您要办理的工单类型："
+    btns = []
+    for name in APPROVAL_CODES.keys():
+        btns.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": name},
+            "type": "primary" if name in ("用印申请单", "开票申请单") else "default",
+            "behaviors": [{"type": "callback", "value": {"action": "approval_type_select", "approval_type": name}}],
+        })
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": btns},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送工单类型选择卡片失败: %s", resp.msg)
 
 
 def send_file_intent_options_card(open_id, file_names):
@@ -920,6 +1016,38 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
+        # 工单类型选择卡片：用户点击后直接进入对应流程
+        if value.get("action") == "approval_type_select":
+            at = value.get("approval_type", "")
+            if at not in APPROVAL_CODES:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "无效的工单类型"}})
+            def _handle_type_select():
+                if at == "用印申请单":
+                    with _state_lock:
+                        SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
+                    send_message(open_id, "请补充以下信息：\n用印申请单还缺少：上传用章文件\n请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
+                elif at == "开票申请单":
+                    with _state_lock:
+                        PENDING_INVOICE[open_id] = {
+                            "step": "need_files",
+                            "file_codes": [],
+                            "doc_fields": {},
+                            "user_id": user_id,
+                            "created_at": time.time(),
+                        }
+                    send_message(open_id, "请补充以下信息：\n开票申请单需要：上传开票凭证\n请上传凭证（结算单+合同、合同+银行水单、合同+订单明细、电商发货/收款截图等，Word/PDF/图片均可），我会自动识别类型。\n\n**说明**：每次仅支持开一张发票，您上传的所有文件将合并为一张发票的凭证。", use_red=True)
+                else:
+                    # 采购、外出、招待等：模拟用户消息，走 AI 分析流程
+                    example = (APPROVAL_USAGE_GUIDE.get(at) or ("", "", False))[1]
+                    with _state_lock:
+                        CONVERSATIONS.setdefault(open_id, [])
+                        CONVERSATIONS[open_id].append({"role": "user", "content": example})
+                        if len(CONVERSATIONS[open_id]) > 10:
+                            CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+                    _process_approval_type_click(open_id, user_id, at, example)
+            threading.Thread(target=_handle_type_select, daemon=True).start()
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择{at}，正在处理"}})
+
         # 文件意图选择卡片：用印申请单 / 开票申请单（3 分钟内未说明意图时弹出）
         if value.get("action") == "file_intent":
             intent = value.get("intent", "")
@@ -1170,7 +1298,7 @@ def on_card_action_confirm(data):
                 else:
                     send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
             else:
-                send_message(open_id, f"提交失败：{msg}")
+                send_message(open_id, f"提交失败：{msg}", use_red=True)
 
         threading.Thread(target=_create_and_notify, daemon=True).start()
         return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在提交，请稍候"}})
@@ -1296,6 +1424,13 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
                                     val = [val] if val else []
                             else:
                                 val = _match_sub_field(sf_name, item)
+                            # 采购申请等：单选框子字段（如「是否有库存」）发起人不填，提交时需给有效值
+                            if sf_type in ("radioV2", "radio") and not val:
+                                opts = sf.get("options", [])
+                                if opts and isinstance(opts, list) and opts[0]:
+                                    opt = opts[0]
+                                    if isinstance(opt, dict):
+                                        val = opt.get("value") or opt.get("key", "") or opt.get("text", "")
                             row.append({"id": sf["id"], "type": sf_type, "value": val})
                         rows.append(row)
                     elif isinstance(item, list):
@@ -1943,16 +2078,16 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             fkey = cj.get("file_key") or cj.get("image_key", "")
             resource_type = f.get("resource_type", "file")
             if not fkey:
-                send_message(open_id, f"无法获取文件「{fname}」，请重新发送。")
+                send_message(open_id, f"无法获取文件「{fname}」，请重新发送。", use_red=True)
                 return
             send_message(open_id, f"正在处理文件「{fname}」（{i+1}/{len(files_list)}），请稍候...")
             file_content, dl_err = download_message_file(msg_id, fkey, resource_type)
             if not file_content:
-                send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{dl_err or ''}".strip())
+                send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{dl_err or ''}".strip(), use_red=True)
                 return
             file_code, upload_err = upload_approval_file(fname, file_content)
             if not file_code:
-                send_message(open_id, f"文件「{fname}」上传失败。{upload_err or ''}".strip())
+                send_message(open_id, f"文件「{fname}」上传失败。{upload_err or ''}".strip(), use_red=True)
                 return
             doc_name = fname.rsplit(".", 1)[0] if "." in fname else fname
             ext = (fname.rsplit(".", 1)[-1] or "").lower()
@@ -1977,7 +2112,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             }
             if open_id in SEAL_INITIAL_FIELDS:
                 del SEAL_INITIAL_FIELDS[open_id]
-        send_message(open_id, f"已接收 {len(items)} 个文件，请依次为每份文件选择选项。")
+        send_message(open_id, f"已接收 {len(items)} 个文件，请依次为每份文件选择选项。", use_red=True)
         _send_seal_queue_card(open_id, user_id, PENDING_SEAL_QUEUE[open_id])
         return
 
@@ -1992,19 +2127,19 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
     file_key = content_json.get("file_key") or content_json.get("image_key", "")
     resource_type = (files_list[0].get("resource_type", "file") if files_list and len(files_list) == 1 else "file")
     if not file_key:
-        send_message(open_id, "无法获取文件，请重新发送。")
+        send_message(open_id, "无法获取文件，请重新发送。", use_red=True)
         return
     send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
     file_content, dl_err = download_message_file(message_id, file_key, resource_type)
     if not file_content:
         err_detail = f"（{dl_err}）" if dl_err else ""
-        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
+        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip(), use_red=True)
         return
     logger.info("用印文件: 已下载 %s, 大小=%d bytes", file_name, len(file_content))
     file_code, upload_err = upload_approval_file(file_name, file_content)
     if not file_code:
         err_detail = f"（{upload_err}）" if upload_err else ""
-        send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}")
+        send_message(open_id, f"文件上传失败，请重新发送文件。附件上传成功后才能继续创建工单。{err_detail}", use_red=True)
         return
     file_codes = [file_code]
     doc_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
@@ -2103,7 +2238,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             lines = [f"此外还缺少：{'、'.join(labels.get(m, m) for m in other_missing)}，请补充说明。"]
             for m in other_missing:
                 lines.append(f"· {labels.get(m, m)}：{hint_map.get(m, '')}")
-            send_message(open_id, "\n".join(lines))
+            send_message(open_id, "\n".join(lines), use_red=True)
     else:
         # 仅缺 company/seal_type/reason，无律师/盖章
         labels = {"company": "用印公司", "seal_type": "印章类型", "reason": "文件用途/用印事由"}
@@ -2115,13 +2250,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         lines = [f"已接收文件：{file_name}", f"· 文件名称: {doc_name}", "", "请补充以下信息（一条消息说完即可）："]
         for k in missing:
             lines.append(f"· {labels.get(k, k)}：{hint_map.get(k, '')}")
-        send_message(open_id, "\n".join(lines))
+        send_message(open_id, "\n".join(lines), use_red=True)
 
 
 def _do_create_seal_multi(open_id, user_id, items, selections):
     """多文件排队完成后，合并为一张工单。items=[{file_name, file_code, doc_fields}, ...], selections=[{lawyer_reviewed, usage_method, document_count}, ...]"""
     if not items or len(items) != len(selections):
-        send_message(open_id, "数据异常，请重新发起用印申请单。")
+        send_message(open_id, "数据异常，请重新发起用印申请单。", use_red=True)
         return
     # 每行仅用该文件自身的 doc_fields + selection，避免后续文件误用首文件的值
     rows = []
@@ -2163,7 +2298,7 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
         else:
             send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
     else:
-        send_message(open_id, f"提交失败：{msg}")
+        send_message(open_id, f"提交失败：{msg}", use_red=True)
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False):
@@ -2210,14 +2345,14 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
             else:
                 send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
         else:
-            send_message(open_id, f"提交失败：{msg}")
+            send_message(open_id, f"提交失败：{msg}", use_red=True)
         return
 
     fc = {"widget15828104903330001": codes} if codes else {}
     admin_comment = get_admin_comment("用印申请单", all_fields)
     summary = format_fields_summary(all_fields, "用印申请单")
     send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc)
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。", use_red=True)
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -2231,7 +2366,7 @@ def _try_complete_seal(open_id, user_id, text):
         with _state_lock:
             if open_id in PENDING_SEAL:
                 del PENDING_SEAL[open_id]
-        send_message(open_id, "已取消用印申请单，如需办理请重新发起。")
+        send_message(open_id, "已取消用印申请单，如需办理请重新发起。", use_red=True)
         return True
 
     doc_fields = pending["doc_fields"]
@@ -2286,7 +2421,7 @@ def _try_complete_seal(open_id, user_id, text):
         hint = "无法理解您的输入，请重新描述用印公司、印章类型和用印事由。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
-        send_message(open_id, hint)
+        send_message(open_id, hint, use_red=True)
         return True
 
     # 合并：文件识别结果优先，用户补充的有效值可覆盖；避免 AI 返回空值覆盖文件识别结果
@@ -2333,7 +2468,7 @@ def _try_complete_seal(open_id, user_id, text):
             hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
             if retry_count >= 3:
                 hint += "\n（若需放弃，可回复「取消」）"
-            send_message(open_id, hint)
+            send_message(open_id, hint, use_red=True)
         return True
 
     file_codes = pending.get("file_codes") or []
@@ -2406,11 +2541,11 @@ def _process_invoice_upload_batch(open_id, user_id, files):
         send_message(open_id, f"正在处理文件「{file_name}」（{i+1}/{len(files)}），请稍候...")
         file_content, dl_err = download_message_file(msg_id, file_key, resource_type)
         if not file_content:
-            send_message(open_id, f"文件「{file_name}」下载失败，请重新发送。{dl_err or ''}".strip())
+            send_message(open_id, f"文件「{file_name}」下载失败，请重新发送。{dl_err or ''}".strip(), use_red=True)
             continue
         file_code, upload_err = upload_approval_file(file_name, file_content)
         if not file_code:
-            send_message(open_id, f"文件「{file_name}」上传失败，请重新发送。{upload_err or ''}".strip())
+            send_message(open_id, f"文件「{file_name}」上传失败，请重新发送。{upload_err or ''}".strip(), use_red=True)
             continue
         extractor = get_file_extractor("开票申请单")
         ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
@@ -2464,7 +2599,7 @@ def _process_invoice_upload_batch(open_id, user_id, files):
         pending["doc_fields"] = doc_fields
         pending["step"] = "user_fields"
     if not file_codes_list:
-        send_message(open_id, "未能成功处理任何文件，请重新上传。")
+        send_message(open_id, "未能成功处理任何文件，请重新上传。", use_red=True)
         return
     # 统一发送选项卡片
     def _fmt_val(v):
@@ -2514,7 +2649,7 @@ def _process_invoice_upload_batch(open_id, user_id, files):
             _invoice_card_last_sent[open_id] = now
     else:
         logger.error("发送开票选项卡片失败: %s", resp.msg)
-        send_message(open_id, f"已接收 {len(file_codes_list)} 个凭证。\n\n已识别：\n{summary or '（无）'}\n\n请补充：发票类型、开票项目。")
+        send_message(open_id, f"已接收 {len(file_codes_list)} 个凭证。\n\n已识别：\n{summary or '（无）'}\n\n请补充：发票类型、开票项目。", use_red=True)
 
 
 def _handle_invoice_file(open_id, user_id, message_id, content_json):
@@ -2569,7 +2704,7 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
         PENDING_INVOICE_UPLOAD.pop(open_id, None)
         # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
 
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。", use_red=True)
 
 
 def _try_complete_invoice(open_id, user_id, text):
@@ -2584,13 +2719,13 @@ def _try_complete_invoice(open_id, user_id, text):
             if open_id in PENDING_INVOICE:
                 del PENDING_INVOICE[open_id]
                 PENDING_INVOICE_UPLOAD.pop(open_id, None)
-        send_message(open_id, "已取消开票申请单，如需办理请重新发起。")
+        send_message(open_id, "已取消开票申请单，如需办理请重新发起。", use_red=True)
         return True
 
     doc_fields = pending.get("doc_fields", {})
     fc_list = pending.get("file_codes", [])
     if not fc_list:
-        send_message(open_id, "开票申请单需要上传开票凭证（合同、对账单、银行水单、订单明细、电商截图等），请重新发起。")
+        send_message(open_id, "开票申请单需要上传开票凭证（合同、对账单、银行水单、订单明细、电商截图等），请重新发起。", use_red=True)
         return True
 
     prompt = (
@@ -2614,7 +2749,7 @@ def _try_complete_invoice(open_id, user_id, text):
         hint = "无法识别您补充的信息，请明确说明：发票类型、开票项目。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
-        send_message(open_id, hint)
+        send_message(open_id, hint, use_red=True)
         return True
 
     all_fields = {**doc_fields, **user_fields}
@@ -2626,7 +2761,7 @@ def _try_complete_invoice(open_id, user_id, text):
         hint = f"还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in missing])}\n请补充。"
         if retry_count >= 3:
             hint += "\n（若需放弃，可回复「取消」）"
-        send_message(open_id, hint)
+        send_message(open_id, hint, use_red=True)
         return True
 
     _do_create_invoice(open_id, user_id, all_fields, fc_list)
@@ -2660,7 +2795,7 @@ def on_message(data):
             with _state_lock:
                 last = _user_last_msg.get(open_id, 0)
                 if now - last < RATE_LIMIT_SEC:
-                    send_message(open_id, "操作过于频繁，请稍后再试。")
+                    send_message(open_id, "操作过于频繁，请稍后再试。", use_red=True)
                     return
                 _user_last_msg[open_id] = now
 
@@ -2675,7 +2810,7 @@ def on_message(data):
                     pending = PENDING_INVOICE.get(open_id)
                     step = pending.get("step", "") if pending else ""
                 if step == "user_fields":
-                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。")
+                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。", use_red=True)
                 else:
                     file_name = content_json.get("file_name", "未知文件")
                     with _state_lock:
@@ -2691,7 +2826,7 @@ def on_message(data):
                     send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个）。正在处理，请稍候...")
                     _schedule_invoice_upload_process(open_id, user_id)
             elif is_seal or in_seal_queue:
-                send_message(open_id, "您当前有用印申请单待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。")
+                send_message(open_id, "您当前有用印申请单待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。", use_red=True)
             elif expects_seal:
                 # 收集文件并防抖，多文件时批量进入排队模式（先出第1张卡，点「下一份」出第2张，最后「提交工单」）
                 file_name = content_json.get("file_name", "未知文件")
@@ -2721,7 +2856,7 @@ def on_message(data):
                     })
                     PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
                 count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
-                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
+                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。", use_red=True)
                 _schedule_file_intent_card(open_id)
             return
 
@@ -2735,11 +2870,11 @@ def on_message(data):
             if is_invoice:
                 pending = PENDING_INVOICE.get(open_id, {})
                 if pending.get("step") == "user_fields":
-                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。")
+                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。", use_red=True)
                 else:
                     image_key = content_json.get("image_key") or content_json.get("file_key", "")
                     if not image_key:
-                        send_message(open_id, "无法获取图片，请重新发送或改为上传文件格式的凭证。")
+                        send_message(open_id, "无法获取图片，请重新发送或改为上传文件格式的凭证。", use_red=True)
                     else:
                         with _state_lock:
                             if open_id not in PENDING_INVOICE_UPLOAD:
@@ -2771,7 +2906,7 @@ def on_message(data):
                     send_message(open_id, f"已收到图片「用印文件截图」（共 {count} 个）。正在处理，请稍候...")
                     _schedule_seal_upload_process(open_id, user_id)
                 else:
-                    send_message(open_id, "无法获取图片，请重新发送。")
+                    send_message(open_id, "无法获取图片，请重新发送。", use_red=True)
             elif open_id in PENDING_FILE_UNCLEAR and PENDING_FILE_UNCLEAR.get(open_id, {}).get("files"):
                 # 用户先上传了文件但未说明意图，又发了图片，将图片加入待确认列表
                 image_key = content_json.get("image_key") or content_json.get("file_key", "")
@@ -2786,17 +2921,17 @@ def on_message(data):
                         })
                         PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
                     count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
-                    send_message(open_id, f"已收到图片（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
+                    send_message(open_id, f"已收到图片（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。", use_red=True)
                     _schedule_file_intent_card(open_id)
                 else:
-                    send_message(open_id, _get_usage_guide_message())
+                    send_approval_type_options_card(open_id)
             else:
-                send_message(open_id, _get_usage_guide_message())
+                send_approval_type_options_card(open_id)
             return
 
         text = content_json.get("text", "").strip()
         if not text:
-            send_message(open_id, _get_usage_guide_message())
+            send_approval_type_options_card(open_id)
             return
 
         # 自动审批开关：仅 auto_approve_user_ids 中的用户可操作
@@ -2841,7 +2976,7 @@ def on_message(data):
                             entry["timer"].cancel()
                         except Exception:
                             pass
-                send_message(open_id, "已取消。如需办理用印或开票，请重新上传文件并说明用途。")
+                send_message(open_id, "已取消。如需办理用印或开票，请重新上传文件并说明用途。", use_red=True)
                 return
             with _state_lock:
                 CONVERSATIONS.setdefault(open_id, [])
@@ -2922,9 +3057,9 @@ def on_message(data):
                     _schedule_invoice_upload_process(open_id, user_id, immediate=True)
                 return
             if needs_seal and needs_invoice:
-                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请单**？回复「用印」或「开票」。")
+                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请单**？回复「用印」或「开票」。", use_red=True)
                 return
-            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
+            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。", use_red=True)
             return
 
         with _state_lock:
@@ -2940,11 +3075,13 @@ def on_message(data):
         unclear = result.get("unclear", "")
 
         if not requests:
-            reply = unclear if unclear else _get_usage_guide_message()
-            send_message(open_id, reply)
+            if unclear:
+                send_message(open_id, unclear, use_red=True)
+            else:
+                send_approval_type_options_card(open_id)
             with _state_lock:
                 if open_id in CONVERSATIONS:
-                    CONVERSATIONS[open_id].append({"role": "assistant", "content": reply})
+                    CONVERSATIONS[open_id].append({"role": "assistant", "content": unclear or "请选择工单类型"})
             return
 
         # 第一阶段：处理需特殊路由的类型（用印/开票），收集剩余待处理
@@ -2960,7 +3097,7 @@ def on_message(data):
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
             send_message(open_id, "您同时发起了用印申请单和开票申请单。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请单」。\n\n"
-                         "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
+                         "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请单"})
@@ -2978,7 +3115,7 @@ def on_message(data):
                         SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
                     send_message(open_id, "请补充以下信息：\n"
                                  f"用印申请单还缺少：上传用章文件\n"
-                                 f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
+                                 f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
                     with _state_lock:
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
@@ -2997,7 +3134,7 @@ def on_message(data):
                     send_message(open_id, "请补充以下信息：\n"
                                  f"开票申请单需要：上传开票凭证\n"
                                  f"请上传凭证（结算单+合同、合同+银行水单、合同+订单明细、电商发货/收款截图等，Word/PDF/图片均可），我会自动识别类型。\n\n"
-                                 f"**说明**：每次仅支持开一张发票，您上传的所有文件将合并为一张发票的凭证。")
+                                 f"**说明**：每次仅支持开一张发票，您上传的所有文件将合并为一张发票的凭证。", use_red=True)
                     with _state_lock:
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
@@ -3062,7 +3199,7 @@ def on_message(data):
         if not complete:
             body = "\n".join(replies)
             if body.strip():
-                send_message(open_id, body)
+                send_message(open_id, body, use_red=True)
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请补充信息"})
@@ -3071,7 +3208,7 @@ def on_message(data):
         header = f"✅ 已处理 {len(complete)} 个申请：\n\n" if len(complete) > 1 else ""
         body = header + "\n\n".join(replies)
         if body.strip():
-            send_message(open_id, body)
+            send_message(open_id, body, use_red=True)
         with _state_lock:
             if not incomplete and open_id in CONVERSATIONS:
                 CONVERSATIONS[open_id] = []
@@ -3079,7 +3216,7 @@ def on_message(data):
     except Exception as e:
         logger.exception("处理消息出错: %s", e)
         if open_id:
-            send_message(open_id, "系统出现异常，请稍后再试。")
+            send_message(open_id, "系统出现异常，请稍后再试。", use_red=True)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
