@@ -173,7 +173,10 @@ def _clean_expired_pending(open_id=None):
                         pass
         for cid in list(PENDING_CONFIRM.keys()):
             if now - PENDING_CONFIRM[cid].get("created_at", 0) > CONFIRM_TTL:
+                oid = PENDING_CONFIRM[cid].get("open_id")
                 del PENDING_CONFIRM[cid]
+                if oid and OPEN_ID_TO_CONFIRM.get(oid) == cid:
+                    del OPEN_ID_TO_CONFIRM[oid]
         USER_STALE_TTL = 86400
         stale_users = [uid for uid, ts in _user_last_msg.items() if now - ts > USER_STALE_TTL]
         for uid in stale_users:
@@ -189,6 +192,67 @@ def _is_cancel_intent(text):
     if len(t) < 2:
         return False
     return any(p in t for p in CANCEL_PHRASES)
+
+
+def _try_modify_confirm(open_id, user_id, text):
+    """汇总卡出现后，用户通过对话修改字段。解析修改意图，更新字段并重新发卡"""
+    with _state_lock:
+        confirm_id = OPEN_ID_TO_CONFIRM.get(open_id)
+        pending = PENDING_CONFIRM.get(confirm_id) if confirm_id else None
+    if not pending:
+        return False
+    if time.time() - pending.get("created_at", 0) > CONFIRM_TTL:
+        with _state_lock:
+            PENDING_CONFIRM.pop(confirm_id, None)
+            OPEN_ID_TO_CONFIRM.pop(open_id, None)
+        send_message(open_id, "确认已超时，请重新发起。")
+        return True
+    if _is_cancel_intent(text):
+        with _state_lock:
+            PENDING_CONFIRM.pop(confirm_id, None)
+            OPEN_ID_TO_CONFIRM.pop(open_id, None)
+        send_message(open_id, "已取消，如需提交请重新发起。")
+        return True
+    approval_type = pending["approval_type"]
+    fields = dict(pending["fields"])
+    summary_cur = format_fields_summary(fields, approval_type)
+    order = FIELD_ORDER.get(approval_type) or []
+    labels = ", ".join(f"{k}({FIELD_LABELS.get(k,k)})" for k in order if k in fields)
+    prompt = (
+        f"用户正在确认【{approval_type}】的工单信息。\n当前信息：\n{summary_cur}\n\n"
+        f"用户说：{text}\n\n"
+        f"请解析用户要修改的字段。用户可能说「把金额改成1000」「购方名称改为XXX公司」「税号错了，应该是123」等。"
+        f"可修改字段（逻辑键名）：{labels}\n"
+        f"只返回JSON，格式如 {{\"amount\": 1000, \"buyer_name\": \"XXX公司\"}}，仅包含用户明确要修改的字段。"
+        f"若用户未表达修改意图（如「确认」「没问题」「提交」等），返回 {{}}。"
+        f"proof_file_type 为数组，如 [\"合同\",\"对账单\"]。只返回JSON，不要其他内容。"
+    )
+    try:
+        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=15)
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        updates = json.loads(content) if content else {}
+    except Exception as e:
+        logger.warning("解析修改意图失败: %s", e)
+        send_message(open_id, "未能识别您的修改内容，请明确说明要修改的字段及新值，如「把开票金额改成1000」。")
+        return True
+    if not updates or not isinstance(updates, dict):
+        send_message(open_id, "如需修改，请明确说明要改的字段及新值。确认无误请直接点击卡片上的「确认提交」按钮。")
+        return True
+    for k, v in updates.items():
+        if k in fields and v is not None:
+            if isinstance(v, list):
+                fields[k] = [str(x).strip() for x in v if x and str(x).strip()]
+            else:
+                fields[k] = str(v).strip() if v else ""
+    with _state_lock:
+        PENDING_CONFIRM.pop(confirm_id, None)
+    admin_comment = get_admin_comment(approval_type, fields)
+    summary = format_fields_summary(fields, approval_type)
+    send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=pending.get("file_codes"))
+    send_message(open_id, "已按您的要求修改，请再次确认信息无误后点击「确认提交」。")
+    return True
 
 
 def _parse_file_intents(text, file_count):
@@ -702,7 +766,7 @@ def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None, 
 
 
 def _update_invoice_card_delayed(token, open_id, card, delay_sec=0.08):
-    """延时更新开票选项卡片以显示选中状态。当前未使用（card/update 可能导致重复发卡，已改为仅 toast）"""
+    """延时更新开票选项卡片以显示选中状态（蓝色 primary 按钮）"""
     if not token or not open_id or not card:
         return
     time.sleep(delay_sec)
@@ -791,9 +855,13 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
 
 
 def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
-    """发送工单确认卡片，用户点击「确认」后创建工单"""
+    """发送工单确认卡片，用户点击「确认」后创建工单。支持用户通过对话修改字段后重新发卡"""
     confirm_id = str(uuid.uuid4())
     with _state_lock:
+        old_cid = OPEN_ID_TO_CONFIRM.pop(open_id, None)
+        if old_cid:
+            PENDING_CONFIRM.pop(old_cid, None)
+        OPEN_ID_TO_CONFIRM[open_id] = confirm_id
         PENDING_CONFIRM[confirm_id] = {
             "open_id": open_id,
             "user_id": user_id,
@@ -803,7 +871,7 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             "admin_comment": admin_comment,
             "created_at": time.time(),
         }
-    text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n请确认以上信息无误后，点击下方按钮提交工单。"
+    text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n请确认以上信息无误后，点击下方按钮提交工单。\n\n若信息有误，可直接回复说明要修改的字段及新值（如「把开票金额改成1000」），我会重新发卡供您确认。"
     btn_config = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": "确认提交"},
@@ -831,6 +899,8 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
         logger.error("发送确认卡片失败: %s", resp.msg)
         with _state_lock:
             PENDING_CONFIRM.pop(confirm_id, None)
+            if OPEN_ID_TO_CONFIRM.get(open_id) == confirm_id:
+                del OPEN_ID_TO_CONFIRM[open_id]
 
 
 def on_card_action_confirm(data):
@@ -1004,7 +1074,7 @@ def on_card_action_confirm(data):
             threading.Thread(target=_do_seal_queue_async, daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
 
-        # 开票选项卡片：发票类型、开票项目（仅保存选项，不更新卡片，避免飞书 card/update 导致重复发卡）
+        # 开票选项卡片：发票类型、开票项目（保存选项并更新卡片以显示蓝色选中状态）
         if value.get("action") == "invoice_option":
             field = value.get("field")
             val = value.get("value")
@@ -1016,6 +1086,11 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新发起开票申请单"}})
             pending["doc_fields"][field] = val
             pending["created_at"] = time.time()
+            update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
+            if update_token:
+                prefix = pending.get("summary_prefix", "")
+                card = _build_invoice_options_card(pending["doc_fields"], prefix)
+                threading.Thread(target=lambda t=update_token, oid=open_id, c=card: _update_invoice_card_delayed(t, oid, c), daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
         # 开票确认提交：选项选完后点击
@@ -1070,6 +1145,8 @@ def on_card_action_confirm(data):
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         with _state_lock:
             pending = PENDING_CONFIRM.pop(confirm_id, None)
+            if pending and OPEN_ID_TO_CONFIRM.get(open_id) == confirm_id:
+                del OPEN_ID_TO_CONFIRM[open_id]
         if not pending:
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "确认已过期，请重新发起"}})
         if time.time() - pending.get("created_at", 0) > CONFIRM_TTL:
@@ -1346,6 +1423,18 @@ def build_form(approval_type, fields, token, file_codes=None):
                             raw = opt_val or opt_text
                             matched = True
                             break
+                # 开票申请单「业务类型」：无精确匹配时做关键词模糊匹配，避免误用 opts[0]（如 Right-bot）
+                if not matched and logical_key == "business_type" and approval_type == "开票申请单" and raw_str:
+                    for kw in ("小蓝词", "NBBOSS", "Right-bot", "right-bot"):
+                        if kw.lower() in raw_str.lower():
+                            for opt in opts:
+                                if isinstance(opt, dict):
+                                    ot = str(opt.get("text", "") or opt.get("value", ""))
+                                    if kw.lower() in ot.lower():
+                                        raw = opt.get("value") or opt.get("key", "") or ot
+                                        matched = True
+                                        break
+                            break
                 if not matched:
                     raw = (opts[0].get("value") or opts[0].get("key", "")) if isinstance(opts[0], dict) else ""
         if field_type == "checkboxV2":
@@ -1398,13 +1487,26 @@ def build_form(approval_type, fields, token, file_codes=None):
 
 
 def _value_to_text(val, options):
-    """将 radioV2/radio 的 value 转为可读的 text"""
+    """将 radioV2/radio/checkboxV2 的 value 转为可读的 text，支持 value/key/id 匹配及 text/label/name 显示"""
     if not options or not val:
         return val
     for opt in options:
-        if isinstance(opt, dict) and opt.get("value") == val:
-            return opt.get("text", val)
+        if isinstance(opt, dict):
+            opt_val = opt.get("value") or opt.get("key") or opt.get("id", "")
+            if str(opt_val) == str(val):
+                return opt.get("text") or opt.get("label") or opt.get("name", val)
     return val
+
+
+def _checkbox_values_to_text(vals, options):
+    """将 checkboxV2 的 value 列表转为可读的 text 列表"""
+    if not options or not vals:
+        return vals
+    result = []
+    for v in (vals if isinstance(vals, list) else [vals]):
+        t = _value_to_text(v, options)
+        result.append(t if t else v)
+    return result
 
 
 def _form_summary(form_list, cached, approval_type=None):
@@ -1463,6 +1565,11 @@ def _form_summary(form_list, cached, approval_type=None):
                             parts.append(display)
                     if parts:
                         lines.append(f"  {i+1}. {', '.join(parts)}")
+        elif ftype == "checkboxV2":
+            val = item.get("value", [])
+            if val:
+                display = _checkbox_values_to_text(val, info.get("options", []))
+                lines.append(f"· {name}: {', '.join(str(d) for d in display)}")
         else:
             val = item.get("value", "")
             if val:
@@ -1587,6 +1694,7 @@ PENDING_INVOICE = {}
 
 # 工单确认：用户点击确认按钮后创建。confirm_id -> {open_id, user_id, approval_type, fields, file_codes, admin_comment, created_at}
 PENDING_CONFIRM = {}
+OPEN_ID_TO_CONFIRM = {}  # open_id -> confirm_id，用于汇总卡出现后用户通过对话修改字段
 CONFIRM_TTL = 15 * 60  # 15 分钟
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
@@ -2109,7 +2217,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     admin_comment = get_admin_comment("用印申请单", all_fields)
     summary = format_fields_summary(all_fields, "用印申请单")
     send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc)
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。")
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -2379,6 +2487,10 @@ def _process_invoice_upload_batch(open_id, user_id, files):
     proof_set = set(p for p in proof_labels if p)
     if proof_set == {"合同"}:
         summary_prefix += "\n\n⚠️ **风险提示**：当前仅提供合同，建议补充收款记录、银行流水、盖章确认的对账单或电商平台订单等凭证，以降低开票风险。"
+    with _state_lock:
+        p = PENDING_INVOICE.get(open_id)
+        if p:
+            p["summary_prefix"] = summary_prefix
     # 发卡去重：3 秒内不重复发送，避免事件重试等导致重复发卡
     now = time.time()
     with _state_lock:
@@ -2457,7 +2569,7 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
         PENDING_INVOICE_UPLOAD.pop(open_id, None)
         # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
 
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认」按钮。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。")
 
 
 def _try_complete_invoice(open_id, user_id, text):
@@ -2702,6 +2814,10 @@ def on_message(data):
                 status = "已开启" if is_auto_approval_enabled() else "已关闭"
                 send_message(open_id, f"自动审批当前状态：{status}")
                 return
+
+        # 汇总卡出现后，用户通过对话修改字段
+        if _try_modify_confirm(open_id, user_id, text):
+            return
 
         with _state_lock:
             in_seal = open_id in PENDING_SEAL
