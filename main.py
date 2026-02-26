@@ -61,7 +61,7 @@ PENDING_SEAL_UPLOAD = {}
 SEAL_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新文件后批量处理
 # 开票等待上传时收集多文件（防抖）：{open_id: {"files": [{...}], "user_id", "created_at", "timer"}}
 PENDING_INVOICE_UPLOAD = {}
-INVOICE_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新文件后批量处理，再统一发卡
+INVOICE_UPLOAD_DEBOUNCE_SEC = 12  # 连续上传多文件时，等待此秒数无新文件后批量处理，再统一发卡（合同+对账单需时间上传）
 # 多文件用印排队：{open_id: {"items": [{file_name, file_code, doc_fields}, ...], "current_index": 0, "selections": [{lawyer, usage, count}, ...], "user_id", "created_at"}}
 PENDING_SEAL_QUEUE = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
@@ -268,7 +268,7 @@ def _handle_split_file_intents(open_id, user_id, files_list, intents):
                     item["resource_type"] = f["resource_type"]
                 PENDING_INVOICE_UPLOAD[open_id]["files"].append(item)
         if len(invoice_files) > 1:
-            send_message(open_id, "开票申请单每次仅支持一个文件，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
+            send_message(open_id, "每次仅支持开一张发票，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
         _schedule_invoice_upload_process(open_id, user_id, immediate=True)
     if seal_files and invoice_files:
         send_message(open_id, f"已接收：{len(seal_files)} 份用印、{len(invoice_files)} 份开票，将分别处理。")
@@ -2276,13 +2276,17 @@ def _infer_invoice_proof_type(file_name, ai_fields):
 
 
 def _process_invoice_upload_batch(open_id, user_id, files):
-    """批量处理开票凭证文件，全部处理完后统一发送选项卡片，避免「已追加xxx」等中间消息"""
+    """批量处理开票凭证文件，全部处理完后统一发送选项卡片。合同+对账单合并为一张发票，金额优先取自对账单。"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
             return
         doc_fields = dict(pending.get("doc_fields", {}))
         file_codes_list = list(pending.get("file_codes", []))
+    # 合同+对账单组合时：金额取自对账单，购方/税号/业务类型取自合同
+    amount_from_settlement = None  # 对账单/结算单的金额优先
+    amount_from_contract = None
+    contract_fields = {}  # 合同中的 buyer_name, tax_id, business_type 等
     for i, f in enumerate(files):
         msg_id = f.get("message_id")
         cj = f.get("content_json", {})
@@ -2304,6 +2308,26 @@ def _process_invoice_upload_batch(open_id, user_id, files):
         ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
         if ai_fields:
             logger.info("开票文件识别结果: %s", ai_fields)
+        proof_type = _infer_invoice_proof_type(file_name, ai_fields)
+        # 合并 proof_file_type
+        if not doc_fields.get("proof_file_type"):
+            doc_fields["proof_file_type"] = [proof_type]
+        elif proof_type not in (doc_fields.get("proof_file_type") or []):
+            existing = doc_fields.get("proof_file_type") or []
+            doc_fields["proof_file_type"] = list(dict.fromkeys(existing + [proof_type]))
+        # 金额：对账单/银行流水/订单等优先，合同次之（收集，最后统一写入）
+        amt = str(ai_fields.get("amount", "")).strip() if ai_fields.get("amount") else ""
+        if amt:
+            if proof_type != "合同":
+                amount_from_settlement = amt  # 对账单、其他、订单类
+            else:
+                amount_from_contract = amt
+        # 合同字段：购方、税号、业务类型等
+        if proof_type == "合同":
+            for k in ("buyer_name", "tax_id", "business_type", "contract_no"):
+                if ai_fields.get(k) and str(ai_fields[k]).strip():
+                    contract_fields[k] = str(ai_fields[k]).strip()
+        # 通用合并（proof_file_type、其他字段）
         for k, v in ai_fields.items():
             if k == "proof_file_type":
                 new_items = v if isinstance(v, list) else ([v] if v and str(v).strip() else [])
@@ -2312,15 +2336,18 @@ def _process_invoice_upload_batch(open_id, user_id, files):
                 merged = list(dict.fromkeys(existing + [str(x).strip() for x in new_items if x and str(x).strip()]))
                 if merged:
                     doc_fields[k] = merged
-            elif v and str(v).strip():
+            elif k != "amount" and v and str(v).strip():
                 doc_fields[k] = v
-        proof_type = _infer_invoice_proof_type(file_name, ai_fields)
-        if not doc_fields.get("proof_file_type"):
-            doc_fields["proof_file_type"] = [proof_type]
-        elif proof_type not in (doc_fields.get("proof_file_type") or []):
-            existing = doc_fields.get("proof_file_type") or []
-            doc_fields["proof_file_type"] = list(dict.fromkeys(existing + [proof_type]))
         file_codes_list.append({"file_code": file_code, "proof_type": proof_type, "file_name": file_name})
+    # 合同+对账单：金额优先取自对账单
+    if amount_from_settlement:
+        doc_fields["amount"] = amount_from_settlement
+    elif amount_from_contract:
+        doc_fields["amount"] = amount_from_contract
+    # 合同字段补充（购方、税号、业务类型等）
+    for k, v in contract_fields.items():
+        if v:
+            doc_fields[k] = v
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
@@ -2347,7 +2374,7 @@ def _process_invoice_upload_batch(open_id, user_id, files):
     summary = "\n".join(lines)
     proof_labels = [f.get("proof_type", "") for f in file_codes_list if f.get("proof_type")]
     proof_desc = "、".join(proof_labels) if proof_labels else "凭证"
-    summary_prefix = f"已接收{proof_desc}（共 {len(file_codes_list)} 个文件）。\n\n已识别：\n{summary or '（无）'}"
+    summary_prefix = f"已接收{proof_desc}（共 {len(file_codes_list)} 个文件）。\n\n**说明**：每次仅支持开一张发票，您上传的所有文件将合并为一张发票的凭证。\n\n已识别：\n{summary or '（无）'}"
     # 仅合同开票时提示风险，建议补充收款/流水/对账单/电商订单等
     proof_set = set(p for p in proof_labels if p)
     if proof_set == {"合同"}:
@@ -2853,7 +2880,8 @@ def on_message(data):
                         }
                     send_message(open_id, "请补充以下信息：\n"
                                  f"开票申请单需要：上传开票凭证\n"
-                                 f"请上传凭证（结算单+合同、合同+银行水单、合同+订单明细、电商发货/收款截图等，Word/PDF/图片均可），我会自动识别类型。")
+                                 f"请上传凭证（结算单+合同、合同+银行水单、合同+订单明细、电商发货/收款截图等，Word/PDF/图片均可），我会自动识别类型。\n\n"
+                                 f"**说明**：每次仅支持开一张发票，您上传的所有文件将合并为一张发票的凭证。")
                     with _state_lock:
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
