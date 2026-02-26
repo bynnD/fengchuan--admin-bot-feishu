@@ -15,12 +15,16 @@ from pathlib import Path
 
 import httpx
 
+from approval_auto_rules import (
+    check_invoice_attachments_with_ai,
+    check_seal_with_ai,
+    collect_file_tokens_from_form,
+)
 from approval_rules_loader import (
     check_auto_approve,
     get_auto_approve_user_ids,
     get_auto_approval_types,
     get_exclude_types,
-    get_seal_type_rules,
 )
 from approval_types import (
     APPROVAL_CODES,
@@ -361,83 +365,6 @@ def get_instance_detail(instance_code, get_token):
     return data.get("data", {}), None
 
 
-def check_seal_with_ai(file_content, file_name, seal_type, get_token):
-    """
-    用印 AI 分析：三点判断
-    1. 文件内容是否合法合规
-    2. 文件内容存在哪些风险点
-    3. 用户选择的用印类型与规则是否匹配
-    file_content: bytes 或 None，为 None 时仅根据文件名/类型推断
-    返回 (can_auto: bool, comment: str, risk_points: list)
-    """
-    from file_extraction import extract_text_from_file
-    from deepseek_client import call_deepseek_with_retry
-
-    seal_rules = get_seal_type_rules()
-    rules_text = "\n".join([f"- {k}：{v}" for k, v in seal_rules.items()])
-
-    file_text = ""
-    if file_content and isinstance(file_content, bytes) and len(file_content) > 10:
-        file_text = extract_text_from_file(file_content, file_name, get_token)
-    has_content = bool(file_text and len(file_text.strip()) > 10)
-    combined = f"文件名：{file_name}\n\n" + (
-        f"文件内容摘要：\n{file_text[:6000]}" if has_content else "（文件内容无法提取，仅根据文件名和类型推断）"
-    )
-
-    prompt = f"""你是一个用印合规审核助手。请对以下文件进行三点分析：
-
-{combined}
-
-用户选择的用印类型：{seal_type}
-
-用印类型与适用文件规则：
-{rules_text}
-
-请严格按以下三点分析，并返回 JSON：
-1. legal_compliant: 文件内容是否合法合规（true/false）
-2. risk_points: 文件内容存在的风险点列表，如无则 []
-3. seal_match: 用户选择的用印类型「{seal_type}」与上述规则是否匹配（true/false）
-4. comment: 综合说明（简短，用于审批意见）
-
-返回格式示例：
-{{"legal_compliant": true, "risk_points": [], "seal_match": true, "comment": "文件合法合规，用印类型匹配。"}}
-
-只返回 JSON，不要其他内容。"""
-
-    try:
-        res = call_deepseek_with_retry(
-            [{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            timeout=30,
-            max_retries=2,
-        )
-        content = res.json()["choices"][0]["message"]["content"].strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        out = json.loads(content)
-        legal = out.get("legal_compliant", False)
-        risks = out.get("risk_points") or []
-        if not isinstance(risks, list):
-            risks = [str(risks)] if risks else []
-        match = out.get("seal_match", False)
-        comment = out.get("comment", "")
-
-        can_auto = legal and match and len(risks) == 0
-        if not can_auto:
-            parts = []
-            if not legal:
-                parts.append("文件内容存在合规问题")
-            if not match:
-                parts.append(f"用印类型「{seal_type}」与文件类型不匹配")
-            if risks:
-                parts.append("风险点：" + "；".join(risks[:5]))
-            comment = "【不符合自动审批规则】" + "；".join(parts) + "。请人工审批。"
-        return can_auto, comment, risks
-    except Exception as e:
-        logger.exception("用印 AI 分析失败: %s", e)
-        return False, f"AI 分析异常：{e}，请人工审批。", ["分析失败"]
-
-
 def query_pending_tasks(user_id, get_token):
     """
     查询指定用户的待审批任务。
@@ -499,20 +426,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         doc_name = fields.get("document_name", "未知")
         doc_type = fields.get("document_type", "")
 
-        file_tokens = []
-        for item in form_list:
-            if item.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file"):
-                val = item.get("value", [])
-                if isinstance(val, list):
-                    for v in val:
-                        if isinstance(v, dict):
-                            tok = v.get("file_token") or v.get("code") or v.get("file_code")
-                            if tok:
-                                file_tokens.append(tok)
-                        elif isinstance(v, str) and v.strip():
-                            file_tokens.append(v.strip())
-                elif val:
-                    file_tokens.append(str(val))
+        file_tokens = collect_file_tokens_from_form(form_list)
 
         file_content = None
         file_name = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
@@ -545,6 +459,37 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
             )
         except Exception as e:
             logger.warning("用印 AI 分析异常: %s", e)
+            add_approval_comment(
+                instance_code,
+                f"【自动审批】AI 分析异常，请人工审批。{e}",
+                get_token,
+            )
+            return
+    elif approval_type == "开票申请单":
+        # 开票申请：AI 分析附件，仅合同则添加评论不处理，其他情况自动通过
+        file_tokens = collect_file_tokens_from_form(form_list)
+        if not file_tokens:
+            add_approval_comment(
+                instance_code,
+                "【自动审批】开票申请单缺少附件，无法进行 AI 分析，请人工审批。",
+                get_token,
+            )
+            return
+        file_contents_with_names = []
+        for i, tok in enumerate(file_tokens[:5]):
+            content, dl_err = _download_approval_file(tok, get_token)
+            fname = f"附件{i+1}.pdf" if content else f"附件{i+1}"
+            file_contents_with_names.append((content or b"", fname))
+        try:
+            only_contract, comment = check_invoice_attachments_with_ai(file_contents_with_names, get_token)
+            if only_contract:
+                add_approval_comment(instance_code, comment, get_token)
+                return
+            can_auto = True
+            comment = comment or "开票申请单已核实，已自动审批通过。"
+            risks = []
+        except Exception as e:
+            logger.warning("开票 AI 分析异常: %s", e)
             add_approval_comment(
                 instance_code,
                 f"【自动审批】AI 分析异常，请人工审批。{e}",
