@@ -1,10 +1,10 @@
 # 自动审批规则配置
-# 总开关由用户 531dcb19 通过对话控制，此处为首次部署默认值
+# 总开关由用户 723eg4a6 通过对话控制，此处为首次部署默认值
 default_enabled: false
 
 # 启用自动审批的审批人 user_id 列表
 auto_approve_user_ids:
-  - "531dcb19"
+  - "723eg4a6"
 
 # 不参与自动审批的工单类型
 exclude_types:
