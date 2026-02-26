@@ -1512,9 +1512,10 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             ext = (fname.rsplit(".", 1)[-1] or "").lower()
             doc_type = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}.get(ext, ext.upper() if ext else "")
             doc_fields = {"document_name": doc_name, "document_count": "1", "document_type": doc_type}
-            if i == 0 and extractor and DEEPSEEK_API_KEY:
-                first_ai = extractor(file_content, fname, {"company": opts.get("company"), "seal_type": seal_opts}, get_token) or {}
-            doc_fields.update(first_ai)
+            # 每个文件单独提取：用印公司、印章类型、用印事由等，避免后续文件误用首文件的值
+            if extractor and DEEPSEEK_API_KEY:
+                ai_fields = extractor(file_content, fname, {"company": opts.get("company"), "seal_type": seal_opts}, get_token) or {}
+                doc_fields.update(ai_fields)
             for k, v in (initial_fields or {}).items():
                 if v and str(v).strip() and k not in ("usage_method",):
                     doc_fields[k] = str(v).strip()
@@ -1675,14 +1676,10 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
     if not items or len(items) != len(selections):
         send_message(open_id, "数据异常，请重新发起用印申请单。")
         return
-    # 取首文件的 seal_type、reason 等作为基准，每行用各自的 doc_fields + selection
-    base = dict(items[0]["doc_fields"])
-    base.pop("lawyer_reviewed", None)
-    base.pop("usage_method", None)
-    base.pop("document_count", None)
+    # 每行仅用该文件自身的 doc_fields + selection，避免后续文件误用首文件的值
     rows = []
     for i, (item, sel) in enumerate(zip(items, selections)):
-        df = {**base, **item["doc_fields"], **sel}
+        df = {**item["doc_fields"], **sel}
         resolved_usage = _resolve_radio_option_for_seal("widget17334699216260001", sel.get("usage_method", "纸质章"), default_first=True)
         resolved_seal = _resolve_radio_option_for_seal("widget15754438920110001", df.get("seal_type", ""), default_first=True)
         lawyer_val = "已审核" if str(sel.get("lawyer_reviewed", "")).strip() in ("是", "yes", "已审核") else "未审核"
@@ -1699,8 +1696,11 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
             "律师是否已审核": resolved_lawyer or lawyer_val,
             "上传用章文件": [item["file_code"]],
         })
-    all_fields = {**base, "seal_detail": rows}
+    all_fields = {"seal_detail": rows}
     all_fields.setdefault("document_name", "、".join(r["文件名称"] for r in rows[:3]) + (" 等" if len(rows) > 3 else ""))
+    # 工单级字段（若表单需要）：用首文件的 company
+    if items[0]["doc_fields"].get("company"):
+        all_fields["company"] = items[0]["doc_fields"]["company"]
     # 附件已在每行 上传用章文件 中，无需单独传 file_codes
     success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=None)
     with _state_lock:
