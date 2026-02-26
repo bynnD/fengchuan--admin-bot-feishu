@@ -179,6 +179,89 @@ def _is_cancel_intent(text):
     return any(p in t for p in CANCEL_PHRASES)
 
 
+def _parse_file_intents(text, file_count):
+    """
+    解析「第一个用印、第二个开票」等分别指定意图。
+    返回 {0: "用印", 1: "开票"} 或 None（无法解析时）。
+    支持：第1个用印、第一个文件用印、1用印、第2个开票 等。
+    """
+    if not text or file_count < 2:
+        return None
+    import re
+    # 按逗号、顿号、分号、空格分割
+    parts = re.split(r"[,，、;；\s]+", text)
+    intents = {}
+    ord_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        intent = None
+        if "用印" in part or "盖章" in part:
+            intent = "用印"
+        elif "开票" in part:
+            intent = "开票"
+        if not intent:
+            continue
+        # 解析序号：第X个、第X、X个
+        m = re.search(r"第?([一二三四五12345])个?", part) or re.search(r"^([12345])", part)
+        if m:
+            idx = ord_map.get(m.group(1), 1) - 1  # 转为 0-based
+            if 0 <= idx < file_count:
+                intents[idx] = intent
+        elif len(intents) == 0 and file_count == 1:
+            intents[0] = intent
+    if not intents or not all(0 <= i < file_count for i in intents):
+        return None
+    # 未指定意图的文件沿用前一个，或默认用印
+    last = "用印"
+    for i in range(file_count):
+        if i in intents:
+            last = intents[i]
+        else:
+            intents[i] = last
+    return intents
+
+
+def _handle_split_file_intents(open_id, user_id, files_list, intents):
+    """按意图拆分文件分别处理：部分用印、部分开票"""
+    with _state_lock:
+        entry = PENDING_FILE_UNCLEAR.pop(open_id, None)
+        if entry and entry.get("timer"):
+            try:
+                entry["timer"].cancel()
+            except Exception:
+                pass
+    seal_files = [f for i, f in enumerate(files_list) if intents.get(i) == "用印"]
+    invoice_files = [f for i, f in enumerate(files_list) if intents.get(i) == "开票"]
+    if seal_files:
+        with _state_lock:
+            SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
+        _handle_file_message(open_id, user_id, None, None, files_list=seal_files)
+    if invoice_files:
+        with _state_lock:
+            PENDING_INVOICE[open_id] = {
+                "step": "need_settlement",
+                "settlement_file_code": None,
+                "contract_file_code": None,
+                "doc_fields": {},
+                "user_id": user_id,
+                "created_at": time.time(),
+            }
+        f0 = invoice_files[0]
+        if len(invoice_files) == 1:
+            _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
+        else:
+            send_message(open_id, "开票申请每次仅支持一个文件，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
+            _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
+    if seal_files and invoice_files:
+        send_message(open_id, f"已接收：{len(seal_files)} 份用印、{len(invoice_files)} 份开票，将分别处理。")
+    elif seal_files:
+        send_message(open_id, f"已接收 {len(seal_files)} 份用印文件，正在处理。")
+    elif invoice_files:
+        send_message(open_id, f"已接收 {len(invoice_files)} 份开票文件，正在处理。")
+
+
 def download_message_file(message_id, file_key, file_type="file"):
     """从飞书消息下载文件。返回 (content, None) 成功，(None, 错误信息) 失败"""
     try:
@@ -1198,8 +1281,8 @@ def _value_to_text(val, options):
     return val
 
 
-def _form_summary(form_list, cached):
-    """根据实际提交的表单和缓存的字段名生成摘要，radioV2 显示 text 而非 value"""
+def _form_summary(form_list, cached, approval_type=None):
+    """根据实际提交的表单和缓存的字段名生成摘要，radioV2 显示 text 而非 value，附件显示「已上传」"""
     lines = []
     for item in form_list:
         fid = item.get("id", "")
@@ -1212,7 +1295,7 @@ def _form_summary(form_list, cached):
                 s = str(val.get("start", "")).split("T")[0]
                 e = str(val.get("end", "")).split("T")[0]
                 lines.append(f"· {name}: {s} 至 {e}")
-        elif ftype in ("attach", "attachV2", "image", "imageV2"):
+        elif ftype in ("attach", "attachV2", "image", "imageV2", "attachmentV2", "attachment"):
             continue
         elif ftype in ("radioV2", "radio"):
             val = item.get("value", "")
@@ -1222,9 +1305,36 @@ def _form_summary(form_list, cached):
         elif ftype == "fieldList":
             val = item.get("value", [])
             if val and isinstance(val, list) and isinstance(val[0], list):
+                sub_fields = info.get("sub_fields", [])
+                if not sub_fields and approval_type:
+                    rev_fallback = {v: k for k, v in (FIELD_ID_FALLBACK.get(approval_type) or {}).items()}
+                    logical_key = rev_fallback.get(fid)
+                    sub_fields = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key, [])
+                sf_map = {sf.get("id"): sf for sf in sub_fields if sf.get("id")} if sub_fields else {}
+                approval_code = APPROVAL_CODES.get(approval_type, "") if approval_type else ""
                 lines.append(f"· {name}:")
                 for i, row in enumerate(val):
-                    parts = [f"{c.get('value','')}" for c in row if c.get("value")]
+                    parts = []
+                    for c in row:
+                        if not isinstance(c, dict):
+                            continue
+                        cid = c.get("id", "")
+                        cval = c.get("value")
+                        ctype = c.get("type", "input")
+                        sf_info = sf_map.get(cid, {})
+                        if sf_info:
+                            ctype = sf_info.get("type", ctype)
+                        if ctype in ("radioV2", "radio"):
+                            opts = sf_info.get("options", [])
+                            if not opts and approval_type and approval_code and cid:
+                                opts = get_sub_field_options(approval_type, cid, approval_code, get_token)
+                            display = _value_to_text(cval, opts) if cval else ""
+                        elif ctype in ("attach", "attachV2", "attachmentV2", "attachment", "image", "imageV2"):
+                            display = "已上传" if cval else ""
+                        else:
+                            display = str(cval) if cval else ""
+                        if display:
+                            parts.append(display)
                     if parts:
                         lines.append(f"  {i+1}. {', '.join(parts)}")
         else:
@@ -1281,7 +1391,7 @@ def create_approval(user_id, approval_type, fields, file_codes=None):
     form_data = json.dumps(form_list, ensure_ascii=False)
     logger.info("提交表单[%s]: %s", approval_type, form_data)
 
-    summary = _form_summary(form_list, cached or {})
+    summary = _form_summary(form_list, cached or {}, approval_type)
 
     res = httpx.post(
         "https://open.feishu.cn/open-apis/approval/v4/instances",
@@ -1368,10 +1478,23 @@ SEAL_OPTION_FIELDS = {
 SEAL_DOC_TYPE_OTHER_VALUE = "mk4u3uw5-guo071d9k5m-1"
 
 
+# 文件类型业务关键词 → 优先匹配的选项文本片段（结算单、合作协议等识别为业务类型，非「保密协议等特殊交办」）
+SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
+    ("结算单", "结算单"),
+    ("合作协议", "协议"),
+    ("合作框架", "框架"),
+    ("合同", "合同"),
+    ("框架协议", "框架"),
+    ("采购合同", "合同"),
+    ("服务协议", "协议"),
+]
+
+
 def _resolve_document_type_for_seal(document_type):
     """
     将 document_type 解析为用印表单「文件类型」控件的有效选项值。
     表单选项为业务分类（如 NBBOSS代理商结算单、其他等），非文件格式。
+    结算单、合作协议等识别为业务类型；保密协议等匹配「保密协议等特殊交办文件」。
     当值为 PDF/Word 等文件格式或不在选项中时，使用「其他」选项。
     """
     opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token)
@@ -1390,6 +1513,22 @@ def _resolve_document_type_for_seal(document_type):
             return opt_val or opt_text
         if raw and raw in (opt_text, opt_val):
             return opt_val or opt_text
+    # 业务类型模糊匹配：结算单、合作协议等 → 匹配选项中包含对应关键词的选项
+    for kw_in_raw, kw_in_opt in SEAL_DOC_TYPE_BUSINESS_KEYWORDS:
+        if kw_in_raw in raw:
+            for o in opts:
+                if not isinstance(o, dict):
+                    continue
+                opt_text = str(o.get("text", "") or o.get("value", ""))
+                if kw_in_opt in opt_text and "保密" not in opt_text and "特殊交办" not in opt_text:
+                    return o.get("value") or o.get("key", "") or opt_text
+    # 保密协议等 → 匹配「保密协议等特殊交办文件」
+    if "保密" in raw or "特殊交办" in raw:
+        for o in opts:
+            if isinstance(o, dict):
+                t = str(o.get("text", "") or o.get("value", ""))
+                if "保密" in t or "特殊交办" in t:
+                    return o.get("value") or o.get("key", "") or t
     # 文件格式（PDF、Word 等）或无效值：使用「其他」选项
     for o in opts:
         if isinstance(o, dict):
@@ -2223,11 +2362,33 @@ def on_message(data):
                 CONVERSATIONS[open_id].append({"role": "user", "content": text})
                 if len(CONVERSATIONS[open_id]) > 10:
                     CONVERSATIONS[open_id] = CONVERSATIONS[open_id][-10:]
+            text_stripped = text.strip()
+            files_list = pending_file.get("files", [])
+            # 1. 用户明确回复「用印」或「开票」时直接采用，避免历史对话导致 AI 仍返回两者造成死循环
+            if text_stripped in ("用印", "开票"):
+                needs_seal = (text_stripped == "用印")
+                needs_invoice = (text_stripped == "开票")
+                requests = [{"approval_type": "用印申请单" if needs_seal else "开票申请", "fields": {}}]
+            else:
+                # 2. 尝试解析「第一个用印、第二个开票」等分别指定
+                intents = _parse_file_intents(text_stripped, len(files_list))
+                if intents is not None:
+                    needs_seal = needs_invoice = False
+                    for idx, intent in intents.items():
+                        if intent == "用印":
+                            needs_seal = True
+                        elif intent == "开票":
+                            needs_invoice = True
+                    if needs_seal or needs_invoice:
+                        # 分别处理：按意图拆分文件
+                        _handle_split_file_intents(open_id, user_id, files_list, intents)
+                        return
+                # 3. 否则调用 AI 分析
                 conv_copy = list(CONVERSATIONS[open_id])
-            result = analyze_message(conv_copy)
-            requests = result.get("requests", [])
-            needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests)
-            needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
+                result = analyze_message(conv_copy)
+                requests = result.get("requests", [])
+                needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests)
+                needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
             if needs_seal and not needs_invoice:
                 files_list = pending_file.get("files", [])
                 with _state_lock:
