@@ -68,6 +68,9 @@ FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
 
 # 限流：每用户最小间隔（秒）
 RATE_LIMIT_SEC = 2
+# 开票选项卡片发卡去重：同一用户 3 秒内不重复发卡
+_invoice_card_last_sent = {}  # open_id -> timestamp
+INVOICE_CARD_DEDUP_SEC = 3
 
 # 取消/重置意图关键词
 CANCEL_PHRASES = ("取消", "算了", "不办了", "重新来", "重置", "不要了", "放弃", "不弄了")
@@ -699,7 +702,7 @@ def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None, 
 
 
 def _update_invoice_card_delayed(token, open_id, card, delay_sec=0.08):
-    """延时更新开票选项卡片以显示选中状态"""
+    """延时更新开票选项卡片以显示选中状态。当前未使用（card/update 可能导致重复发卡，已改为仅 toast）"""
     if not token or not open_id or not card:
         return
     time.sleep(delay_sec)
@@ -1001,7 +1004,7 @@ def on_card_action_confirm(data):
             threading.Thread(target=_do_seal_queue_async, daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
 
-        # 开票选项卡片：发票类型、开票项目
+        # 开票选项卡片：发票类型、开票项目（仅保存选项，不更新卡片，避免飞书 card/update 导致重复发卡）
         if value.get("action") == "invoice_option":
             field = value.get("field")
             val = value.get("value")
@@ -1013,23 +1016,6 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新发起开票申请单"}})
             pending["doc_fields"][field] = val
             pending["created_at"] = time.time()
-            update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
-            if update_token:
-                doc = dict(pending["doc_fields"])
-                def _fmt(v):
-                    return "、".join(str(x) for x in v) if isinstance(v, list) else v
-                order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
-                lines = []
-                for k in order:
-                    if k in doc and doc[k] and k not in ("invoice_type", "invoice_items"):
-                        lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt(doc[k])}")
-                for k, v in doc.items():
-                    if k not in order and v and k not in ("invoice_type", "invoice_items"):
-                        lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt(v)}")
-                summary = "\n".join(lines)
-                summary_prefix = f"已接收凭证。\n\n已识别：\n{summary or '（无）'}"
-                card = _build_invoice_options_card(doc, summary_prefix)
-                threading.Thread(target=lambda t=update_token, oid=open_id, c=card: _update_invoice_card_delayed(t, oid, c), daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
         # 开票确认提交：选项选完后点击
@@ -2366,6 +2352,13 @@ def _process_invoice_upload_batch(open_id, user_id, files):
     proof_set = set(p for p in proof_labels if p)
     if proof_set == {"合同"}:
         summary_prefix += "\n\n⚠️ **风险提示**：当前仅提供合同，建议补充收款记录、银行流水、盖章确认的对账单或电商平台订单等凭证，以降低开票风险。"
+    # 发卡去重：3 秒内不重复发送，避免事件重试等导致重复发卡
+    now = time.time()
+    with _state_lock:
+        last = _invoice_card_last_sent.get(open_id, 0)
+        if now - last < INVOICE_CARD_DEDUP_SEC:
+            logger.info("开票选项卡片去重跳过: open_id=%s 距上次 %.1fs", open_id, now - last)
+            return
     card = _build_invoice_options_card(doc_fields, summary_prefix)
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
@@ -2377,7 +2370,10 @@ def _process_invoice_upload_batch(open_id, user_id, files):
         .request_body(body) \
         .build()
     resp = client.im.v1.message.create(request)
-    if not resp.success():
+    if resp.success():
+        with _state_lock:
+            _invoice_card_last_sent[open_id] = now
+    else:
         logger.error("发送开票选项卡片失败: %s", resp.msg)
         send_message(open_id, f"已接收 {len(file_codes_list)} 个凭证。\n\n已识别：\n{summary or '（无）'}\n\n请补充：发票类型、开票项目。")
 
