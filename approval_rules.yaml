@@ -38,7 +38,7 @@ rules:
     enabled: true
     pass_comment: "开票申请已核实，已自动审批通过。"
 
-  用印申请:
+  用印申请单:
     enabled: true
     ai_check: true
-    pass_comment: "用印申请已核实，文件类型与用印类型匹配，已自动审批通过。"
+    pass_comment: "用印申请单已核实，文件类型与用印类型匹配，已自动审批通过。"

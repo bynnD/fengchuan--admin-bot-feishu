@@ -46,7 +46,7 @@ def get_admin_comment(fields):
    - 内部调用 `file_extraction.extract_text_from_file()` 获取文本（含飞书 OCR 识别图片/扫描件）
    - 根据业务用 AI 从文本中提取字段，返回 `{字段名: 值}`
 
-参考 `seal.py`（用印申请）的实现。
+参考 `seal.py`（用印申请单）的实现。
 
 ## 删除工单类型
 

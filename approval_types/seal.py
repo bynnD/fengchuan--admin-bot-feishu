@@ -8,8 +8,8 @@ from deepseek_client import call_deepseek_with_retry
 
 logger = logging.getLogger(__name__)
 
-NAME = "用印申请"
-APPROVAL_CODE = "58F1B962-73D4-408F-8B1B-3FB1776CF2B8"
+NAME = "用印申请单"
+APPROVAL_CODE = "A0FF356F-AF36-4781-8785-309FB6D5CE50"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 有附件识别读取需求，使用通用文件内容提取（含 OCR）
 
@@ -49,7 +49,7 @@ FIELD_NAME_ALIASES = {
     "用印事由": "reason",
 }
 
-# 表格主字段 ID（58F1B962 审批定义 - 明细 fieldList）
+# 表格主字段 ID（用印申请单 - 明细 fieldList）
 FIELD_ID_FALLBACK = {
     "seal_detail":     "widget17719721160210001",   # 明细 fieldList
 }

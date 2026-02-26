@@ -113,7 +113,7 @@ def check_auto_approve(approval_type, fields):
         return True, type_rules.get("pass_comment", "已核实，已自动审批通过。"), []
 
     # 用印：需要 AI 分析，此处仅返回需 AI 检查的标记，实际判断在 approval_auto 中
-    if approval_type == "用印申请" and type_rules.get("ai_check"):
+    if approval_type == "用印申请单" and type_rules.get("ai_check"):
         # 由 approval_auto 模块调用 seal AI 分析后决定
         return None, type_rules.get("pass_comment", ""), []  # None 表示需 AI 检查
 

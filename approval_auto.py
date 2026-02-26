@@ -428,8 +428,8 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     cached = get_form_fields(approval_type, approval_code, get_token)
     fields = parse_form_to_fields(approval_type, form_list, cached, get_token)
 
-    # 用印申请：需要 AI 分析附件
-    if approval_type == "用印申请":
+    # 用印申请单：需要 AI 分析附件
+    if approval_type == "用印申请单":
         seal_type = fields.get("seal_type", "")
         doc_name = fields.get("document_name", "未知")
         doc_type = fields.get("document_type", "")
@@ -454,7 +454,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         if not file_tokens:
             add_approval_comment(
                 instance_code,
-                "【自动审批】用印申请缺少附件，无法进行 AI 分析，请人工审批。",
+                "【自动审批】用印申请单缺少附件，无法进行 AI 分析，请人工审批。",
                 get_token,
             )
             return
@@ -470,7 +470,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         if not seal_type:
             add_approval_comment(
                 instance_code,
-                "【自动审批】用印申请缺少印章类型，请人工审批。",
+                "【自动审批】用印申请单缺少印章类型，请人工审批。",
                 get_token,
             )
             return

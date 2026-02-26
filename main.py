@@ -129,7 +129,7 @@ def _clean_expired_pending(open_id=None):
         for oid in list(PENDING_SEAL.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL else []):
             if oid in PENDING_SEAL and now - PENDING_SEAL[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_SEAL[oid]
-                to_notify.append((oid, "用印申请已超时，请重新发起。"))
+                to_notify.append((oid, "用印申请单已超时，请重新发起。"))
         for oid in list(PENDING_INVOICE.keys()) if open_id is None else ([open_id] if open_id in PENDING_INVOICE else []):
             if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_INVOICE[oid]
@@ -137,7 +137,7 @@ def _clean_expired_pending(open_id=None):
         for oid in list(PENDING_SEAL_QUEUE.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL_QUEUE else []):
             if oid in PENDING_SEAL_QUEUE and now - PENDING_SEAL_QUEUE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_SEAL_QUEUE[oid]
-                to_notify.append((oid, "用印申请已超时，请重新发起。"))
+                to_notify.append((oid, "用印申请单已超时，请重新发起。"))
         for oid in list(SEAL_INITIAL_FIELDS.keys()) if open_id is None else ([open_id] if open_id in SEAL_INITIAL_FIELDS else []):
             data = SEAL_INITIAL_FIELDS.get(oid)
             created = data.get("created_at", 0) if isinstance(data, dict) else 0
@@ -345,7 +345,7 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
 
 
 def send_file_intent_options_card(open_id, file_names):
-    """发送文件意图选择卡片：用印申请 / 开票申请，3 分钟内未说明意图时使用。file_names 可为 str 或 list"""
+    """发送文件意图选择卡片：用印申请单 / 开票申请，3 分钟内未说明意图时使用。file_names 可为 str 或 list"""
     if isinstance(file_names, list):
         names_str = "、".join(f"「{n}」" for n in file_names)
     else:
@@ -359,8 +359,8 @@ def send_file_intent_options_card(open_id, file_names):
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": text}},
             {"tag": "action", "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": "用印申请（盖章）"}, "type": "primary",
-                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "用印申请"}}]},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "用印申请单（盖章）"}, "type": "primary",
+                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "用印申请单"}}]},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "开票申请"}, "type": "default",
                  "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "开票申请"}}]},
             ]},
@@ -656,7 +656,7 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
-        # 文件意图选择卡片：用印申请 / 开票申请（3 分钟内未说明意图时弹出）
+        # 文件意图选择卡片：用印申请单 / 开票申请（3 分钟内未说明意图时弹出）
         if value.get("action") == "file_intent":
             intent = value.get("intent", "")
             with _state_lock:
@@ -668,13 +668,13 @@ def on_card_action_confirm(data):
                         pass
             if not pending_file or not pending_file.get("files"):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
-            if intent == "用印申请":
+            if intent == "用印申请单":
                 files_list = pending_file.get("files", [])
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
                 if files_list:
                     threading.Thread(target=lambda: _handle_file_message(open_id, user_id, None, None, files_list=files_list), daemon=True).start()
-                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请，正在处理"}})
+                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请单，正在处理"}})
             if intent == "开票申请":
                 files_list = pending_file.get("files", [])
                 with _state_lock:
@@ -871,7 +871,7 @@ def analyze_message(history):
         f"可处理的审批类型：\n{approval_list}\n\n"
         f"各类型需要的字段：\n{field_hints}\n\n"
         f"【关键】分析用户最新消息，可能包含一个或多个审批需求，分别识别并提取。"
-        f"例如「我要采购笔记本，还要给合同盖章」= 采购申请 + 用印申请。"
+        f"例如「我要采购笔记本，还要给合同盖章」= 采购申请 + 用印申请单。"
         f"每个需求单独列出，每个需求的 fields 和 missing 独立。\n\n"
         f"重要规则：\n"
         f"1. 尽量从用户消息中推算字段，不要轻易列为missing\n"
@@ -886,7 +886,7 @@ def analyze_message(history):
         f"purchase_type(采购类别)可根据采购物品自动推断，如办公电脑、办公桌→办公用品，设备、机器→设备类等。\n"
         f"7. 招待/团建物资领用：item_detail是物品明细列表(必填)，每项含名称、数量。"
         f"格式为[{{\"名称\":\"矿泉水\",\"数量\":\"2\"}}]。缺少名称或数量任一项就把item_detail列入missing。\n"
-        f"8. 用印申请：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
+        f"8. 用印申请单：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
         f"document_name/document_type不需要用户说，会从上传文件自动获取。"
         f"lawyer_reviewed(律师是否已审核)必须用户明确提供「是」或「否」，未明确说明则放入 missing。"
         f"若用户明确说「盖公章」「要盖公章」「公章」等，必须将 seal_type 提取为「公章」，不要放入 missing。"
@@ -931,7 +931,7 @@ _FIELDLIST_ALIAS = {
     "数量": ["quantity", "qty", "count", "num"],
     "金额": ["amount", "price", "cost", "单价", "总价", "费用"],
     "是否有库存": ["has_stock", "in_stock", "库存", "stock"],
-    # 用印申请表格结构
+    # 用印申请单表格结构
     "文件名称": ["document_name", "doc_name", "文件名"],
     "文件类型": ["document_type", "doc_type", "类型"],
     "用印公司": ["company", "公司"],
@@ -1035,7 +1035,7 @@ def build_form(approval_type, fields, token, file_codes=None):
         if field_type in ("attach", "attachV2", "image", "imageV2", "attachmentV2", "attachment", "file"):
             files = file_codes.get(field_id)
             if not files and file_codes:
-                # 用印申请等：传入的 file_codes 可能用固定 ID，实际表单的附件字段 ID 可能不同
+                # 用印申请单等：传入的 file_codes 可能用固定 ID，实际表单的附件字段 ID 可能不同
                 files = next(iter(file_codes.values()), None)
             if files:
                 # 飞书附件字段 value 需为文件 code 数组
@@ -1088,7 +1088,7 @@ def build_form(approval_type, fields, token, file_codes=None):
             opts = field_info.get("options", [])
             if opts and isinstance(opts, list):
                 raw_str = str(raw).strip()
-                # 用印申请「律师是否已审核」：表单选项为「已审核/未审核」，用户说「是/否」时需映射
+                # 用印申请单「律师是否已审核」：表单选项为「已审核/未审核」，用户说「是/否」时需映射
                 if logical_key == "lawyer_reviewed" and raw_str in ("是", "yes"):
                     raw_str = "已审核"
                 elif logical_key == "lawyer_reviewed" and raw_str in ("否", "no"):
@@ -1290,7 +1290,7 @@ def _on_message_read(_data):
 
 
 PENDING_SEAL = {}
-# 用印申请：用户首次消息中已提取的字段，等收到文件后合并。结构 {open_id: {"fields": {...}, "created_at": ts}}
+# 用印申请单：用户首次消息中已提取的字段，等收到文件后合并。结构 {open_id: {"fields": {...}, "created_at": ts}}
 SEAL_INITIAL_FIELDS = {}
 
 # 限流：open_id -> 上次消息时间
@@ -1305,7 +1305,7 @@ CONFIRM_TTL = 15 * 60  # 15 分钟
 
 ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
-# 用印申请选项字段（表格结构时选项在 sub_fields 内，此处作 fallback）
+# 用印申请单选项字段（表格结构时选项在 sub_fields 内，此处作 fallback）
 SEAL_OPTION_FIELDS = {
     "usage_method": "widget17334699216260001",   # 盖章形式：纸质章/电子章/外带印章
     "seal_type": "widget15754438920110001",     # 印章类型
@@ -1324,10 +1324,10 @@ def _resolve_document_type_for_seal(document_type):
     表单选项为业务分类（如 NBBOSS代理商结算单、其他等），非文件格式。
     当值为 PDF/Word 等文件格式或不在选项中时，使用「其他」选项。
     """
-    opts = get_sub_field_options("用印申请", "widget17334700336550001", APPROVAL_CODES["用印申请"], get_token)
+    opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token)
     if not opts:
-        invalidate_cache("用印申请")  # 旧缓存可能无 sub_field options，清除后下次重试
-        opts = get_sub_field_options("用印申请", "widget17334700336550001", APPROVAL_CODES["用印申请"], get_token)
+        invalidate_cache("用印申请单")  # 旧缓存可能无 sub_field options，清除后下次重试
+        opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token)
     if not opts:
         return SEAL_DOC_TYPE_OTHER_VALUE
     raw = str(document_type or "").strip()
@@ -1355,10 +1355,10 @@ def _resolve_radio_option_for_seal(field_id, raw_value, default_first=True):
     将文本值解析为用印表单 radioV2 控件的有效 option value。
     用于 seal_type、usage_method 等 fieldList 子字段。
     """
-    opts = get_sub_field_options("用印申请", field_id, APPROVAL_CODES["用印申请"], get_token)
+    opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token)
     if not opts:
-        invalidate_cache("用印申请")
-        opts = get_sub_field_options("用印申请", field_id, APPROVAL_CODES["用印申请"], get_token)
+        invalidate_cache("用印申请单")
+        opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token)
     if not opts:
         return ""
     raw = str(raw_value or "").strip()
@@ -1377,9 +1377,9 @@ def _resolve_radio_option_for_seal(field_id, raw_value, default_first=True):
 
 
 def _get_seal_form_options():
-    """从工单模版读取用印申请的选项，返回 {逻辑键: [选项文本列表]}"""
+    """从工单模版读取用印申请单的选项，返回 {逻辑键: [选项文本列表]}"""
     token = get_token()
-    cached = get_form_fields("用印申请", APPROVAL_CODES["用印申请"], token)
+    cached = get_form_fields("用印申请单", APPROVAL_CODES["用印申请单"], token)
     if not cached:
         return {}
     result = {}
@@ -1435,7 +1435,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         # 多文件排队模式：先出第1张卡，选完「下一份」出第2张，全部选完出「提交工单」
         opts = _get_seal_form_options()
         seal_opts = opts.get("seal_type", ["公章", "合同章", "法人章", "财务章"])
-        extractor = get_file_extractor("用印申请")
+        extractor = get_file_extractor("用印申请单")
         with _state_lock:
             data = SEAL_INITIAL_FIELDS.pop(open_id, {})
         initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
@@ -1525,7 +1525,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
     lawyer_opts = opts.get("lawyer_reviewed", ["是", "否"])
 
     # 合并：文件基础信息 + 文件内容 AI 识别（使用通用提取器，含 OCR，适用所有有附件识别需求的工单）+ 首次消息已提取字段（后者优先）
-    extractor = get_file_extractor("用印申请")
+    extractor = get_file_extractor("用印申请单")
     if not extractor:
         logger.warning("用印提取: 未找到 extractor，请检查 approval_types 注册")
     if not DEEPSEEK_API_KEY:
@@ -1623,7 +1623,7 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
 def _do_create_seal_multi(open_id, user_id, items, selections):
     """多文件排队完成后，合并为一张工单。items=[{file_name, file_code, doc_fields}, ...], selections=[{lawyer_reviewed, usage_method, document_count}, ...]"""
     if not items or len(items) != len(selections):
-        send_message(open_id, "数据异常，请重新发起用印申请。")
+        send_message(open_id, "数据异常，请重新发起用印申请单。")
         return
     # 取首文件的 seal_type、reason 等作为基准，每行用各自的 doc_fields + selection
     base = dict(items[0]["doc_fields"])
@@ -1652,7 +1652,7 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
     all_fields = {**base, "seal_detail": rows}
     all_fields.setdefault("document_name", "、".join(r["文件名称"] for r in rows[:3]) + (" 等" if len(rows) > 3 else ""))
     # 附件已在每行 上传用章文件 中，无需单独传 file_codes
-    success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=None)
+    success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=None)
     with _state_lock:
         if open_id in PENDING_SEAL_QUEUE:
             del PENDING_SEAL_QUEUE[open_id]
@@ -1662,15 +1662,15 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            send_card_message(open_id, f"【用印申请】\n{summary}\n\n工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+            send_card_message(open_id, f"【用印申请单】\n{summary}\n\n工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
         else:
-            send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}")
+            send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
     else:
         send_message(open_id, f"提交失败：{msg}")
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False):
-    """用印申请字段齐全时，发送确认卡片，用户点击确认后创建工单。direct_create=True 时直接创建不弹确认卡。表单为 fieldList 表格结构。"""
+    """用印申请单字段齐全时，发送确认卡片，用户点击确认后创建工单。direct_create=True 时直接创建不弹确认卡。表单为 fieldList 表格结构。"""
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "纸质章")
     all_fields.setdefault("document_count", "1")
@@ -1701,7 +1701,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
             del PENDING_SEAL[open_id]
 
     if direct_create:
-        success, msg, resp_data, summary = create_approval(user_id, "用印申请", all_fields, file_codes=codes)
+        success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=codes)
         if success:
             with _state_lock:
                 if open_id in CONVERSATIONS:
@@ -1709,22 +1709,22 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
             instance_code = resp_data.get("instance_code", "")
             if instance_code:
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                send_card_message(open_id, f"【用印申请】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                send_card_message(open_id, f"【用印申请单】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
-                send_message(open_id, f"· 用印申请：✅ 已提交\n{summary}")
+                send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
         else:
             send_message(open_id, f"提交失败：{msg}")
         return
 
     fc = {"widget15828104903330001": codes} if codes else {}
-    admin_comment = get_admin_comment("用印申请", all_fields)
-    summary = format_fields_summary(all_fields, "用印申请")
-    send_confirm_card(open_id, "用印申请", summary, admin_comment, user_id, all_fields, file_codes=fc)
+    admin_comment = get_admin_comment("用印申请单", all_fields)
+    summary = format_fields_summary(all_fields, "用印申请单")
+    send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc)
     send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
 
 
 def _try_complete_seal(open_id, user_id, text):
-    """用户发送补充信息后，合并文件字段+用户字段，创建用印申请"""
+    """用户发送补充信息后，合并文件字段+用户字段，创建用印申请单"""
     with _state_lock:
         pending = PENDING_SEAL.get(open_id)
     if not pending:
@@ -1734,7 +1734,7 @@ def _try_complete_seal(open_id, user_id, text):
         with _state_lock:
             if open_id in PENDING_SEAL:
                 del PENDING_SEAL[open_id]
-        send_message(open_id, "已取消用印申请，如需办理请重新发起。")
+        send_message(open_id, "已取消用印申请单，如需办理请重新发起。")
         return True
 
     doc_fields = pending["doc_fields"]
@@ -1762,7 +1762,7 @@ def _try_complete_seal(open_id, user_id, text):
     lawyer_hint = f"（选项：{'/'.join(opts.get('lawyer_reviewed', ['是','否']))}，必填，用户必须明确选择）"
 
     prompt = (
-        f"用户为用印申请补充了以下信息：\n{text}\n\n"
+        f"用户为用印申请单补充了以下信息：\n{text}\n\n"
         f"请提取并返回JSON，包含：\n"
         f"- company: 用印公司{company_hint}（用户未提及则不返回，保留文件识别结果）\n"
         f"- seal_type: 印章类型{seal_hint}（用户未提及则不返回，保留文件识别结果）\n"
@@ -2085,7 +2085,7 @@ def on_message(data):
             if is_invoice:
                 _handle_invoice_file(open_id, user_id, message_id, content_json)
             elif is_seal or in_seal_queue:
-                send_message(open_id, "您当前有用印申请待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。")
+                send_message(open_id, "您当前有用印申请单待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。")
             elif expects_seal:
                 # 收集文件并防抖，多文件时批量进入排队模式（先出第1张卡，点「下一份」出第2张，最后「提交工单」）
                 file_name = content_json.get("file_name", "未知文件")
@@ -2115,7 +2115,7 @@ def on_message(data):
                     })
                     PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
                 count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
-                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
                 _schedule_file_intent_card(open_id)
             return
 
@@ -2176,7 +2176,7 @@ def on_message(data):
                 conv_copy = list(CONVERSATIONS[open_id])
             result = analyze_message(conv_copy)
             requests = result.get("requests", [])
-            needs_seal = any(r.get("approval_type") == "用印申请" for r in requests)
+            needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests)
             needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
             if needs_seal and not needs_invoice:
                 files_list = pending_file.get("files", [])
@@ -2187,7 +2187,7 @@ def on_message(data):
                             entry["timer"].cancel()
                         except Exception:
                             pass
-                req_seal = next((r for r in requests if r.get("approval_type") == "用印申请"), None)
+                req_seal = next((r for r in requests if r.get("approval_type") == "用印申请单"), None)
                 if req_seal and req_seal.get("fields"):
                     with _state_lock:
                         SEAL_INITIAL_FIELDS[open_id] = {"fields": req_seal["fields"], "created_at": time.time()}
@@ -2219,9 +2219,9 @@ def on_message(data):
                     _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
                 return
             if needs_seal and needs_invoice:
-                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请** 还是 **开票申请**？回复「用印」或「开票」。")
+                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请**？回复「用印」或「开票」。")
                 return
-            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请单**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
             return
 
         with _state_lock:
@@ -2247,21 +2247,21 @@ def on_message(data):
         # 第一阶段：处理需特殊路由的类型（用印/开票），收集剩余待处理
         remaining_requests = []
         with _state_lock:
-            needs_seal = any(r.get("approval_type") == "用印申请" for r in requests) and open_id not in PENDING_SEAL
+            needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests) and open_id not in PENDING_SEAL
             needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests) and open_id not in PENDING_INVOICE
 
         if needs_seal and needs_invoice:
-            req_seal = next(r for r in requests if r.get("approval_type") == "用印申请")
+            req_seal = next(r for r in requests if r.get("approval_type") == "用印申请单")
             initial = req_seal.get("fields", {})
             if initial:
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
-            send_message(open_id, "您同时发起了用印申请和开票申请。请先完成用印申请（上传需要盖章的文件），完成后再发送「开票申请」。\n\n"
+            send_message(open_id, "您同时发起了用印申请单和开票申请。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请」。\n\n"
                          "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
             with _state_lock:
                 if open_id in CONVERSATIONS:
-                    CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请"})
-            remaining_requests = [r for r in requests if r.get("approval_type") not in ("用印申请", "开票申请")]
+                    CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请单"})
+            remaining_requests = [r for r in requests if r.get("approval_type") not in ("用印申请单", "开票申请")]
             if not remaining_requests:
                 return
         else:
@@ -2269,12 +2269,12 @@ def on_message(data):
                 at = req.get("approval_type", "")
                 miss = req.get("missing", [])
                 fields_check = req.get("fields", {})
-                if at == "用印申请" and open_id not in PENDING_SEAL:
+                if at == "用印申请单" and open_id not in PENDING_SEAL:
                     initial = req.get("fields", {}) or {}
                     with _state_lock:
                         SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
                     send_message(open_id, "请补充以下信息：\n"
-                                 f"用印申请还缺少：上传用章文件\n"
+                                 f"用印申请单还缺少：上传用章文件\n"
                                  f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
                     with _state_lock:
                         if open_id in CONVERSATIONS:
@@ -2383,7 +2383,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         if path == "/debug-extract":
             from approval_types import get_file_extractor, FILE_EXTRACTORS
             diag = {
-                "extractor_registered": get_file_extractor("用印申请") is not None,
+                "extractor_registered": get_file_extractor("用印申请单") is not None,
                 "invoice_extractor": get_file_extractor("开票申请") is not None,
                 "file_extractors": list(FILE_EXTRACTORS.keys()),
                 "DEEPSEEK_API_KEY_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
