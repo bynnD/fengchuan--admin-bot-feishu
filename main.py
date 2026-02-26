@@ -59,6 +59,9 @@ PENDING_FILE_UNCLEAR = {}
 # 用印等待上传时收集多文件（防抖）：{open_id: {"files": [{...}], "user_id", "created_at", "timer"}}
 PENDING_SEAL_UPLOAD = {}
 SEAL_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新文件后批量处理
+# 开票等待上传时收集多文件（防抖）：{open_id: {"files": [{...}], "user_id", "created_at", "timer"}}
+PENDING_INVOICE_UPLOAD = {}
+INVOICE_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新文件后批量处理，再统一发卡
 # 多文件用印排队：{open_id: {"items": [{file_name, file_code, doc_fields}, ...], "current_index": 0, "selections": [{lawyer, usage, count}, ...], "user_id", "created_at"}}
 PENDING_SEAL_QUEUE = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
@@ -133,6 +136,12 @@ def _clean_expired_pending(open_id=None):
         for oid in list(PENDING_INVOICE.keys()) if open_id is None else ([open_id] if open_id in PENDING_INVOICE else []):
             if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_INVOICE[oid]
+                entry = PENDING_INVOICE_UPLOAD.pop(oid, None)
+                if entry and entry.get("timer"):
+                    try:
+                        entry["timer"].cancel()
+                    except Exception:
+                        pass
                 to_notify.append((oid, "开票申请单已超时，请重新发起。"))
         for oid in list(PENDING_SEAL_QUEUE.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL_QUEUE else []):
             if oid in PENDING_SEAL_QUEUE and now - PENDING_SEAL_QUEUE[oid].get("created_at", 0) > PENDING_TTL:
@@ -247,12 +256,17 @@ def _handle_split_file_intents(open_id, user_id, files_list, intents):
                 "user_id": user_id,
                 "created_at": time.time(),
             }
-        f0 = invoice_files[0]
-        if len(invoice_files) == 1:
-            _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
-        else:
+        with _state_lock:
+            if open_id not in PENDING_INVOICE_UPLOAD:
+                PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+            for f in invoice_files[:1]:  # 开票仅支持单文件
+                item = {"message_id": f.get("message_id"), "content_json": f.get("content_json", {}), "file_name": f.get("file_name", "未知文件")}
+                if "resource_type" in f:
+                    item["resource_type"] = f["resource_type"]
+                PENDING_INVOICE_UPLOAD[open_id]["files"].append(item)
+        if len(invoice_files) > 1:
             send_message(open_id, "开票申请单每次仅支持一个文件，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
-            _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
+        _schedule_invoice_upload_process(open_id, user_id, immediate=True)
     if seal_files and invoice_files:
         send_message(open_id, f"已接收：{len(seal_files)} 份用印、{len(invoice_files)} 份开票，将分别处理。")
     elif seal_files:
@@ -489,6 +503,40 @@ def _schedule_file_intent_card(open_id):
     with _state_lock:
         if open_id in PENDING_FILE_UNCLEAR:
             PENDING_FILE_UNCLEAR[open_id]["timer"] = timer
+
+
+def _schedule_invoice_upload_process(open_id, user_id, immediate=False):
+    """开票等待上传时，防抖后批量处理已收集的文件，全部处理完再统一发送选项卡片。immediate=True 时立即处理（用于 file_intent 单次传入）"""
+
+    def _process():
+        with _state_lock:
+            entry = PENDING_INVOICE_UPLOAD.pop(open_id, None)
+        if not entry:
+            return
+        files = entry.get("files", [])
+        uid = entry.get("user_id", "")
+        if not files:
+            return
+        threading.Thread(target=lambda: _process_invoice_upload_batch(open_id, uid, files), daemon=True).start()
+
+    with _state_lock:
+        if open_id not in PENDING_INVOICE_UPLOAD:
+            return
+        old = PENDING_INVOICE_UPLOAD[open_id]
+        if old and old.get("timer"):
+            try:
+                old["timer"].cancel()
+            except Exception:
+                pass
+    if immediate:
+        _process()
+    else:
+        timer = threading.Timer(INVOICE_UPLOAD_DEBOUNCE_SEC, _process)
+        timer.daemon = True
+        timer.start()
+        with _state_lock:
+            if open_id in PENDING_INVOICE_UPLOAD:
+                PENDING_INVOICE_UPLOAD[open_id]["timer"] = timer
 
 
 def _schedule_seal_upload_process(open_id, user_id):
@@ -828,10 +876,15 @@ def on_card_action_confirm(data):
                         "user_id": user_id,
                         "created_at": time.time(),
                     }
+                    if open_id not in PENDING_INVOICE_UPLOAD:
+                        PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                    for f in files_list:
+                        item = {"message_id": f.get("message_id"), "content_json": f.get("content_json", {}), "file_name": f.get("file_name", "未知文件")}
+                        if "resource_type" in f:
+                            item["resource_type"] = f["resource_type"]
+                        PENDING_INVOICE_UPLOAD[open_id]["files"].append(item)
                 if files_list:
-                    f0 = files_list[0]
-                    msg_id, cj = f0["message_id"], f0["content_json"]
-                    threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
+                    _schedule_invoice_upload_process(open_id, user_id, immediate=True)
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请单，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         # 用印选项卡片（含排队模式）：律师是否已审核、盖章形式、文件数量
@@ -1793,12 +1846,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             msg_id = f.get("message_id")
             cj = f.get("content_json", {})
             fname = f.get("file_name", cj.get("file_name", "未知文件"))
-            fkey = cj.get("file_key", "")
+            fkey = cj.get("file_key") or cj.get("image_key", "")
+            resource_type = f.get("resource_type", "file")
             if not fkey:
                 send_message(open_id, f"无法获取文件「{fname}」，请重新发送。")
                 return
             send_message(open_id, f"正在处理文件「{fname}」（{i+1}/{len(files_list)}），请稍候...")
-            file_content, dl_err = download_message_file(msg_id, fkey, "file")
+            file_content, dl_err = download_message_file(msg_id, fkey, resource_type)
             if not file_content:
                 send_message(open_id, f"文件「{fname}」下载失败，请重新发送。{dl_err or ''}".strip())
                 return
@@ -1841,12 +1895,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
     # 单文件处理（来自 files_list[0] 或 直接上传的 message_id/content_json）
     if not files_list:
         file_name = content_json.get("file_name", "未知文件")
-    file_key = content_json.get("file_key", "")
+    file_key = content_json.get("file_key") or content_json.get("image_key", "")
+    resource_type = (files_list[0].get("resource_type", "file") if files_list and len(files_list) == 1 else "file")
     if not file_key:
         send_message(open_id, "无法获取文件，请重新发送。")
         return
     send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
-    file_content, dl_err = download_message_file(message_id, file_key, "file")
+    file_content, dl_err = download_message_file(message_id, file_key, resource_type)
     if not file_content:
         err_detail = f"（{dl_err}）" if dl_err else ""
         send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
@@ -2234,124 +2289,106 @@ def _infer_invoice_proof_type(file_name, ai_fields):
     return "其他" if has_amount else "合同"
 
 
-def _handle_invoice_file(open_id, user_id, message_id, content_json):
-    """处理开票申请单的文件上传：自动识别多种凭证（结算单、合同、银行水单、订单明细、电商截图等），支持任意组合和上传顺序"""
+def _process_invoice_upload_batch(open_id, user_id, files):
+    """批量处理开票凭证文件，全部处理完后统一发送选项卡片，避免「已追加xxx」等中间消息"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
             return
-        step = pending.get("step", "")
         doc_fields = dict(pending.get("doc_fields", {}))
         file_codes_list = list(pending.get("file_codes", []))
-    if step == "user_fields":
-        # 已进入选项步骤时，仍可追加更多凭证（不重复发卡，仅更新 pending，用户点原卡片确认即可）
-        pass  # 继续处理，下方会 append 并更新
-    file_key = content_json.get("file_key", "")
-    file_name = content_json.get("file_name", "未知文件")
-    if not file_key:
-        send_message(open_id, "无法获取文件，请重新发送。")
-        return
-
-    send_message(open_id, f"正在处理文件「{file_name}」，请稍候...")
-    file_content, dl_err = download_message_file(message_id, file_key, "file")
-    if not file_content:
-        err_detail = f"（{dl_err}）" if dl_err else ""
-        send_message(open_id, f"文件下载失败，请重新发送。{err_detail}".strip())
-        return
-
-    file_code, upload_err = upload_approval_file(file_name, file_content)
-    if not file_code:
-        err_detail = f"（{upload_err}）" if upload_err else ""
-        send_message(open_id, f"文件上传失败，请重新发送。{err_detail}")
-        return
-
-    extractor = get_file_extractor("开票申请单")
-    ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
-    if ai_fields:
-        logger.info("开票文件识别结果: %s", ai_fields)
-
-    for k, v in ai_fields.items():
-        if k == "proof_file_type":
-            # 多选合并：结算单+合同 分别识别后合并去重
-            new_items = v if isinstance(v, list) else ([v] if v and str(v).strip() else [])
-            existing = doc_fields.get(k)
-            existing = existing if isinstance(existing, list) else ([existing] if existing and str(existing).strip() else [])
-            merged = list(dict.fromkeys(existing + [str(x).strip() for x in new_items if x and str(x).strip()]))
-            if merged:
-                doc_fields[k] = merged
-        elif v and str(v).strip():
-            doc_fields[k] = v
-
-    proof_type = _infer_invoice_proof_type(file_name, ai_fields)
-    # 未识别到 proof_file_type 时，根据推断类型补充
-    if not doc_fields.get("proof_file_type"):
-        doc_fields["proof_file_type"] = [proof_type]
-    elif proof_type not in (doc_fields.get("proof_file_type") or []):
-        existing = doc_fields.get("proof_file_type") or []
-        doc_fields["proof_file_type"] = list(dict.fromkeys(existing + [proof_type]))
+    for i, f in enumerate(files):
+        msg_id = f.get("message_id")
+        cj = f.get("content_json", {})
+        file_name = cj.get("file_name", f.get("file_name", "未知文件"))
+        file_key = cj.get("file_key") or cj.get("image_key", "")
+        resource_type = f.get("resource_type", "file")  # "image" 时使用 type=image 下载
+        if not file_key:
+            continue
+        send_message(open_id, f"正在处理文件「{file_name}」（{i+1}/{len(files)}），请稍候...")
+        file_content, dl_err = download_message_file(msg_id, file_key, resource_type)
+        if not file_content:
+            send_message(open_id, f"文件「{file_name}」下载失败，请重新发送。{dl_err or ''}".strip())
+            continue
+        file_code, upload_err = upload_approval_file(file_name, file_content)
+        if not file_code:
+            send_message(open_id, f"文件「{file_name}」上传失败，请重新发送。{upload_err or ''}".strip())
+            continue
+        extractor = get_file_extractor("开票申请单")
+        ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
+        if ai_fields:
+            logger.info("开票文件识别结果: %s", ai_fields)
+        for k, v in ai_fields.items():
+            if k == "proof_file_type":
+                new_items = v if isinstance(v, list) else ([v] if v and str(v).strip() else [])
+                existing = doc_fields.get(k)
+                existing = existing if isinstance(existing, list) else ([existing] if existing and str(existing).strip() else [])
+                merged = list(dict.fromkeys(existing + [str(x).strip() for x in new_items if x and str(x).strip()]))
+                if merged:
+                    doc_fields[k] = merged
+            elif v and str(v).strip():
+                doc_fields[k] = v
+        proof_type = _infer_invoice_proof_type(file_name, ai_fields)
+        if not doc_fields.get("proof_file_type"):
+            doc_fields["proof_file_type"] = [proof_type]
+        elif proof_type not in (doc_fields.get("proof_file_type") or []):
+            existing = doc_fields.get("proof_file_type") or []
+            doc_fields["proof_file_type"] = list(dict.fromkeys(existing + [proof_type]))
+        file_codes_list.append({"file_code": file_code, "proof_type": proof_type, "file_name": file_name})
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
             return
-        file_codes_list = pending.get("file_codes", [])
-        file_codes_list.append({"file_code": file_code, "proof_type": proof_type, "file_name": file_name})
         pending["file_codes"] = file_codes_list
         pending["doc_fields"] = doc_fields
-        # 至少 1 个凭证即可进入选项步骤（支持单凭证如电商截图，或多凭证如合同+对账单）
-        if len(file_codes_list) >= 1:
-            pending["step"] = "user_fields"
-
-    type_labels = {"对账单": "对账单/结算单", "合同": "合同/协议", "其他": "凭证"}
-    type_label = type_labels.get(proof_type, proof_type)
-    with _state_lock:
-        pending = PENDING_INVOICE.get(open_id)
-        doc_fields_final = dict(pending.get("doc_fields", {})) if pending else dict(doc_fields)
-        fc_list = list(pending.get("file_codes", [])) if pending else []
-        user_id_val = pending.get("user_id", "") if pending else user_id
-    if step == "user_fields" and len(fc_list) > 1:
-        # 追加凭证：不重复发卡，提示用户在原卡片上确认
-        send_message(open_id, f"已追加{type_label}：{file_name}，请在上方卡片中完成选项选择并点击确认。")
+        pending["step"] = "user_fields"
+    if not file_codes_list:
+        send_message(open_id, "未能成功处理任何文件，请重新上传。")
         return
-    if len(file_codes_list) >= 1:
-        has_invoice_type = bool(doc_fields_final.get("invoice_type"))
-        has_invoice_items = bool(doc_fields_final.get("invoice_items"))
-        if has_invoice_type and has_invoice_items:
-            _do_create_invoice(open_id, user_id_val, doc_fields_final, fc_list)
-        else:
-            # 汇总信息：开票金额优先展示，其余按字段顺序
-            def _fmt_val(v):
-                if isinstance(v, list):
-                    return "、".join(str(x) for x in v if x)
-                return v
-            order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
-            lines = []
-            for k in order:
-                if k in doc_fields and doc_fields[k]:
-                    lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(doc_fields[k])}")
-            for k, v in doc_fields.items():
-                if k not in order and v:
-                    lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(v)}")
-            summary = "\n".join(lines)
-            proof_labels = [f.get("proof_type", "") for f in fc_list if f.get("proof_type")]
-            proof_desc = "、".join(proof_labels) if proof_labels else "凭证"
-            summary_prefix = f"已接收{proof_desc}。\n\n已识别：\n{summary or '（无）'}"
-            card = _build_invoice_options_card(doc_fields_final, summary_prefix)
-            body = CreateMessageRequestBody.builder() \
-                .receive_id(open_id) \
-                .msg_type("interactive") \
-                .content(json.dumps(card, ensure_ascii=False)) \
-                .build()
-            request = CreateMessageRequest.builder() \
-                .receive_id_type("open_id") \
-                .request_body(body) \
-                .build()
-            resp = client.im.v1.message.create(request)
-            if not resp.success():
-                logger.error("发送开票选项卡片失败: %s", resp.msg)
-                send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
-                             "请补充：发票类型、开票项目（如：增值税专用发票 技术服务费）")
-    else:
-        send_message(open_id, f"已接收{type_label}：{file_name}\n请继续上传开票凭证（合同、对账单、银行水单、订单明细、电商截图等，Word/PDF/图片均可）。")
+    # 统一发送选项卡片
+    def _fmt_val(v):
+        if isinstance(v, list):
+            return "、".join(str(x) for x in v if x)
+        return v
+    order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
+    lines = []
+    for k in order:
+        if k in doc_fields and doc_fields[k]:
+            lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(doc_fields[k])}")
+    for k, v in doc_fields.items():
+        if k not in order and v:
+            lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(v)}")
+    summary = "\n".join(lines)
+    proof_labels = [f.get("proof_type", "") for f in file_codes_list if f.get("proof_type")]
+    proof_desc = "、".join(proof_labels) if proof_labels else "凭证"
+    summary_prefix = f"已接收{proof_desc}（共 {len(file_codes_list)} 个文件）。\n\n已识别：\n{summary or '（无）'}"
+    card = _build_invoice_options_card(doc_fields, summary_prefix)
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送开票选项卡片失败: %s", resp.msg)
+        send_message(open_id, f"已接收 {len(file_codes_list)} 个凭证。\n\n已识别：\n{summary or '（无）'}\n\n请补充：发票类型、开票项目。")
+
+
+def _handle_invoice_file(open_id, user_id, message_id, content_json):
+    """单文件入口（兼容旧调用），转为防抖批量流程"""
+    with _state_lock:
+        if open_id not in PENDING_INVOICE_UPLOAD:
+            PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+        PENDING_INVOICE_UPLOAD[open_id]["files"].append({
+            "message_id": message_id,
+            "content_json": content_json,
+            "file_name": content_json.get("file_name", "未知文件"),
+        })
+    _schedule_invoice_upload_process(open_id, user_id, immediate=True)
 
 
 def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
@@ -2385,9 +2422,10 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
     with _state_lock:
         if open_id in PENDING_INVOICE:
             del PENDING_INVOICE[open_id]
+        PENDING_INVOICE_UPLOAD.pop(open_id, None)
         # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
 
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。")
+    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认」按钮。")
 
 
 def _try_complete_invoice(open_id, user_id, text):
@@ -2401,6 +2439,7 @@ def _try_complete_invoice(open_id, user_id, text):
         with _state_lock:
             if open_id in PENDING_INVOICE:
                 del PENDING_INVOICE[open_id]
+                PENDING_INVOICE_UPLOAD.pop(open_id, None)
         send_message(open_id, "已取消开票申请单，如需办理请重新发起。")
         return True
 
@@ -2467,11 +2506,12 @@ def on_message(data):
         _clean_expired_pending(open_id)
 
         now = time.time()
-        # 限流：文件上传在收集阶段（用印等待上传、未说明意图）不限制，允许多文件快速连续上传
+        # 限流：文件上传在收集阶段（用印等待上传、未说明意图、开票等待上传）不限制，允许多文件快速连续上传
         with _state_lock:
             in_seal_upload = open_id in PENDING_SEAL_UPLOAD
             in_file_unclear = open_id in PENDING_FILE_UNCLEAR and PENDING_FILE_UNCLEAR.get(open_id, {}).get("files")
-            skip_rate_limit = (msg_type == "file") and (in_seal_upload or in_file_unclear or open_id in SEAL_INITIAL_FIELDS)
+            in_invoice_upload = open_id in PENDING_INVOICE and PENDING_INVOICE.get(open_id, {}).get("step") != "user_fields"
+            skip_rate_limit = (msg_type in ("file", "image")) and (in_seal_upload or in_file_unclear or open_id in SEAL_INITIAL_FIELDS or in_invoice_upload)
         if not skip_rate_limit:
             with _state_lock:
                 last = _user_last_msg.get(open_id, 0)
@@ -2487,7 +2527,25 @@ def on_message(data):
                 in_seal_queue = open_id in PENDING_SEAL_QUEUE
                 expects_seal = open_id in SEAL_INITIAL_FIELDS  # 用户已说用印，在等上传
             if is_invoice:
-                _handle_invoice_file(open_id, user_id, message_id, content_json)
+                with _state_lock:
+                    pending = PENDING_INVOICE.get(open_id)
+                    step = pending.get("step", "") if pending else ""
+                if step == "user_fields":
+                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。")
+                else:
+                    file_name = content_json.get("file_name", "未知文件")
+                    with _state_lock:
+                        if open_id not in PENDING_INVOICE_UPLOAD:
+                            PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                        PENDING_INVOICE_UPLOAD[open_id]["files"].append({
+                            "message_id": message_id,
+                            "content_json": content_json,
+                            "file_name": file_name,
+                        })
+                        PENDING_INVOICE_UPLOAD[open_id]["created_at"] = time.time()
+                    count = len(PENDING_INVOICE_UPLOAD[open_id]["files"])
+                    send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个）。正在处理，请稍候...")
+                    _schedule_invoice_upload_process(open_id, user_id)
             elif is_seal or in_seal_queue:
                 send_message(open_id, "您当前有用印申请单待完成，请先完成选项选择。如需重新上传多个文件，请回复「取消」后重新发起。")
             elif expects_seal:
@@ -2524,7 +2582,72 @@ def on_message(data):
             return
 
         if msg_type == "image":
-            send_message(open_id, _get_usage_guide_message())
+            # 开票/用印流程中收到图片时，作为凭证处理，而非发送通用指南
+            with _state_lock:
+                is_invoice = open_id in PENDING_INVOICE
+                is_seal = open_id in PENDING_SEAL
+                in_seal_queue = open_id in PENDING_SEAL_QUEUE
+                expects_seal = open_id in SEAL_INITIAL_FIELDS
+            if is_invoice:
+                pending = PENDING_INVOICE.get(open_id, {})
+                if pending.get("step") == "user_fields":
+                    send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。")
+                else:
+                    image_key = content_json.get("image_key") or content_json.get("file_key", "")
+                    if not image_key:
+                        send_message(open_id, "无法获取图片，请重新发送或改为上传文件格式的凭证。")
+                    else:
+                        with _state_lock:
+                            if open_id not in PENDING_INVOICE_UPLOAD:
+                                PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                            PENDING_INVOICE_UPLOAD[open_id]["files"].append({
+                                "message_id": message_id,
+                                "content_json": {"file_key": image_key, "file_name": "凭证截图.png", "image_key": image_key},
+                                "file_name": "凭证截图.png",
+                                "resource_type": "image",
+                            })
+                            PENDING_INVOICE_UPLOAD[open_id]["created_at"] = time.time()
+                        count = len(PENDING_INVOICE_UPLOAD[open_id]["files"])
+                        send_message(open_id, f"已收到图片（共 {count} 个）。正在处理，请稍候...")
+                        _schedule_invoice_upload_process(open_id, user_id)
+            elif expects_seal and not (is_seal or in_seal_queue):
+                image_key = content_json.get("image_key") or content_json.get("file_key", "")
+                if image_key:
+                    with _state_lock:
+                        if open_id not in PENDING_SEAL_UPLOAD:
+                            PENDING_SEAL_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                        PENDING_SEAL_UPLOAD[open_id]["files"].append({
+                            "message_id": message_id,
+                            "content_json": {"file_key": image_key, "file_name": "用印文件截图.png", "image_key": image_key},
+                            "file_name": "用印文件截图.png",
+                            "resource_type": "image",
+                        })
+                        PENDING_SEAL_UPLOAD[open_id]["created_at"] = time.time()
+                    count = len(PENDING_SEAL_UPLOAD[open_id]["files"])
+                    send_message(open_id, f"已收到图片「用印文件截图」（共 {count} 个）。正在处理，请稍候...")
+                    _schedule_seal_upload_process(open_id, user_id)
+                else:
+                    send_message(open_id, "无法获取图片，请重新发送。")
+            elif open_id in PENDING_FILE_UNCLEAR and PENDING_FILE_UNCLEAR.get(open_id, {}).get("files"):
+                # 用户先上传了文件但未说明意图，又发了图片，将图片加入待确认列表
+                image_key = content_json.get("image_key") or content_json.get("file_key", "")
+                if image_key:
+                    with _state_lock:
+                        PENDING_FILE_UNCLEAR[open_id]["files"].append({
+                            "file_key": image_key,
+                            "message_id": message_id,
+                            "file_name": "凭证截图.png",
+                            "content_json": {"file_key": image_key, "file_name": "凭证截图.png", "image_key": image_key},
+                            "resource_type": "image",
+                        })
+                        PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
+                    count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
+                    send_message(open_id, f"已收到图片（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
+                    _schedule_file_intent_card(open_id)
+                else:
+                    send_message(open_id, _get_usage_guide_message())
+            else:
+                send_message(open_id, _get_usage_guide_message())
             return
 
         text = content_json.get("text", "").strip()
@@ -2640,8 +2763,15 @@ def on_message(data):
                         "created_at": time.time(),
                     }
                 if files_list:
-                    f0 = files_list[0]
-                    _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
+                    with _state_lock:
+                        if open_id not in PENDING_INVOICE_UPLOAD:
+                            PENDING_INVOICE_UPLOAD[open_id] = {"files": [], "user_id": user_id, "created_at": time.time(), "timer": None}
+                        for f in files_list:
+                            item = {"message_id": f.get("message_id"), "content_json": f.get("content_json", {}), "file_name": f.get("file_name", "未知文件")}
+                            if "resource_type" in f:
+                                item["resource_type"] = f["resource_type"]
+                            PENDING_INVOICE_UPLOAD[open_id]["files"].append(item)
+                    _schedule_invoice_upload_process(open_id, user_id, immediate=True)
                 return
             if needs_seal and needs_invoice:
                 send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请单**？回复「用印」或「开票」。")
