@@ -2362,6 +2362,10 @@ def _process_invoice_upload_batch(open_id, user_id, files):
     proof_labels = [f.get("proof_type", "") for f in file_codes_list if f.get("proof_type")]
     proof_desc = "、".join(proof_labels) if proof_labels else "凭证"
     summary_prefix = f"已接收{proof_desc}（共 {len(file_codes_list)} 个文件）。\n\n已识别：\n{summary or '（无）'}"
+    # 仅合同开票时提示风险，建议补充收款/流水/对账单/电商订单等
+    proof_set = set(p for p in proof_labels if p)
+    if proof_set == {"合同"}:
+        summary_prefix += "\n\n⚠️ **风险提示**：当前仅提供合同，建议补充收款记录、银行流水、盖章确认的对账单或电商平台订单等凭证，以降低开票风险。"
     card = _build_invoice_options_card(doc_fields, summary_prefix)
     body = CreateMessageRequestBody.builder() \
         .receive_id(open_id) \
@@ -2394,6 +2398,11 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
 def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
     """开票申请单字段齐全时，发送确认卡片，用户点击确认后创建工单。file_codes_list: [{file_code, proof_type, file_name}, ...]"""
     all_fields = dict(all_fields)
+    # 业务类型兜底：开票项目含 NBBOSS 但 AI 误识别为 Right-bot 时，以开票项目为准
+    inv_items = str(all_fields.get("invoice_items", "")).upper()
+    bt = str(all_fields.get("business_type", "")).strip().lower()
+    if "NBBOSS" in inv_items and bt in ("right-bot", "rightbot"):
+        all_fields["business_type"] = "NBBOSS"
     all_fields.setdefault("proof_file_type", ["合同"])
     all_fields.setdefault("contract_sealed", "已盖章")
     aid = _get_invoice_attachment_field_ids()
