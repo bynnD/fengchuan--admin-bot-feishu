@@ -555,6 +555,27 @@ def _build_seal_options_card(doc_fields, file_name):
     }
 
 
+def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None, delay_sec=0.08):
+    """延时更新用印选项卡片以显示选中状态（蓝色框）。delay_sec 尽量短以减少用户感知延迟。"""
+    if not token or not open_id:
+        return
+    time.sleep(delay_sec)
+    try:
+        card = card or _build_seal_options_card(doc_fields, file_name)
+        body = {"token": token, "card": {"open_ids": [open_id], "config": card.get("config", {}), "elements": card.get("elements", [])}}
+        resp = httpx.post(
+            "https://open.feishu.cn/open-apis/interactive/v1/card/update",
+            headers={"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"},
+            json=body,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning("延时更新用印卡片失败: code=%s msg=%s", data.get("code"), data.get("msg"))
+    except Exception as e:
+        logger.warning("延时更新用印卡片异常: %s", e)
+
+
 def _send_seal_queue_card(open_id, user_id, queue_data):
     """发送排队模式下当前文件的选项卡片"""
     items = queue_data.get("items", [])
@@ -711,6 +732,10 @@ def on_card_action_confirm(data):
                     elif field in ("lawyer_reviewed", "usage_method"):
                         doc_fields[field] = val
                     queue_data["created_at"] = time.time()
+                    update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
+                    if update_token:
+                        qcard = _build_seal_queue_card(doc_fields, items[idx]["file_name"], idx, len(items), idx == len(items) - 1)
+                        threading.Thread(target=lambda t=update_token, oid=open_id, c=qcard: _update_seal_card_delayed(t, oid, None, None, card=c), daemon=True).start()
                     return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
             if not pending:
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
@@ -720,6 +745,10 @@ def on_card_action_confirm(data):
                 doc_fields[field] = val
             elif field in ("lawyer_reviewed", "usage_method"):
                 doc_fields[field] = val
+            update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
+            if update_token:
+                _doc, _fname = dict(doc_fields), pending.get("file_name", "")
+                threading.Thread(target=lambda t=update_token, oid=open_id, d=_doc, f=_fname: _update_seal_card_delayed(t, oid, d, f), daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
 
         # 多文件排队：下一份（确认）
