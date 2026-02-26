@@ -73,19 +73,13 @@ def get_admin_comment(fields):
 
 def extract_fields_from_file(file_content, file_name, form_opts, get_token):
     """
-    从结算单或合同文件中提取开票相关字段。
-    结算单：金额、结算单编号等
-    合同：购方名称、税号、合同编号等
+    从开票凭证文件中提取相关字段。支持多种凭证：
+    结算单/对账单、合同/协议、银行水单、订单明细、电商发货/收款截图等。
     """
     base_name = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
     file_text = extract_text_from_file(file_content, file_name, get_token)
     has_content = bool(file_text and len(file_text.strip()) > 10)
     combined = f"文件名：{base_name}\n\n" + (f"文件内容摘要：\n{file_text}" if has_content else "（内容无法提取）")
-
-    # 根据文件名判断是结算单还是合同，给 AI 不同提示
-    is_settlement = "结算" in base_name or "结算单" in base_name
-    is_contract = "合同" in base_name or "协议" in base_name
-    doc_type = "结算单" if is_settlement else ("合同" if is_contract else "未知")
 
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
@@ -93,7 +87,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         return {}
 
     prompt = (
-        f"从以下{doc_type}文件中提取开票申请相关字段。\n\n{combined}\n\n"
+        f"从以下开票凭证文件中提取相关字段。支持多种凭证类型：结算单/对账单、合同/协议、银行水单、订单明细、电商发货截图、收款截图等。\n\n{combined}\n\n"
         f"请返回JSON，包含能识别的字段：\n"
         f"- amount: 金额（数字，如 10000 或 10000.00）\n"
         f"- buyer_name: 购方名称/开票抬头（合同中的甲方、乙方或购买方）\n"
@@ -102,7 +96,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         f"- settlement_no: 结算单编号\n"
         f"- business_type: 业务类型（如广告、技术、电商等，从文件内容推断）\n"
         f"- proof_file_type: 开票证明文件类型，可多选。可选值：合同、对账单、有赞商城后台订单、微信小店后台订单、企业微信收款订单、其他。"
-        f"结算单对应「对账单」，合同/协议对应「合同」，根据文件类型和内容选择，返回数组如 [\"合同\",\"对账单\"]\n"
+        f"根据文件内容判断：结算单/对账单→对账单；合同/协议→合同；银行流水/水单→其他；订单明细/发货截图/收款截图→有赞商城后台订单或微信小店后台订单或企业微信收款订单或其他（能区分平台则选对应项）\n"
         f"只返回能明确识别的字段，不要猜测。只返回JSON，不要其他内容。"
     )
     try:
