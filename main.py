@@ -467,22 +467,15 @@ def _validate_seal_options(doc_fields):
 
 
 def _build_seal_queue_card(doc_fields, file_name, index, total, is_last):
-    """多文件排队模式：每文件一张卡。前几张为「确认」，最后一张为「确认」+「提交工单」"""
+    """多文件排队模式：每文件一张卡，仅「确认」按钮。全部确认后再出「提交工单」汇总卡片"""
     card = _build_seal_options_card(doc_fields, file_name)
-    # 前几张：仅确认；最后一张：确认 + 提交工单
-    if is_last:
-        btns = [
-            {"tag": "button", "text": {"tag": "plain_text", "content": "确认"},
-             "type": "default", "behaviors": [{"type": "callback", "value": {"action": "seal_finish"}}]},
-            {"tag": "button", "text": {"tag": "plain_text", "content": "提交工单"},
-             "type": "primary", "behaviors": [{"type": "callback", "value": {"action": "seal_submit_queue"}}]},
-        ]
-    else:
-        btns = [{
-            "tag": "button", "text": {"tag": "plain_text", "content": f"确认（{index + 1}/{total}）"},
-            "type": "primary",
-            "behaviors": [{"type": "callback", "value": {"action": "seal_next"}}],
-        }]
+    btn_label = f"确认（{index + 1}/{total}）" if not is_last else "确认"
+    btn_action = "seal_next" if not is_last else "seal_finish"
+    btns = [{
+        "tag": "button", "text": {"tag": "plain_text", "content": btn_label},
+        "type": "primary",
+        "behaviors": [{"type": "callback", "value": {"action": btn_action}}],
+    }]
     for elem in card.get("elements", []):
         if elem.get("tag") == "action" and elem.get("actions"):
             acts = elem["actions"]
@@ -493,8 +486,7 @@ def _build_seal_queue_card(doc_fields, file_name, index, total, is_last):
         if elem.get("tag") == "div" and elem.get("text", {}).get("tag") == "lark_md":
             c = elem["text"].get("content", "")
             if "已接收文件" in c:
-                hint = "选完后点击「确认」或「提交工单」" if is_last else "选完后点击「确认」"
-                c = c.replace("选完后点击「提交」", hint)
+                c = c.replace("选完后点击「提交」", "选完后点击「确认」")
                 elem["text"]["content"] = f"**第 {index + 1}/{total} 份文件**\n\n" + c
                 break
     return card
@@ -574,6 +566,34 @@ def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None, 
             logger.warning("延时更新用印卡片失败: code=%s msg=%s", data.get("code"), data.get("msg"))
     except Exception as e:
         logger.warning("延时更新用印卡片异常: %s", e)
+
+
+def _send_seal_final_card(open_id, total):
+    """全部文件确认后，发送汇总卡片，含「提交工单」按钮"""
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"以上 **{total}** 份文件均已选择完成，请点击下方按钮生成一张工单。"}},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [{
+                "tag": "button", "text": {"tag": "plain_text", "content": "提交工单"},
+                "type": "primary",
+                "behaviors": [{"type": "callback", "value": {"action": "seal_submit_queue"}}],
+            }]},
+        ],
+    }
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(open_id) \
+        .msg_type("interactive") \
+        .content(json.dumps(card, ensure_ascii=False)) \
+        .build()
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(body) \
+        .build()
+    resp = client.im.v1.message.create(request)
+    if not resp.success():
+        logger.error("发送用印最终提交卡片失败: %s", resp.msg)
 
 
 def _send_seal_queue_card(open_id, user_id, queue_data):
@@ -793,9 +813,10 @@ def on_card_action_confirm(data):
             count = str(doc_fields.get("document_count", "1")).strip()
             queue_data["selections"].append({"lawyer_reviewed": lawyer, "usage_method": usage, "document_count": count or "1"})
             queue_data["created_at"] = time.time()
+            _send_seal_final_card(open_id, len(items))
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择完成，请点击提交工单"}})
 
-        # 多文件排队：提交工单（校验三项必选，若未点确认则先补全最后一份选择）
+        # 多文件排队：提交工单（在汇总卡片上点击）
         if value.get("action") == "seal_submit_queue":
             with _state_lock:
                 queue_data = PENDING_SEAL_QUEUE.get(open_id)
