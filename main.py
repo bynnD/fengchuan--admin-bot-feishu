@@ -963,8 +963,18 @@ def on_card_action_confirm(data):
             update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
             if update_token:
                 doc = dict(pending["doc_fields"])
-                summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc.items() if v and k not in ("invoice_type", "invoice_items")])
-                summary_prefix = f"已接收结算单和合同。\n\n已识别：\n{summary or '（无）'}" if summary else "已接收结算单和合同。\n\n"
+                def _fmt(v):
+                    return "、".join(str(x) for x in v) if isinstance(v, list) else v
+                order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
+                lines = []
+                for k in order:
+                    if k in doc and doc[k] and k not in ("invoice_type", "invoice_items"):
+                        lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt(doc[k])}")
+                for k, v in doc.items():
+                    if k not in order and v and k not in ("invoice_type", "invoice_items"):
+                        lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt(v)}")
+                summary = "\n".join(lines)
+                summary_prefix = f"已接收凭证。\n\n已识别：\n{summary or '（无）'}"
                 card = _build_invoice_options_card(doc, summary_prefix)
                 threading.Thread(target=lambda t=update_token, oid=open_id, c=card: _update_invoice_card_delayed(t, oid, c), daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
@@ -2308,7 +2318,20 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
         if has_invoice_type and has_invoice_items:
             _do_create_invoice(open_id, user_id_val, doc_fields_final, fc_list)
         else:
-            summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
+            # 汇总信息：开票金额优先展示，其余按字段顺序
+            def _fmt_val(v):
+                if isinstance(v, list):
+                    return "、".join(str(x) for x in v if x)
+                return v
+            order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
+            lines = []
+            for k in order:
+                if k in doc_fields and doc_fields[k]:
+                    lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(doc_fields[k])}")
+            for k, v in doc_fields.items():
+                if k not in order and v:
+                    lines.append(f"· {FIELD_LABELS.get(k, k)}: {_fmt_val(v)}")
+            summary = "\n".join(lines)
             proof_labels = [f.get("proof_type", "") for f in fc_list if f.get("proof_type")]
             proof_desc = "、".join(proof_labels) if proof_labels else "凭证"
             summary_prefix = f"已接收{proof_desc}。\n\n已识别：\n{summary or '（无）'}"

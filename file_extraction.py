@@ -1,6 +1,6 @@
 """
 通用文件内容提取模块 - 供所有有附件识别读取需求的工单类型使用。
-支持 Word/PDF 文本提取，图片和扫描件通过飞书 OCR 识别。
+支持 Word/PDF/Excel 文本提取，图片和扫描件通过飞书 OCR 识别。
 """
 
 import base64
@@ -60,6 +60,22 @@ def extract_text_from_file(file_content, file_name, get_token):
                 return text
             except Exception as doc_err:
                 logger.warning("Word 解析失败(%s): %s", file_name, doc_err)
+                return ""
+        if ext == "xlsx":
+            from io import BytesIO
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(BytesIO(file_content), read_only=True, data_only=True)
+                parts = []
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        row_cells = [str(c).strip() for c in (row or []) if c is not None and str(c).strip()]
+                        if row_cells:
+                            parts.append(" | ".join(row_cells))
+                text = "\n".join(parts)[:8000]
+                return text
+            except Exception as excel_err:
+                logger.warning("Excel 解析失败(%s): %s", file_name, excel_err)
                 return ""
         if ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp"):
             return feishu_ocr(file_content, get_token)[:8000]

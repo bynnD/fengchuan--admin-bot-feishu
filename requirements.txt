@@ -8,4 +8,5 @@ lark-oapi==1.4.24
 httpx>=0.27,<1.0
 python-docx
 pypdf
+openpyxl
 pymupdf
