@@ -17,9 +17,23 @@ switch_commands:
     - "打开自动审批"
   disable:
     - "关闭自动审批"
+  enable_all:
+    - "全部开启"
+  disable_all:
+    - "全部关闭"
   query:
     - "自动审批状态"
     - "自动审批开没开"
+  # 按类型开启：支持 "开启{类型}" 或 "开启{类型}自动审批"
+  enable_type_keywords:
+    - "采购"
+    - "开票"
+    - "用印"
+  # 按类型关闭
+  disable_type_keywords:
+    - "采购"
+    - "开票"
+    - "用印"
 
 # 用印类型与文件类型匹配规则（供 AI 参考，可适当补充）
 seal_type_rules:

@@ -15,8 +15,11 @@ from approval_types import (
 )
 from approval_rules_loader import check_switch_command, get_auto_approve_user_ids
 from approval_auto import (
+    get_auto_approval_status,
     is_auto_approval_enabled,
     set_auto_approval_enabled,
+    set_auto_approval_type_enabled,
+    set_all_types_enabled,
 )
 from field_cache import get_form_fields, get_sub_field_options, invalidate_cache, is_free_process, mark_free_process
 from deepseek_client import call_deepseek_with_retry
@@ -2937,18 +2940,40 @@ def on_message(data):
         # 自动审批开关：仅 auto_approve_user_ids 中的用户可操作
         if user_id in get_auto_approve_user_ids():
             cmd = check_switch_command(text)
-            if cmd == "enable":
-                set_auto_approval_enabled(True, user_id)
-                send_message(open_id, "已开启自动审批。")
-                return
-            if cmd == "disable":
-                set_auto_approval_enabled(False, user_id)
-                send_message(open_id, "已关闭自动审批。")
-                return
-            if cmd == "query":
-                status = "已开启" if is_auto_approval_enabled() else "已关闭"
-                send_message(open_id, f"自动审批当前状态：{status}")
-                return
+            if cmd:
+                action, approval_type = cmd[0], cmd[1] if len(cmd) > 1 else None
+                if action == "enable":
+                    set_auto_approval_enabled(True, user_id)
+                    send_message(open_id, "已开启自动审批。")
+                    return
+                if action == "disable":
+                    set_auto_approval_enabled(False, user_id)
+                    send_message(open_id, "已关闭自动审批。")
+                    return
+                if action == "enable_all":
+                    set_all_types_enabled(True, user_id)
+                    send_message(open_id, "已全部开启自动审批。")
+                    return
+                if action == "disable_all":
+                    set_auto_approval_enabled(False, user_id)
+                    send_message(open_id, "已全部关闭自动审批。")
+                    return
+                if action == "enable_type" and approval_type:
+                    set_auto_approval_enabled(True, user_id)
+                    set_auto_approval_type_enabled(approval_type, True, user_id)
+                    send_message(open_id, f"已开启「{approval_type}」自动审批。")
+                    return
+                if action == "disable_type" and approval_type:
+                    set_auto_approval_type_enabled(approval_type, False, user_id)
+                    send_message(open_id, f"已关闭「{approval_type}」自动审批。")
+                    return
+                if action == "query":
+                    st = get_auto_approval_status()
+                    lines = [f"总开关：{'已开启' if st['enabled'] else '已关闭'}"]
+                    for t, on in st["types"].items():
+                        lines.append(f"  · {t}：{'开' if on else '关'}")
+                    send_message(open_id, "自动审批状态：\n" + "\n".join(lines))
+                    return
 
         # 汇总卡出现后，用户通过对话修改字段
         if _try_modify_confirm(open_id, user_id, text):

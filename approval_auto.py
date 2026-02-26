@@ -18,6 +18,7 @@ import httpx
 from approval_rules_loader import (
     check_auto_approve,
     get_auto_approve_user_ids,
+    get_auto_approval_types,
     get_exclude_types,
     get_seal_type_rules,
 )
@@ -36,18 +37,23 @@ _STATE_FILE = os.environ.get("AUTO_APPROVAL_STATE_FILE") or str(
     Path(__file__).resolve().parent / "auto_approval_state.json"
 )
 _state_lock = threading.RLock()
-_auto_approval_enabled = None  # 从文件加载
+_state_data = None  # {"enabled": bool, "types": {type: bool}, ...}
 
 
 def _load_state():
     """加载自动审批开关状态"""
-    global _auto_approval_enabled
+    global _state_data
     path = Path(_STATE_FILE)
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                _auto_approval_enabled = data.get("enabled", False)
+                _state_data = {
+                    "enabled": data.get("enabled", False),
+                    "types": data.get("types") or {},
+                    "updated_by": data.get("updated_by", ""),
+                    "updated_at": data.get("updated_at", ""),
+                }
                 return
         except Exception as e:
             logger.warning("加载自动审批状态失败: %s", e)
@@ -58,24 +64,33 @@ def _load_state():
         if rpath.exists():
             with open(rpath, "r", encoding="utf-8") as f:
                 rules = yaml.safe_load(f) or {}
-                _auto_approval_enabled = rules.get("default_enabled", False)
+                _state_data = {
+                    "enabled": rules.get("default_enabled", False),
+                    "types": {},
+                    "updated_by": "",
+                    "updated_at": "",
+                }
                 return
     except Exception:
         pass
-    _auto_approval_enabled = False
+    _state_data = {"enabled": False, "types": {}, "updated_by": "", "updated_at": ""}
 
 
-def _save_state(enabled, user_id=""):
-    """保存自动审批开关状态"""
-    global _auto_approval_enabled
+def _save_state(enabled=None, types=None, user_id=""):
+    """保存自动审批开关状态。enabled/types 为 None 时保持原值"""
+    global _state_data
     with _state_lock:
-        _auto_approval_enabled = enabled
+        if _state_data is None:
+            _load_state()
+        data = dict(_state_data)
+        if enabled is not None:
+            data["enabled"] = bool(enabled)
+        if types is not None:
+            data["types"] = dict(types)
+        data["updated_by"] = user_id
+        data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        _state_data = data
         try:
-            data = {
-                "enabled": enabled,
-                "updated_by": user_id,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-            }
             with open(_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -83,16 +98,66 @@ def _save_state(enabled, user_id=""):
 
 
 def is_auto_approval_enabled():
-    """获取当前自动审批开关状态"""
-    global _auto_approval_enabled
-    if _auto_approval_enabled is None:
+    """获取当前自动审批总开关状态"""
+    global _state_data
+    if _state_data is None:
         _load_state()
-    return bool(_auto_approval_enabled)
+    return bool(_state_data.get("enabled", False))
+
+
+def is_auto_approval_enabled_for_type(approval_type):
+    """判断指定工单类型是否启用自动审批"""
+    if not is_auto_approval_enabled():
+        return False
+    if approval_type in get_exclude_types():
+        return False
+    types = _state_data.get("types") or {}
+    if approval_type in types:
+        return bool(types[approval_type])
+    # 未在 types 中配置时，按 rules.xxx.enabled
+    try:
+        import yaml
+        rpath = Path(__file__).resolve().parent / "approval_rules.yaml"
+        if rpath.exists():
+            with open(rpath, "r", encoding="utf-8") as f:
+                rules = yaml.safe_load(f) or {}
+                tr = (rules.get("rules") or {}).get(approval_type)
+                return bool(tr and tr.get("enabled", True))
+    except Exception:
+        pass
+    return False
 
 
 def set_auto_approval_enabled(enabled, user_id=""):
-    """设置自动审批开关"""
-    _save_state(bool(enabled), user_id)
+    """设置自动审批总开关"""
+    _save_state(enabled=enabled, user_id=user_id)
+
+
+def set_auto_approval_type_enabled(approval_type, enabled, user_id=""):
+    """设置指定工单类型的自动审批开关"""
+    global _state_data
+    if _state_data is None:
+        _load_state()
+    types = dict(_state_data.get("types") or {})
+    types[approval_type] = bool(enabled)
+    _save_state(types=types, user_id=user_id)
+
+
+def set_all_types_enabled(enabled, user_id=""):
+    """设置全部工单类型的自动审批开关，并开启总开关"""
+    global _state_data
+    if _state_data is None:
+        _load_state()
+    types = {t: bool(enabled) for t in get_auto_approval_types()}
+    _save_state(enabled=True, types=types, user_id=user_id)
+
+
+def get_auto_approval_status():
+    """获取自动审批状态：总开关 + 各类型开关。用于 query 指令"""
+    result = {"enabled": is_auto_approval_enabled(), "types": {}}
+    for t in get_auto_approval_types():
+        result["types"][t] = is_auto_approval_enabled_for_type(t)
+    return result
 
 
 # approval_code -> 工单类型
@@ -410,12 +475,12 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     """
     处理单条待审批任务：获取实例详情 -> 解析表单 -> 判断规则 -> 审批或评论
     """
-    if not is_auto_approval_enabled():
-        return
-    if user_id not in get_auto_approve_user_ids():
-        return
     approval_type = APPROVAL_CODE_TO_TYPE.get(approval_code)
     if not approval_type or approval_type in get_exclude_types():
+        return
+    if not is_auto_approval_enabled_for_type(approval_type):
+        return
+    if user_id not in get_auto_approve_user_ids():
         return
 
     detail, err = get_instance_detail(instance_code, get_token)

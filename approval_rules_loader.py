@@ -65,8 +65,28 @@ def get_switch_commands():
     return {
         "enable": tuple(cmds.get("enable") or ["开启自动审批", "打开自动审批"]),
         "disable": tuple(cmds.get("disable") or ["关闭自动审批"]),
+        "enable_all": tuple(cmds.get("enable_all") or ["全部开启"]),
+        "disable_all": tuple(cmds.get("disable_all") or ["全部关闭"]),
         "query": tuple(cmds.get("query") or ["自动审批状态", "自动审批开没开"]),
+        "enable_type_keywords": list(cmds.get("enable_type_keywords") or ["采购", "开票", "用印"]),
+        "disable_type_keywords": list(cmds.get("disable_type_keywords") or ["采购", "开票", "用印"]),
     }
+
+
+# 类型简称 -> 完整工单类型名
+_TYPE_ALIAS = {
+    "采购": "采购申请",
+    "开票": "开票申请单",
+    "用印": "用印申请单",
+}
+
+
+def get_auto_approval_types():
+    """获取支持自动审批的工单类型（rules 中 enabled 的，排除 exclude_types）"""
+    rules = _load_rules()
+    exclude = get_exclude_types()
+    type_rules = rules.get("rules") or {}
+    return [t for t, r in type_rules.items() if r.get("enabled", True) and t not in exclude]
 
 
 def get_seal_type_rules():
@@ -78,18 +98,37 @@ def get_seal_type_rules():
 def check_switch_command(text):
     """
     检查文本是否为开关指令。
-    返回 "enable" | "disable" | "query" | None
+    返回 (action, approval_type) 或 None。
+    action: "enable" | "disable" | "enable_all" | "disable_all" | "enable_type" | "disable_type" | "query"
+    approval_type: 仅 enable_type/disable_type 时有值，如 "采购申请"
     """
     t = (text or "").strip()
     if not t:
         return None
     cmds = get_switch_commands()
     if t in cmds["enable"]:
-        return "enable"
+        return ("enable", None)
     if t in cmds["disable"]:
-        return "disable"
+        return ("disable", None)
+    if t in cmds["enable_all"]:
+        return ("enable_all", None)
+    if t in cmds["disable_all"]:
+        return ("disable_all", None)
     if t in cmds["query"]:
-        return "query"
+        return ("query", None)
+    # 按类型：开启采购/开启采购申请、关闭用印 等
+    for kw in cmds["enable_type_keywords"]:
+        full = _TYPE_ALIAS.get(kw, kw)
+        if t in ("开启" + kw, "打开" + kw, "开启" + full, "打开" + full,
+                 "开启" + kw + "自动审批", "打开" + kw + "自动审批",
+                 "开启" + full + "自动审批", "打开" + full + "自动审批",
+                 "开启" + kw + "自动审核", "打开" + kw + "自动审核"):
+            return ("enable_type", full)
+    for kw in cmds["disable_type_keywords"]:
+        full = _TYPE_ALIAS.get(kw, kw)
+        if t in ("关闭" + kw, "关闭" + full, "关闭" + kw + "自动审批", "关闭" + full + "自动审批",
+                 "关闭" + kw + "自动审核", "关闭" + full + "自动审核"):
+            return ("disable_type", full)
     return None
 
 
