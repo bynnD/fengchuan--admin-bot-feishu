@@ -133,7 +133,7 @@ def _clean_expired_pending(open_id=None):
         for oid in list(PENDING_INVOICE.keys()) if open_id is None else ([open_id] if open_id in PENDING_INVOICE else []):
             if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_INVOICE[oid]
-                to_notify.append((oid, "开票申请已超时，请重新发起。"))
+                to_notify.append((oid, "开票申请单已超时，请重新发起。"))
         for oid in list(PENDING_SEAL_QUEUE.keys()) if open_id is None else ([open_id] if open_id in PENDING_SEAL_QUEUE else []):
             if oid in PENDING_SEAL_QUEUE and now - PENDING_SEAL_QUEUE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_SEAL_QUEUE[oid]
@@ -252,7 +252,7 @@ def _handle_split_file_intents(open_id, user_id, files_list, intents):
         if len(invoice_files) == 1:
             _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
         else:
-            send_message(open_id, "开票申请每次仅支持一个文件，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
+            send_message(open_id, "开票申请单每次仅支持一个文件，已为您处理第一个文件。如需为其他文件开票，请单独发起。")
             _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
     if seal_files and invoice_files:
         send_message(open_id, f"已接收：{len(seal_files)} 份用印、{len(invoice_files)} 份开票，将分别处理。")
@@ -428,7 +428,7 @@ def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
 
 
 def send_file_intent_options_card(open_id, file_names):
-    """发送文件意图选择卡片：用印申请单 / 开票申请，3 分钟内未说明意图时使用。file_names 可为 str 或 list"""
+    """发送文件意图选择卡片：用印申请单 / 开票申请单，3 分钟内未说明意图时使用。file_names 可为 str 或 list"""
     if isinstance(file_names, list):
         names_str = "、".join(f"「{n}」" for n in file_names)
     else:
@@ -444,8 +444,8 @@ def send_file_intent_options_card(open_id, file_names):
             {"tag": "action", "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "用印申请单（盖章）"}, "type": "primary",
                  "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "用印申请单"}}]},
-                {"tag": "button", "text": {"tag": "plain_text", "content": "开票申请"}, "type": "default",
-                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "开票申请"}}]},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "开票申请单"}, "type": "default",
+                 "behaviors": [{"type": "callback", "value": {"action": "file_intent", "intent": "开票申请单"}}]},
             ]},
         ],
     }
@@ -651,6 +651,26 @@ def _update_seal_card_delayed(token, open_id, doc_fields, file_name, card=None, 
         logger.warning("延时更新用印卡片异常: %s", e)
 
 
+def _update_invoice_card_delayed(token, open_id, card, delay_sec=0.08):
+    """延时更新开票选项卡片以显示选中状态"""
+    if not token or not open_id or not card:
+        return
+    time.sleep(delay_sec)
+    try:
+        body = {"token": token, "card": {"open_ids": [open_id], "config": card.get("config", {}), "elements": card.get("elements", [])}}
+        resp = httpx.post(
+            "https://open.feishu.cn/open-apis/interactive/v1/card/update",
+            headers={"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"},
+            json=body,
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning("延时更新开票卡片失败: code=%s msg=%s", data.get("code"), data.get("msg"))
+    except Exception as e:
+        logger.warning("延时更新开票卡片异常: %s", e)
+
+
 def _send_seal_final_card(open_id, total):
     """全部文件确认后，发送汇总卡片，含「提交工单」按钮"""
     card = {
@@ -780,7 +800,7 @@ def on_card_action_confirm(data):
                 value = json.loads(value) if value else {}
             except json.JSONDecodeError:
                 value = {}
-        # 文件意图选择卡片：用印申请单 / 开票申请（3 分钟内未说明意图时弹出）
+        # 文件意图选择卡片：用印申请单 / 开票申请单（3 分钟内未说明意图时弹出）
         if value.get("action") == "file_intent":
             intent = value.get("intent", "")
             with _state_lock:
@@ -799,7 +819,7 @@ def on_card_action_confirm(data):
                 if files_list:
                     threading.Thread(target=lambda: _handle_file_message(open_id, user_id, None, None, files_list=files_list), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请单，正在处理"}})
-            if intent == "开票申请":
+            if intent == "开票申请单":
                 files_list = pending_file.get("files", [])
                 with _state_lock:
                     PENDING_INVOICE[open_id] = {
@@ -814,7 +834,7 @@ def on_card_action_confirm(data):
                     f0 = files_list[0]
                     msg_id, cj = f0["message_id"], f0["content_json"]
                     threading.Thread(target=lambda: _handle_invoice_file(open_id, user_id, msg_id, cj), daemon=True).start()
-                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请，正在处理"}})
+                return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择开票申请单，正在处理"}})
             return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
         # 用印选项卡片（含排队模式）：律师是否已审核、盖章形式、文件数量
         if value.get("action") == "seal_option":
@@ -928,6 +948,47 @@ def on_card_action_confirm(data):
                 _do_create_seal_multi(open_id, queue_data["user_id"], items, selections)
 
             threading.Thread(target=_do_seal_queue_async, daemon=True).start()
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
+
+        # 开票选项卡片：发票类型、开票项目
+        if value.get("action") == "invoice_option":
+            field = value.get("field")
+            val = value.get("value")
+            if not field or not val or field not in ("invoice_type", "invoice_items"):
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "参数无效"}})
+            with _state_lock:
+                pending = PENDING_INVOICE.get(open_id)
+            if not pending or pending.get("step") != "user_fields":
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新发起开票申请单"}})
+            pending["doc_fields"][field] = val
+            pending["created_at"] = time.time()
+            update_token = getattr(ev, "token", None) or getattr(getattr(ev, "event", None), "token", None) or ""
+            if update_token:
+                doc = dict(pending["doc_fields"])
+                summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc.items() if v and k not in ("invoice_type", "invoice_items")])
+                summary_prefix = f"已接收结算单和合同。\n\n已识别：\n{summary or '（无）'}" if summary else "已接收结算单和合同。\n\n"
+                card = _build_invoice_options_card(doc, summary_prefix)
+                threading.Thread(target=lambda t=update_token, oid=open_id, c=card: _update_invoice_card_delayed(t, oid, c), daemon=True).start()
+            return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": f"已选择：{val}"}})
+
+        # 开票确认提交：选项选完后点击
+        if value.get("action") == "invoice_submit":
+            with _state_lock:
+                pending = PENDING_INVOICE.pop(open_id, None)
+            if not pending or pending.get("step") != "user_fields":
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新发起开票申请单"}})
+            doc_fields = pending.get("doc_fields", {})
+            if not doc_fields.get("invoice_type") or not doc_fields.get("invoice_items"):
+                with _state_lock:
+                    PENDING_INVOICE[open_id] = pending
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择发票类型和开票项目"}})
+            settlement_code = pending.get("settlement_file_code")
+            contract_code = pending.get("contract_file_code")
+            if not settlement_code or not contract_code:
+                return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "缺少结算单或合同，请重新发起"}})
+            def _do_invoice_async():
+                _do_create_invoice(open_id, user_id, doc_fields, settlement_code, contract_code)
+            threading.Thread(target=_do_invoice_async, daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
 
         # 用印提交：选完后点击提交，创建工单
@@ -1208,7 +1269,7 @@ def build_form(approval_type, fields, token, file_codes=None):
             raw = fields.get("amount") or fields.get("金额") or ""
         if not raw and field_name in ("开票金额", "发票金额"):
             raw = fields.get("amount") or ""
-        # 开票申请：客户/开票名称、税务登记证号/社会统一信用代码 等表单字段名兜底
+        # 开票申请单：客户/开票名称、税务登记证号/社会统一信用代码 等表单字段名兜底
         if not raw and field_name in ("客户/开票名称", "购方名称", "开票抬头"):
             raw = fields.get("buyer_name") or ""
         if not raw and field_name in ("税务登记证号/社会统一信用代码", "购方税号", "税务登记证号", "社会统一信用代码"):
@@ -1241,6 +1302,25 @@ def build_form(approval_type, fields, token, file_codes=None):
                             break
                 if not matched:
                     raw = (opts[0].get("value") or opts[0].get("key", "")) if isinstance(opts[0], dict) else ""
+        if field_type == "checkboxV2":
+            opts = field_info.get("options", [])
+            raw_list = raw if isinstance(raw, list) else ([raw] if raw else [])
+            resolved = []
+            for r in raw_list:
+                r_str = str(r).strip()
+                if not r_str:
+                    continue
+                for opt in (opts or []):
+                    if isinstance(opt, dict):
+                        ov = opt.get("value") or opt.get("key", "")
+                        ot = str(opt.get("text", ""))
+                        if r_str == ov or r_str == ot or r_str in (ov, ot):
+                            resolved.append(ov or r_str)
+                            break
+                        if r_str in ot or ot in r_str:
+                            resolved.append(ov or r_str)
+                            break
+            raw = resolved
         # fieldList 无 sub_fields 时使用配置的 fallback（如采购费用明细）
         if field_type == "fieldList" and not (field_info.get("sub_fields")):
             fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
@@ -1456,7 +1536,7 @@ SEAL_INITIAL_FIELDS = {}
 # 限流：open_id -> 上次消息时间
 _user_last_msg = {}
 
-# 开票申请：需结算单+合同双附件，分步收集
+# 开票申请单：需结算单+合同双附件，分步收集
 PENDING_INVOICE = {}
 
 # 工单确认：用户点击确认按钮后创建。confirm_id -> {open_id, user_id, approval_type, fields, file_codes, admin_comment, created_at}
@@ -1591,14 +1671,86 @@ def _get_seal_form_options():
     return result
 
 
-# 开票申请附件字段 ID（6692F47D 表单仅一个「上传开票证明文件」，结算单+合同合并上传）
+# 开票申请单附件字段 ID（6706BE14 表单仅一个「上传开票证明文件」，结算单+合同合并上传）
 INVOICE_ATTACHMENT_FIELD_ID = "widget16457795866320001"
+# 开票申请单选项字段（发票类型、开票项目）
+INVOICE_OPTION_FIELDS = {
+    "invoice_type": "widget16457794296140001",
+    "invoice_items": "widget17660282371600001",
+}
+
+
+def _get_invoice_form_options():
+    """从工单模版读取开票申请单的发票类型、开票项目选项"""
+    token = get_token()
+    cached = get_form_fields("开票申请单", APPROVAL_CODES.get("开票申请单", ""), token)
+    if not cached:
+        return {}
+    result = {}
+    for logical_key, field_id in INVOICE_OPTION_FIELDS.items():
+        info = cached.get(field_id, {})
+        opts = info.get("options", [])
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts) if opts else []
+            except json.JSONDecodeError:
+                opts = []
+        texts = []
+        for o in opts:
+            if isinstance(o, dict):
+                t = o.get("text") or o.get("value", "")
+                if t:
+                    texts.append(str(t))
+        if texts:
+            result[logical_key] = texts
+    return result
+
+
+def _build_invoice_options_card(doc_fields, summary_prefix=""):
+    """构建开票选项卡片：发票类型、开票项目，用印式选项按钮"""
+    opts = _get_invoice_form_options()
+    invoice_type_opts = opts.get("invoice_type") or ["增值税专用发票", "增值税普通发票", "普通发票"]
+    invoice_items_opts = opts.get("invoice_items") or ["技术服务费", "广告费", "咨询费", "其他"]
+    selected_type = str(doc_fields.get("invoice_type", "")).strip()
+    selected_items = str(doc_fields.get("invoice_items", "")).strip()
+    text = (
+        f"{summary_prefix}\n\n请点击下方选项完成补充：\n\n"
+        f"**发票类型**（必选）"
+    )
+    type_btns = [
+        {"tag": "button", "text": {"tag": "plain_text", "content": v},
+         "type": "primary" if v == selected_type else "default",
+         "behaviors": [{"type": "callback", "value": {"action": "invoice_option", "field": "invoice_type", "value": v}}]}
+        for v in invoice_type_opts
+    ]
+    items_btns = [
+        {"tag": "button", "text": {"tag": "plain_text", "content": v},
+         "type": "primary" if v == selected_items else "default",
+         "behaviors": [{"type": "callback", "value": {"action": "invoice_option", "field": "invoice_items", "value": v}}]}
+        for v in invoice_items_opts
+    ]
+    submit_btn = {
+        "tag": "button", "text": {"tag": "plain_text", "content": "确认提交"},
+        "type": "primary",
+        "behaviors": [{"type": "callback", "value": {"action": "invoice_submit"}}],
+    }
+    return {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+            {"tag": "action", "actions": type_btns},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "开票项目（必选）", "lines": 1}},
+            {"tag": "action", "actions": items_btns},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [submit_btn]},
+        ],
+    }
 
 
 def _get_invoice_attachment_field_ids():
-    """从开票申请表单缓存中查找附件字段。新表单仅一个「上传开票证明文件」，结算单+合同合并"""
+    """从开票申请单表单缓存中查找附件字段。新表单仅一个「上传开票证明文件」，结算单+合同合并"""
     token = get_token()
-    cached = get_form_fields("开票申请", APPROVAL_CODES.get("开票申请", ""), token)
+    cached = get_form_fields("开票申请单", APPROVAL_CODES.get("开票申请单", ""), token)
     if not cached:
         return {"unified": INVOICE_ATTACHMENT_FIELD_ID}
     result = {}
@@ -2059,7 +2211,7 @@ def _infer_invoice_file_type(file_name, ai_fields):
 
 
 def _handle_invoice_file(open_id, user_id, message_id, content_json):
-    """处理开票申请的文件上传：根据文件名和内容自动识别是结算单还是合同，支持任意上传顺序"""
+    """处理开票申请单的文件上传：根据文件名和内容自动识别是结算单还是合同，支持任意上传顺序"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
@@ -2090,16 +2242,30 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
         send_message(open_id, f"文件上传失败，请重新发送。{err_detail}")
         return
 
-    extractor = get_file_extractor("开票申请")
+    extractor = get_file_extractor("开票申请单")
     ai_fields = extractor(file_content, file_name, {}, get_token) if extractor else {}
     if ai_fields:
         logger.info("开票文件识别结果: %s", ai_fields)
 
     for k, v in ai_fields.items():
-        if v and str(v).strip():
+        if k == "proof_file_type":
+            # 多选合并：结算单+合同 分别识别后合并去重
+            new_items = v if isinstance(v, list) else ([v] if v and str(v).strip() else [])
+            existing = doc_fields.get(k)
+            existing = existing if isinstance(existing, list) else ([existing] if existing and str(existing).strip() else [])
+            merged = list(dict.fromkeys(existing + [str(x).strip() for x in new_items if x and str(x).strip()]))
+            if merged:
+                doc_fields[k] = merged
+        elif v and str(v).strip():
             doc_fields[k] = v
 
     file_type = _infer_invoice_file_type(file_name, ai_fields)
+    # 未识别到 proof_file_type 时，根据文件类型推断
+    if not doc_fields.get("proof_file_type"):
+        if file_type == "settlement":
+            doc_fields["proof_file_type"] = ["对账单"]
+        elif file_type == "contract":
+            doc_fields["proof_file_type"] = ["合同"]
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
@@ -2128,17 +2294,29 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
             _do_create_invoice(open_id, user_id, doc_fields_final, settlement_code, contract_code)
         else:
             summary = "\n".join([f"· {FIELD_LABELS.get(k, k)}: {v}" for k, v in doc_fields.items() if v])
-            send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
-                         "请补充以下必填项（一条消息说完即可）：\n"
-                         "1. 发票类型（如：增值税专用发票、普通发票等）\n"
-                         "2. 开票项目（如：技术服务费、广告费等）")
+            summary_prefix = f"已接收结算单和合同。\n\n已识别：\n{summary or '（无）'}"
+            card = _build_invoice_options_card(doc_fields_final, summary_prefix)
+            body = CreateMessageRequestBody.builder() \
+                .receive_id(open_id) \
+                .msg_type("interactive") \
+                .content(json.dumps(card, ensure_ascii=False)) \
+                .build()
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(body) \
+                .build()
+            resp = client.im.v1.message.create(request)
+            if not resp.success():
+                logger.error("发送开票选项卡片失败: %s", resp.msg)
+                send_message(open_id, f"已接收{type_label}：{file_name}\n\n已识别：\n{summary or '（无）'}\n\n"
+                             "请补充：发票类型、开票项目（如：增值税专用发票 技术服务费）")
     else:
         need = "合同" if not has_contract else "结算单"
         send_message(open_id, f"已接收{type_label}：{file_name}\n请继续上传{need}（Word/PDF/图片均可）。")
 
 
 def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_code):
-    """开票申请字段齐全时，发送确认卡片，用户点击确认后创建工单"""
+    """开票申请单字段齐全时，发送确认卡片，用户点击确认后创建工单"""
     all_fields = dict(all_fields)
     all_fields.setdefault("proof_file_type", ["合同"])
     all_fields.setdefault("contract_sealed", "已盖章")
@@ -2155,16 +2333,16 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
             file_codes[aid["contract"]] = [contract_code]
     if not file_codes and (settlement_code or contract_code):
         token = get_token()
-        cached = get_form_fields("开票申请", APPROVAL_CODES["开票申请"], token)
+        cached = get_form_fields("开票申请单", APPROVAL_CODES["开票申请单"], token)
         attach_ids = [fid for fid, info in (cached or {}).items()
                       if info.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file")]
         codes = [c for c in [settlement_code, contract_code] if c]
         if attach_ids:
             file_codes[attach_ids[0]] = codes
 
-    admin_comment = get_admin_comment("开票申请", all_fields)
-    summary = format_fields_summary(all_fields, "开票申请")
-    send_confirm_card(open_id, "开票申请", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None)
+    admin_comment = get_admin_comment("开票申请单", all_fields)
+    summary = format_fields_summary(all_fields, "开票申请单")
+    send_confirm_card(open_id, "开票申请单", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None)
 
     with _state_lock:
         if open_id in PENDING_INVOICE:
@@ -2175,7 +2353,7 @@ def _do_create_invoice(open_id, user_id, all_fields, settlement_code, contract_c
 
 
 def _try_complete_invoice(open_id, user_id, text):
-    """用户补充发票类型、开票项目后，创建开票申请"""
+    """用户补充发票类型、开票项目后，创建开票申请单"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
     if not pending or pending.get("step") != "user_fields":
@@ -2185,18 +2363,18 @@ def _try_complete_invoice(open_id, user_id, text):
         with _state_lock:
             if open_id in PENDING_INVOICE:
                 del PENDING_INVOICE[open_id]
-        send_message(open_id, "已取消开票申请，如需办理请重新发起。")
+        send_message(open_id, "已取消开票申请单，如需办理请重新发起。")
         return True
 
     doc_fields = pending.get("doc_fields", {})
     settlement_code = pending.get("settlement_file_code")
     contract_code = pending.get("contract_file_code")
     if not settlement_code or not contract_code:
-        send_message(open_id, "开票申请需要结算单和合同两个附件，请重新发起并分别上传。")
+        send_message(open_id, "开票申请单需要结算单和合同两个附件，请重新发起并分别上传。")
         return True
 
     prompt = (
-        f"用户为开票申请补充了以下信息：\n{text}\n\n"
+        f"用户为开票申请单补充了以下信息：\n{text}\n\n"
         "请提取并返回JSON，必须包含：\n"
         "- invoice_type: 发票类型（如增值税专用发票、普通发票等）\n"
         "- invoice_items: 开票项目（如技术服务费、广告费等）\n"
@@ -2304,7 +2482,7 @@ def on_message(data):
                     })
                     PENDING_FILE_UNCLEAR[open_id]["created_at"] = time.time()
                 count = len(PENDING_FILE_UNCLEAR[open_id]["files"])
-                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+                send_message(open_id, f"已收到文件「{file_name}」（共 {count} 个文件）。请问您需要办理：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
                 _schedule_file_intent_card(open_id)
             return
 
@@ -2368,7 +2546,7 @@ def on_message(data):
             if text_stripped in ("用印", "开票"):
                 needs_seal = (text_stripped == "用印")
                 needs_invoice = (text_stripped == "开票")
-                requests = [{"approval_type": "用印申请单" if needs_seal else "开票申请", "fields": {}}]
+                requests = [{"approval_type": "用印申请单" if needs_seal else "开票申请单", "fields": {}}]
             else:
                 # 2. 尝试解析「第一个用印、第二个开票」等分别指定
                 intents = _parse_file_intents(text_stripped, len(files_list))
@@ -2388,7 +2566,7 @@ def on_message(data):
                 result = analyze_message(conv_copy)
                 requests = result.get("requests", [])
                 needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests)
-                needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests)
+                needs_invoice = any(r.get("approval_type") == "开票申请单" for r in requests)
             if needs_seal and not needs_invoice:
                 files_list = pending_file.get("files", [])
                 with _state_lock:
@@ -2414,7 +2592,7 @@ def on_message(data):
                             entry["timer"].cancel()
                         except Exception:
                             pass
-                req_inv = next((r for r in requests if r.get("approval_type") == "开票申请"), None)
+                req_inv = next((r for r in requests if r.get("approval_type") == "开票申请单"), None)
                 doc_fields_init = {k: v for k, v in (req_inv.get("fields") or {}).items() if v and str(v).strip()} if req_inv else {}
                 with _state_lock:
                     PENDING_INVOICE[open_id] = {
@@ -2430,9 +2608,9 @@ def on_message(data):
                     _handle_invoice_file(open_id, user_id, f0["message_id"], f0["content_json"])
                 return
             if needs_seal and needs_invoice:
-                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请**？回复「用印」或「开票」。")
+                send_message(open_id, "您同时提到用印和开票。请明确：本次上传的文件是用于 **用印申请单** 还是 **开票申请单**？回复「用印」或「开票」。")
                 return
-            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请单**（盖章）还是 **开票申请**？请回复「用印」或「开票」。")
+            send_message(open_id, "未识别到用印或开票需求。请问您上传的文件是用于：**用印申请单**（盖章）还是 **开票申请单**？请回复「用印」或「开票」。")
             return
 
         with _state_lock:
@@ -2459,7 +2637,7 @@ def on_message(data):
         remaining_requests = []
         with _state_lock:
             needs_seal = any(r.get("approval_type") == "用印申请单" for r in requests) and open_id not in PENDING_SEAL
-            needs_invoice = any(r.get("approval_type") == "开票申请" for r in requests) and open_id not in PENDING_INVOICE
+            needs_invoice = any(r.get("approval_type") == "开票申请单" for r in requests) and open_id not in PENDING_INVOICE
 
         if needs_seal and needs_invoice:
             req_seal = next(r for r in requests if r.get("approval_type") == "用印申请单")
@@ -2467,12 +2645,12 @@ def on_message(data):
             if initial:
                 with _state_lock:
                     SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
-            send_message(open_id, "您同时发起了用印申请单和开票申请。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请」。\n\n"
+            send_message(open_id, "您同时发起了用印申请单和开票申请单。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请单」。\n\n"
                          "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。")
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请单"})
-            remaining_requests = [r for r in requests if r.get("approval_type") not in ("用印申请单", "开票申请")]
+            remaining_requests = [r for r in requests if r.get("approval_type") not in ("用印申请单", "开票申请单")]
             if not remaining_requests:
                 return
         else:
@@ -2491,7 +2669,7 @@ def on_message(data):
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                     continue
-                if at == "开票申请" and open_id not in PENDING_INVOICE:
+                if at == "开票申请单" and open_id not in PENDING_INVOICE:
                     initial = req.get("fields", {})
                     doc_fields_init = {k: v for k, v in initial.items() if v and str(v).strip()} if initial else {}
                     with _state_lock:
@@ -2504,7 +2682,7 @@ def on_message(data):
                             "created_at": time.time(),
                         }
                     send_message(open_id, "请补充以下信息：\n"
-                                 f"开票申请需要：上传结算单和合同\n"
+                                 f"开票申请单需要：上传结算单和合同\n"
                                  f"请上传结算单和合同（可任意顺序，Word/PDF/图片均可），我会根据文件名和内容自动识别。")
                     with _state_lock:
                         if open_id in CONVERSATIONS:
@@ -2568,7 +2746,9 @@ def on_message(data):
             replies.append("请补充以下信息：\n" + "\n".join(parts))
 
         if not complete:
-            send_message(open_id, "\n".join(replies))
+            body = "\n".join(replies)
+            if body.strip():
+                send_message(open_id, body)
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请补充信息"})
@@ -2595,7 +2775,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             from approval_types import get_file_extractor, FILE_EXTRACTORS
             diag = {
                 "extractor_registered": get_file_extractor("用印申请单") is not None,
-                "invoice_extractor": get_file_extractor("开票申请") is not None,
+                "invoice_extractor": get_file_extractor("开票申请单") is not None,
                 "file_extractors": list(FILE_EXTRACTORS.keys()),
                 "DEEPSEEK_API_KEY_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
                 "DEEPSEEK_API_KEY_len": len(os.environ.get("DEEPSEEK_API_KEY", "")),

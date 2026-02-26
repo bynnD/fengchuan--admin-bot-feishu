@@ -34,9 +34,9 @@ rules:
     enabled: true
     pass_comment: "采购申请已核实，已自动审批通过。"
 
-  开票申请:
+  开票申请单:
     enabled: true
-    pass_comment: "开票申请已核实，已自动审批通过。"
+    pass_comment: "开票申请单已核实，已自动审批通过。"
 
   用印申请单:
     enabled: true

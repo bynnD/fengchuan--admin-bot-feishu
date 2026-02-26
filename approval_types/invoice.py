@@ -1,4 +1,4 @@
-# 开票申请
+# 开票申请单
 
 import json
 import logging
@@ -8,8 +8,8 @@ from deepseek_client import call_deepseek_with_retry
 
 logger = logging.getLogger(__name__)
 
-NAME = "开票申请"
-APPROVAL_CODE = "6692F47D-F6CF-4342-8DAC-32CE84F39E6F"
+NAME = "开票申请单"
+APPROVAL_CODE = "6706BE14-0ED3-4718-8E57-DF5F52935BDE"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 从结算单和合同自动提取字段
 
@@ -22,7 +22,7 @@ FIELD_HINTS = (
 # 用户必须明确说明
 USER_REQUIRED_FIELDS = ["invoice_type", "invoice_items"]
 # 从结算单/合同自动识别
-AUTO_FIELDS = ["amount", "buyer_name", "tax_id", "contract_no", "settlement_no"]
+AUTO_FIELDS = ["amount", "buyer_name", "tax_id", "contract_no", "settlement_no", "business_type", "proof_file_type"]
 
 CONVERSATION_FIELDS = ["invoice_type", "invoice_items"]
 IMAGE_FIELDS = AUTO_FIELDS
@@ -51,7 +51,7 @@ FIELD_NAME_ALIASES = {
     "开票证明文件类型（可多选）": "proof_file_type",
     "开票合同是否盖章": "contract_sealed",
 }
-# 与 6692F47D 审批定义一致
+# 与 6706BE14 审批定义一致
 FIELD_ID_FALLBACK = {
     "buyer_name":      "widget17334740014470001",   # 客户/开票名称
     "tax_id":          "widget17334740172520001",   # 税务登记证号/社会统一信用代码
@@ -100,6 +100,9 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         f"- tax_id: 购方税号/纳税人识别号\n"
         f"- contract_no: 合同编号\n"
         f"- settlement_no: 结算单编号\n"
+        f"- business_type: 业务类型（如广告、技术、电商等，从文件内容推断）\n"
+        f"- proof_file_type: 开票证明文件类型，可多选。可选值：合同、对账单、有赞商城后台订单、微信小店后台订单、企业微信收款订单、其他。"
+        f"结算单对应「对账单」，合同/协议对应「合同」，根据文件类型和内容选择，返回数组如 [\"合同\",\"对账单\"]\n"
         f"只返回能明确识别的字段，不要猜测。只返回JSON，不要其他内容。"
     )
     try:
@@ -119,11 +122,20 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         result = {}
         for k in AUTO_FIELDS:
             v = out.get(k)
-            if v and str(v).strip():
+            if v is None:
+                continue
+            if k == "proof_file_type":
+                if isinstance(v, list):
+                    items = [str(x).strip() for x in v if x and str(x).strip()]
+                    if items:
+                        result[k] = items
+                elif str(v).strip():
+                    result[k] = [str(v).strip()]
+            elif v and str(v).strip():
                 result[k] = str(v).strip()
         return result
     except Exception as e:
         import traceback
-        logger.warning("开票申请从文件提取失败: %s", e)
+        logger.warning("开票申请单从文件提取失败: %s", e)
         traceback.print_exc()
         return {}

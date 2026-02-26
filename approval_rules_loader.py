@@ -109,7 +109,7 @@ def check_auto_approve(approval_type, fields):
         return False, "", ["该类型未启用自动审批"]
 
     # 采购、开票：默认通过
-    if approval_type in ("采购申请", "开票申请"):
+    if approval_type in ("采购申请", "开票申请单"):
         return True, type_rules.get("pass_comment", "已核实，已自动审批通过。"), []
 
     # 用印：需要 AI 分析，此处仅返回需 AI 检查的标记，实际判断在 approval_auto 中
