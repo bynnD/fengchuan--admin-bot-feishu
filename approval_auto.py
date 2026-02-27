@@ -430,10 +430,13 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     code_to_type = _build_approval_code_to_type()
     approval_type = code_to_type.get(approval_code)
     if not approval_type or approval_type in get_exclude_types():
+        logger.debug("自动审批: 跳过 instance=%s (无类型或已排除)", instance_code)
         return
     if not is_auto_approval_enabled_for_type(approval_type):
+        logger.info("自动审批: 跳过 instance=%s %s 未启用自动审批", instance_code, approval_type)
         return
     if user_id not in get_auto_approve_user_ids():
+        logger.info("自动审批: 跳过 instance=%s user_id=%s 不在 auto_approve_user_ids", instance_code, user_id)
         return
 
     detail, err = get_instance_detail(instance_code, get_token)
@@ -537,6 +540,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         try:
             only_contract, comment = check_invoice_attachments_with_ai(file_contents_with_names, get_token)
             if only_contract:
+                logger.info("自动审批: 开票 instance=%s AI 判断仅合同，转人工", instance_code)
                 add_approval_comment(instance_code, comment, get_token)
                 return
             can_auto = True
@@ -558,8 +562,11 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         risks = risk_points or []
 
     if can_auto:
-        approve_task(approval_code, instance_code, user_id, task_id, comment, get_token)
+        ok, err = approve_task(approval_code, instance_code, user_id, task_id, comment, get_token)
+        if not ok:
+            logger.warning("自动审批: 审批 API 失败 instance=%s: %s", instance_code, err)
     else:
+        logger.info("自动审批: instance=%s %s 不符合规则，添加评论", instance_code, approval_type)
         fail_comment = f"【不符合自动审批规则】\n{comment}\n"
         if risks:
             fail_comment += "风险点：" + "；".join(risks[:5]) + "\n"
@@ -574,8 +581,10 @@ def poll_and_process(get_token):
     """
     uids = get_auto_approve_user_ids()
     if not uids:
-        logger.debug("自动审批轮询: auto_approve_user_ids 为空，跳过")
+        logger.info("自动审批轮询: auto_approve_user_ids 为空，跳过")
         return
+    logger.info("自动审批轮询: 开始 uid=%s", uids)
+    processed_count = 0
     for uid in uids:
         found_any = False
         for approval_code, instance_codes in _iter_instances_for_user(uid, get_token):
@@ -586,6 +595,7 @@ def poll_and_process(get_token):
                     logger.warning("自动审批: 获取实例详情失败 instance=%s err=%s", ic, err)
                     continue
                 task_list = detail.get("task_list") or []
+                matched = False
                 for t in task_list:
                     t_uid = t.get("user_id")
                     t_status = t.get("status")
@@ -594,9 +604,18 @@ def poll_and_process(get_token):
                         process_auto_approve_for_task(
                             approval_code, ic, uid, t.get("id"), get_token
                         )
+                        processed_count += 1
+                        matched = True
                         break
+                if not matched:
+                    pending_uids = [t.get("user_id") for t in task_list if t.get("status") == "PENDING"]
+                    logger.info(
+                        "自动审批: 实例 %s 无匹配任务 (期望 uid=%s, PENDING 任务审批人=%s)",
+                        ic, uid, pending_uids,
+                    )
         if not found_any:
-            logger.debug("自动审批轮询: uid=%s 无待审批实例", uid)
+            logger.info("自动审批轮询: uid=%s 无待审批实例", uid)
+    logger.info("自动审批轮询: 完成，本次处理 %d 个任务", processed_count)
 
 
 def _iter_instances_for_user(user_id, get_token):
@@ -608,7 +627,7 @@ def _iter_instances_for_user(user_id, get_token):
     token = get_token()
     end_ts = int(time.time() * 1000)
     start_ts = int((time.time() - 7 * 24 * 3600) * 1000)  # 近7天
-    for approval_code, _ in _get_approval_codes_to_query():
+    for approval_code, approval_type in _get_approval_codes_to_query():
         if not approval_code:
             logger.debug("自动审批: 跳过空 approval_code")
             continue
@@ -651,8 +670,10 @@ def _iter_instances_for_user(user_id, get_token):
             page = data.get("data", {})
             codes = page.get("instance_code_list", [])
             if codes:
-                logger.info("自动审批: 查询到 %d 个 PENDING 实例 approval=%s", len(codes), approval_code)
+                logger.info("自动审批: 查询到 %d 个 PENDING 实例 %s (approval=%s)", len(codes), approval_type, approval_code)
                 yield approval_code, codes
+            else:
+                logger.debug("自动审批: 查询 %s 返回 0 个 PENDING 实例 (approval_code=%s)", approval_type, approval_code)
             # 分页
             while page.get("page_token"):
                 res2 = httpx.post(
@@ -670,4 +691,4 @@ def _iter_instances_for_user(user_id, get_token):
                 if codes:
                     yield approval_code, codes
         except Exception as e:
-            logger.debug("查询实例失败: %s", e)
+            logger.warning("自动审批: 查询实例失败 approval=%s: %s", approval_type, e)
