@@ -2407,8 +2407,8 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
             else:
                 _on_work_order_card_sent(open_id)
                 send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
-    else:
-        send_message(open_id, f"提交失败：{msg}", use_red=True)
+        else:
+            send_message(open_id, f"提交失败：{msg}", use_red=True)
 
 
 def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False):
