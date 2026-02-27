@@ -582,7 +582,7 @@ def send_approval_type_options_card(open_id):
         btns.append({
             "tag": "button",
             "text": {"tag": "plain_text", "content": name},
-            "type": "primary" if name in ("用印申请单", "开票申请单") else "default",
+            "type": "default",
             "behaviors": [{"type": "callback", "value": {"action": "approval_type_select", "approval_type": name}}],
         })
     card = {

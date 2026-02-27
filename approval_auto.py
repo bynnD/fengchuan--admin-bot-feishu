@@ -606,6 +606,9 @@ def _iter_instances_for_user(user_id, get_token):
     end_ts = int(time.time() * 1000)
     start_ts = int((time.time() - 7 * 24 * 3600) * 1000)  # 近7天
     for approval_code, _ in _get_approval_codes_to_query():
+        if not approval_code:
+            logger.debug("自动审批: 跳过空 approval_code")
+            continue
         try:
             body = {
                 "approval_code": approval_code,
@@ -620,9 +623,27 @@ def _iter_instances_for_user(user_id, get_token):
                 json=body,
                 timeout=10,
             )
+            if res.status_code != 200:
+                try:
+                    err_body = res.json()
+                    logger.warning(
+                        "自动审批: instances/query HTTP %s approval=%s code=%s msg=%s body=%s",
+                        res.status_code, approval_code,
+                        err_body.get("code"), err_body.get("msg"),
+                        err_body,
+                    )
+                except Exception:
+                    logger.warning(
+                        "自动审批: instances/query HTTP %s approval=%s body=%s",
+                        res.status_code, approval_code, res.text[:500],
+                    )
+                continue
             data = res.json()
             if data.get("code") != 0:
-                logger.debug("自动审批: instances/query 失败 approval=%s code=%s msg=%s", approval_code, data.get("code"), data.get("msg"))
+                logger.warning(
+                    "自动审批: instances/query 失败 approval=%s code=%s msg=%s",
+                    approval_code, data.get("code"), data.get("msg"),
+                )
                 continue
             page = data.get("data", {})
             codes = page.get("instance_code_list", [])
