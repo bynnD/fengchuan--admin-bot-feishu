@@ -517,11 +517,13 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 def add_approval_comment(instance_code, content, get_token, user_id=None):
     """在审批实例下添加评论。飞书要求 content 为 JSON 字符串 {\"text\":\"...\",\"files\":[]}。
-    99992402 field validation failed 时，尝试 user_id 放 query 或仅传 content。"""
+    99992402 field validation failed 时，尝试多种传参方式。"""
     token = get_token()
     text = (content or "自动审批").strip()
-    # 移除可能导致 field validation failed 的控制字符（保留换行）
-    text = "".join(c for c in text if c == "\n" or not (ord(c) < 32 or ord(c) == 127))
+    # 收紧 content：换行、制表符等替换为空格，移除其他控制字符，避免触发 field validation failed
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    text = "".join(c for c in text if ord(c) >= 32 and ord(c) != 127)
+    text = " ".join(text.split())  # 合并多余空格
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
     content_json = json.dumps({"text": text, "files": []}, ensure_ascii=False, separators=(",", ":"))
@@ -535,44 +537,48 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
             timeout=10,
         )
 
-    # 尝试1：user_id 放 query（部分版本要求）
-    if user_id:
-        params = {"user_id_type": "user_id", "user_id": user_id}
-        res = _post(params, {"content": content_json})
-        data = res.json()
-        if data.get("code") == 0:
-            logger.info("已添加审批评论: instance=%s", instance_code)
-            return True, None
-
-    # 尝试2：user_id 放 body
+    # 尝试1：user_id 放 body（飞书文档推荐）
     if user_id:
         body = {"content": content_json, "user_id": user_id}
         res = _post({"user_id_type": "user_id"}, body)
         data = res.json()
         if data.get("code") == 0:
-            logger.info("已添加审批评论: instance=%s", instance_code)
+            logger.info("已添加审批评论: instance=%s user_id=%s", instance_code, user_id)
             return True, None
 
-    # 尝试3：仅 content（JSON 格式），不传 user_id
+    # 尝试2：user_id 放 query
+    if user_id:
+        params = {"user_id_type": "user_id", "user_id": user_id}
+        res = _post(params, {"content": content_json})
+        data = res.json()
+        if data.get("code") == 0:
+            logger.info("已添加审批评论(query): instance=%s user_id=%s", instance_code, user_id)
+            return True, None
+
+    # 尝试3：仅 content，不传 user_id
     res = _post({"user_id_type": "user_id"}, {"content": content_json})
     data = res.json()
     if data.get("code") == 0:
         logger.info("已添加审批评论(无user_id): instance=%s", instance_code)
         return True, None
 
-    # 尝试4：content 改为纯文本（部分环境可能仅支持纯文本）
+    # 尝试4：content 改为纯文本
     if data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower():
         res4 = _post({"user_id_type": "user_id"}, {"content": text})
         data4 = res4.json()
         if data4.get("code") == 0:
-            logger.info("已添加审批评论(纯文本content): instance=%s", instance_code)
+            logger.info("已添加审批评论(纯文本): instance=%s", instance_code)
             return True, None
-        data = data4  # 用于最终错误日志
+        data = data4
 
     logger.warning(
-        "添加评论失败: code=%s msg=%s",
+        "添加评论失败: code=%s msg=%s instance=%s user_id=%r content_len=%d content_preview=%r",
         data.get("code"),
         data.get("msg"),
+        instance_code,
+        user_id,
+        len(content_json),
+        content_json[:120] + "..." if len(content_json) > 120 else content_json,
     )
     return False, data.get("msg", "未知错误")
 
