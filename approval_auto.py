@@ -516,22 +516,28 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 
 def add_approval_comment(instance_code, content, get_token, user_id=None):
-    """在审批实例下添加评论。飞书要求 content 为 JSON 字符串 {\"text\":\"...\",\"files\":[]}。
-    99992402 field validation failed 时，尝试多种传参方式。"""
+    """在审批实例下添加评论。飞书要求 content 为 JSON 字符串。
+    铁桶防御：绝对不手动拼接字符串，AI 返回的双引号/换行/制表符等由 json.dumps 自动转义。"""
     token = get_token()
+    # 仅做长度截断，不预清洗——json.dumps 会正确处理双引号、换行、制表符等
     text = (content or "自动审批").strip()
-    # 收紧 content：换行、制表符等替换为空格，移除其他控制字符，避免触发 field validation failed
-    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    text = "".join(c for c in text if ord(c) >= 32 and ord(c) != 127)
-    text = " ".join(text.split())  # 合并多余空格
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
-    content_json = json.dumps({"text": text, "files": []}, ensure_ascii=False, separators=(",", ":"))
+
+    # 核心防线：先放入字典，再用 json.dumps 序列化，自动处理所有转义
+    content_dict = {"text": text, "files": []}
+    safe_content_str = json.dumps(content_dict, ensure_ascii=False)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "python-httpx/0.28.1",
+    }
 
     def _post(params, body):
         return httpx.post(
             f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            headers=headers,
             params=params,
             json=body,
             timeout=10,
@@ -539,8 +545,9 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
 
     # 尝试1：user_id 放 body（飞书文档推荐）
     if user_id:
-        body = {"content": content_json, "user_id": user_id}
-        res = _post({"user_id_type": "user_id"}, body)
+        payload = {"content": safe_content_str, "user_id": user_id}
+        logger.debug("审批评论请求 payload: %s", json.dumps(payload, ensure_ascii=False)[:200])
+        res = _post({"user_id_type": "user_id"}, payload)
         data = res.json()
         if data.get("code") == 0:
             logger.info("已添加审批评论: instance=%s user_id=%s", instance_code, user_id)
@@ -549,20 +556,20 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
     # 尝试2：user_id 放 query
     if user_id:
         params = {"user_id_type": "user_id", "user_id": user_id}
-        res = _post(params, {"content": content_json})
+        res = _post(params, {"content": safe_content_str})
         data = res.json()
         if data.get("code") == 0:
             logger.info("已添加审批评论(query): instance=%s user_id=%s", instance_code, user_id)
             return True, None
 
     # 尝试3：仅 content，不传 user_id
-    res = _post({"user_id_type": "user_id"}, {"content": content_json})
+    res = _post({"user_id_type": "user_id"}, {"content": safe_content_str})
     data = res.json()
     if data.get("code") == 0:
         logger.info("已添加审批评论(无user_id): instance=%s", instance_code)
         return True, None
 
-    # 尝试4：content 改为纯文本
+    # 尝试4：content 改为纯文本（兜底）
     if data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower():
         res4 = _post({"user_id_type": "user_id"}, {"content": text})
         data4 = res4.json()
@@ -577,8 +584,8 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
         data.get("msg"),
         instance_code,
         user_id,
-        len(content_json),
-        content_json[:120] + "..." if len(content_json) > 120 else content_json,
+        len(safe_content_str),
+        safe_content_str[:120] + "..." if len(safe_content_str) > 120 else safe_content_str,
     )
     return False, data.get("msg", "未知错误")
 
