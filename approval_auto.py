@@ -85,9 +85,10 @@ def _collect_tokens_from_file_codes(file_codes, file_names_hint=None):
     return tokens
 
 
-def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_tokens_with_names=None):
+def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_tokens_with_names=None, file_contents_with_names=None):
     """
     工单创建前规则预检。用于发确认卡前或直接创建前。
+    file_contents_with_names: [(content_bytes, file_name), ...] 内存中的文件内容，优先使用，避免审批 file_code 无法用 drive 下载导致 404。
     返回 (compliant: bool, comment: str, risks: list)
     """
     if not get_token:
@@ -196,21 +197,25 @@ def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_t
         return can_auto, comment, all_risks
 
     if approval_type == "开票申请单":
-        if file_tokens_with_names:
-            tokens_with_names = file_tokens_with_names
+        # 优先使用传入的内存文件内容，避免审批 file_code 无法用 drive 下载导致 404
+        if file_contents_with_names:
+            file_contents_for_ai = [(c or b"", n or f"附件{i+1}") for i, (c, n) in enumerate(file_contents_with_names[:10])]
         else:
-            tokens_with_names = _collect_tokens_from_file_codes(file_codes or {})
+            if file_tokens_with_names:
+                tokens_with_names = file_tokens_with_names
+            else:
+                tokens_with_names = _collect_tokens_from_file_codes(file_codes or {})
 
-        if not tokens_with_names:
-            return False, "开票申请单缺少附件，无法进行 AI 分析。", ["缺少附件"]
+            if not tokens_with_names:
+                return False, "开票申请单缺少附件，无法进行 AI 分析。", ["缺少附件"]
 
-        file_contents_with_names = []
-        for i, (tok, fname_from_form) in enumerate(tokens_with_names[:10]):
-            content, dl_err = _download_approval_file(tok, get_token)
-            fname = fname_from_form or f"附件{i+1}"
-            file_contents_with_names.append((content or b"", fname))
+            file_contents_for_ai = []
+            for i, (tok, fname_from_form) in enumerate(tokens_with_names[:10]):
+                content, dl_err = _download_approval_file(tok, get_token)
+                fname = fname_from_form or f"附件{i+1}"
+                file_contents_for_ai.append((content or b"", fname))
         try:
-            only_contract, comment = check_invoice_attachments_with_ai(file_contents_with_names, get_token)
+            only_contract, comment = check_invoice_attachments_with_ai(file_contents_for_ai, get_token)
             if only_contract:
                 return False, comment or "附件中仅有合同。", ["仅合同"]
             return True, "", []

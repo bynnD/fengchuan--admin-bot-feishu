@@ -2729,7 +2729,13 @@ def _process_invoice_upload_batch_impl(open_id, user_id, files):
                     doc_fields[k] = merged
             elif k != "amount" and v and str(v).strip():
                 doc_fields[k] = v
-        file_codes_list.append({"file_code": file_code, "proof_type": proof_type, "file_name": file_name})
+        # 保存 content 供 run_pre_check 复用，避免审批 file_code 无法用 drive 下载导致 404
+        file_codes_list.append({
+            "file_code": file_code,
+            "proof_type": proof_type,
+            "file_name": file_name,
+            "content": file_content,
+        })
     # 合同+对账单：金额优先取自对账单
     if amount_from_settlement:
         doc_fields["amount"] = amount_from_settlement
@@ -2844,8 +2850,14 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
 
     admin_comment = get_admin_comment("开票申请单", all_fields)
     summary = format_fields_summary(all_fields, "开票申请单")
+    # 优先使用内存中的文件内容，避免审批 file_code 无法用 drive 下载导致 404
+    file_contents_with_names = [(f["content"], f.get("file_name", "未知文件")) for f in (file_codes_list or []) if f.get("content") is not None]
     file_tokens_with_names = [(f["file_code"], f.get("file_name", "")) for f in (file_codes_list or []) if f.get("file_code")]
-    pre_check = run_pre_check("开票申请单", all_fields, file_codes or {}, get_token, file_tokens_with_names=file_tokens_with_names)
+    pre_check = run_pre_check(
+        "开票申请单", all_fields, file_codes or {}, get_token,
+        file_tokens_with_names=file_tokens_with_names,
+        file_contents_with_names=file_contents_with_names if file_contents_with_names else None,
+    )
     # 选项卡已展示「仅合同」风险时，确保预检结果包含该风险，以便工单创建时写入评论
     proof_set = set(f.get("proof_type", "") for f in (file_codes_list or []) if f.get("proof_type"))
     if proof_set == {"合同"}:
