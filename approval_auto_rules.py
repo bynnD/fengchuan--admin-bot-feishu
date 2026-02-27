@@ -16,8 +16,11 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def collect_file_tokens_from_form(form_list):
-    """从审批表单中收集所有附件 file_token/code"""
-    tokens = []
+    """
+    从审批表单中收集所有附件 file_token/code 及文件名。
+    返回 [(token, name), ...]，name 为表单中的文件名，无则空字符串。
+    """
+    result = []
 
     def _extract_from_val(val):
         if isinstance(val, list):
@@ -25,11 +28,12 @@ def collect_file_tokens_from_form(form_list):
                 if isinstance(v, dict):
                     tok = v.get("file_token") or v.get("code") or v.get("file_code")
                     if tok:
-                        tokens.append(tok)
+                        name = v.get("name") or v.get("file_name") or ""
+                        result.append((tok, str(name).strip() if name else ""))
                 elif isinstance(v, str) and v.strip():
-                    tokens.append(v.strip())
+                    result.append((v.strip(), ""))
         elif val:
-            tokens.append(str(val))
+            result.append((str(val), ""))
 
     for item in form_list:
         if item.get("type") in ("attach", "attachV2", "attachment", "attachmentV2", "file"):
@@ -44,7 +48,7 @@ def collect_file_tokens_from_form(form_list):
                                 "attach", "attachV2", "attachment", "attachmentV2", "file"
                             ):
                                 _extract_from_val(cell.get("value", []))
-    return tokens
+    return result
 
 
 # =============================================================================

@@ -443,29 +443,33 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     cached = get_form_fields(approval_type, approval_code, get_token)
     fields = parse_form_to_fields(approval_type, form_list, cached, get_token)
 
-    # 用印申请单：需要 AI 分析附件
+    # 用印申请单：需要 AI 分析所有附件
     if approval_type == "用印申请单":
         seal_type = fields.get("seal_type", "")
         doc_name = fields.get("document_name", "未知")
         doc_type = fields.get("document_type", "")
 
-        file_tokens = collect_file_tokens_from_form(form_list)
+        # 多行 fieldList 时，从首行提取印章类型、文件名称等
+        seal_detail = fields.get("seal_detail", [])
+        if seal_detail and isinstance(seal_detail, list) and len(seal_detail) > 0:
+            first_row = seal_detail[0]
+            if isinstance(first_row, dict):
+                _val = first_row.get("印章类型") or first_row.get("seal_type")
+                if _val is not None and _val != "":
+                    seal_type = _val.get("text", _val) if isinstance(_val, dict) else str(_val)
+                if not doc_name or doc_name == "未知":
+                    _dn = first_row.get("文件名称")
+                    doc_name = (_dn.get("text", _dn) if isinstance(_dn, dict) else _dn) or "未知"
+                if not doc_type:
+                    _dt = first_row.get("文件类型")
+                    doc_type = (_dt.get("text", _dt) if isinstance(_dt, dict) else _dt) or ""
 
-        file_content = None
-        file_name = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
-        if not file_tokens:
+        file_tokens_with_names = collect_file_tokens_from_form(form_list)
+
+        if not file_tokens_with_names:
             add_approval_comment(
                 instance_code,
                 "【自动审批】用印申请单缺少附件，无法进行 AI 分析，请人工审批。",
-                get_token,
-            )
-            return
-        file_content, dl_err = _download_approval_file(file_tokens[0], get_token)
-        if not file_content:
-            logger.warning("用印附件下载失败 instance=%s: %s", instance_code, dl_err)
-            add_approval_comment(
-                instance_code,
-                f"【自动审批】附件下载失败（{dl_err}），无法进行 AI 分析，请人工审批。",
                 get_token,
             )
             return
@@ -476,22 +480,46 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
                 get_token,
             )
             return
-        try:
-            can_auto, comment, risks = check_seal_with_ai(
-                file_content, file_name, seal_type, get_token
-            )
-        except Exception as e:
-            logger.warning("用印 AI 分析异常: %s", e)
-            add_approval_comment(
-                instance_code,
-                f"【自动审批】AI 分析异常，请人工审批。{e}",
-                get_token,
-            )
+
+        default_fname = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
+        can_auto = True
+        comment = "用印申请单已核实，已自动审批通过。"
+        for i, (tok, fname_from_form) in enumerate(file_tokens_with_names):
+            file_content, dl_err = _download_approval_file(tok, get_token)
+            if not file_content:
+                logger.warning("用印附件 %d 下载失败 instance=%s: %s", i + 1, instance_code, dl_err)
+                add_approval_comment(
+                    instance_code,
+                    f"【自动审批】附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析，请人工审批。",
+                    get_token,
+                )
+                return
+            file_name = fname_from_form or (default_fname if i == 0 else f"附件{i+1}")
+            try:
+                file_can_auto, file_comment, risks = check_seal_with_ai(
+                    file_content, file_name, seal_type, get_token
+                )
+                if not file_can_auto:
+                    can_auto = False
+                    comment = file_comment
+                    break
+            except Exception as e:
+                logger.warning("用印附件 %d AI 分析异常: %s", i + 1, e)
+                add_approval_comment(
+                    instance_code,
+                    f"【自动审批】AI 分析异常（附件{i + 1}），请人工审批。{e}",
+                    get_token,
+                )
+                return
+        if not can_auto:
+            add_approval_comment(instance_code, comment, get_token)
             return
+        risks = []
     elif approval_type == "开票申请单":
-        # 开票申请：AI 分析附件，仅合同则添加评论不处理，其他情况自动通过
-        file_tokens = collect_file_tokens_from_form(form_list)
-        if not file_tokens:
+        # 开票申请：AI 分析附件（最多 10 个），仅合同则添加评论不处理，其他情况自动通过
+        INVOICE_MAX_ATTACHMENTS = 10
+        file_tokens_with_names = collect_file_tokens_from_form(form_list)
+        if not file_tokens_with_names:
             add_approval_comment(
                 instance_code,
                 "【自动审批】开票申请单缺少附件，无法进行 AI 分析，请人工审批。",
@@ -499,9 +527,9 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
             )
             return
         file_contents_with_names = []
-        for i, tok in enumerate(file_tokens[:5]):
+        for i, (tok, fname_from_form) in enumerate(file_tokens_with_names[:INVOICE_MAX_ATTACHMENTS]):
             content, dl_err = _download_approval_file(tok, get_token)
-            fname = f"附件{i+1}.pdf" if content else f"附件{i+1}"
+            fname = fname_from_form or (f"附件{i+1}" if content else f"附件{i+1}")
             file_contents_with_names.append((content or b"", fname))
         try:
             only_contract, comment = check_invoice_attachments_with_ai(file_contents_with_names, get_token)
