@@ -3275,6 +3275,64 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(diag, ensure_ascii=False, indent=2).encode("utf-8"))
+        elif path == "/debug-instances-query":
+            from urllib.parse import parse_qs
+            qs = parse_qs((self.path.split("?") + ["?"])[1])
+            if SECRET_TOKEN:
+                token_param = (qs.get("token") or [""])[0]
+                if token_param != SECRET_TOKEN:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"Forbidden: invalid or missing token")
+                    return
+            at = (qs.get("type") or [""])[0] or "开票申请单"
+            try:
+                code = APPROVAL_CODES.get(at, "")
+                if not code:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"未知类型: {at}"}, ensure_ascii=False).encode("utf-8"))
+                    return
+                token = get_token()
+                end_ts = int(time.time() * 1000)
+                start_ts = int((time.time() - 7 * 24 * 3600) * 1000)
+                body = {
+                    "approval_code": code,
+                    "instance_start_time_from": str(start_ts),
+                    "instance_start_time_to": str(end_ts),
+                    "instance_status": "PENDING",
+                }
+                res = httpx.post(
+                    "https://open.feishu.cn/open-apis/approval/v4/instances/query",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    params={"user_id_type": "user_id"},
+                    json=body,
+                    timeout=10,
+                )
+                data = res.json()
+                out = {
+                    "approval_type": at,
+                    "approval_code": code,
+                    "request_body": body,
+                    "time_range_human": {
+                        "from": time.strftime("%Y-%m-%d %H:%M", time.localtime(start_ts / 1000)),
+                        "to": time.strftime("%Y-%m-%d %H:%M", time.localtime(end_ts / 1000)),
+                    },
+                    "http_status": res.status_code,
+                    "response": data,
+                    "instance_count": len(data.get("data", {}).get("instance_code_list", [])),
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
+            except Exception as e:
+                import traceback
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e), "traceback": traceback.format_exc()}, ensure_ascii=False).encode("utf-8"))
         elif path == "/debug-form":
             from urllib.parse import parse_qs
             qs = parse_qs((self.path.split("?") + ["?"])[1])

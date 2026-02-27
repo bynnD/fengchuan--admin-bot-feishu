@@ -627,6 +627,11 @@ def _iter_instances_for_user(user_id, get_token):
     token = get_token()
     end_ts = int(time.time() * 1000)
     start_ts = int((time.time() - 7 * 24 * 3600) * 1000)  # 近7天
+    logger.info(
+        "自动审批: 查询时间范围 %s ~ %s (近7天)",
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(start_ts / 1000)),
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(end_ts / 1000)),
+    )
     for approval_code, approval_type in _get_approval_codes_to_query():
         if not approval_code:
             logger.debug("自动审批: 跳过空 approval_code")
@@ -638,6 +643,11 @@ def _iter_instances_for_user(user_id, get_token):
                 "instance_start_time_to": str(end_ts),
                 "instance_status": "PENDING",
             }
+            logger.info(
+                "自动审批: 请求 instances/query %s body=%s",
+                approval_type,
+                body,
+            )
             res = httpx.post(
                 "https://open.feishu.cn/open-apis/approval/v4/instances/query",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -663,17 +673,25 @@ def _iter_instances_for_user(user_id, get_token):
             data = res.json()
             if data.get("code") != 0:
                 logger.warning(
-                    "自动审批: instances/query 失败 approval=%s code=%s msg=%s",
-                    approval_code, data.get("code"), data.get("msg"),
+                    "自动审批: instances/query 失败 approval=%s code=%s msg=%s 完整响应=%s",
+                    approval_code, data.get("code"), data.get("msg"), data,
                 )
                 continue
             page = data.get("data", {})
+            logger.debug("自动审批: instances/query %s 响应 data 键=%s", approval_type, list(page.keys()) if isinstance(page, dict) else type(page))
             codes = page.get("instance_code_list", [])
             if codes:
-                logger.info("自动审批: 查询到 %d 个 PENDING 实例 %s (approval=%s)", len(codes), approval_type, approval_code)
+                logger.info(
+                    "自动审批: 查询到 %d 个 PENDING 实例 %s instance_codes=%s",
+                    len(codes), approval_type, codes[:5] if len(codes) > 5 else codes,
+                )
                 yield approval_code, codes
             else:
-                logger.debug("自动审批: 查询 %s 返回 0 个 PENDING 实例 (approval_code=%s)", approval_type, approval_code)
+                logger.info(
+                    "自动审批: 查询 %s 返回 0 个 PENDING 实例 完整响应 data=%s",
+                    approval_type,
+                    page,
+                )
             # 分页
             while page.get("page_token"):
                 res2 = httpx.post(
@@ -685,6 +703,7 @@ def _iter_instances_for_user(user_id, get_token):
                 )
                 data2 = res2.json()
                 if data2.get("code") != 0:
+                    logger.warning("自动审批: 分页查询失败 approval=%s code=%s", approval_code, data2.get("code"))
                     break
                 page = data2.get("data", {})
                 codes = page.get("instance_code_list", [])

@@ -166,3 +166,4 @@ docker run -e FEISHU_APP_ID=xxx -e FEISHU_APP_SECRET=xxx -e DEEPSEEK_API_KEY=xxx
 
 - `GET /`：健康检查，返回 `ok`
 - `GET /debug-form?type=采购申请`：查看指定审批类型的表单字段结构（若配置 `SECRET_TOKEN`，需带 `?token=xxx`）
+- `GET /debug-instances-query?type=开票申请单`：调试 instances/query 接口，返回 PENDING 实例查询的请求与响应（若配置 `SECRET_TOKEN`，需带 `?token=xxx`）
