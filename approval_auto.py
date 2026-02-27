@@ -679,7 +679,14 @@ def _iter_instances_for_user(user_id, get_token):
                 continue
             page = data.get("data", {})
             logger.debug("自动审批: instances/query %s 响应 data 键=%s", approval_type, list(page.keys()) if isinstance(page, dict) else type(page))
+            # 飞书 API 可能返回 instance_code_list 或 instance_list（新格式，需从 instance.code 提取）
             codes = page.get("instance_code_list", [])
+            if not codes and page.get("instance_list"):
+                codes = [
+                    item.get("instance", {}).get("code")
+                    for item in page["instance_list"]
+                    if item.get("instance", {}).get("code")
+                ]
             if codes:
                 logger.info(
                     "自动审批: 查询到 %d 个 PENDING 实例 %s instance_codes=%s",
@@ -707,6 +714,12 @@ def _iter_instances_for_user(user_id, get_token):
                     break
                 page = data2.get("data", {})
                 codes = page.get("instance_code_list", [])
+                if not codes and page.get("instance_list"):
+                    codes = [
+                        item.get("instance", {}).get("code")
+                        for item in page["instance_list"]
+                        if item.get("instance", {}).get("code")
+                    ]
                 if codes:
                     yield approval_code, codes
         except Exception as e:

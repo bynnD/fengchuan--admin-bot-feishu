@@ -3311,6 +3311,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     timeout=10,
                 )
                 data = res.json()
+                page_data = data.get("data", {})
+                codes = page_data.get("instance_code_list", [])
+                if not codes and page_data.get("instance_list"):
+                    codes = [item.get("instance", {}).get("code") for item in page_data["instance_list"] if item.get("instance", {}).get("code")]
                 out = {
                     "approval_type": at,
                     "approval_code": code,
@@ -3321,7 +3325,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     },
                     "http_status": res.status_code,
                     "response": data,
-                    "instance_count": len(data.get("data", {}).get("instance_code_list", [])),
+                    "instance_count": len(codes),
                 }
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
