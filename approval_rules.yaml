@@ -2,6 +2,10 @@
 # 总开关由用户 723eg4a6 通过对话控制，此处为首次部署默认值
 default_enabled: false
 
+# 若公司使用不同的审批定义，可在此覆盖 approval_code（从飞书管理后台-审批-对应审批的 URL 中获取）
+# approval_code_override:
+#   开票申请单: "你的开票审批定义ID"
+
 # 启用自动审批的审批人 user_id 列表
 auto_approve_user_ids:
   - "723eg4a6"

@@ -23,6 +23,7 @@ from approval_auto_rules import (
 from approval_rules_loader import (
     check_auto_approve,
     get_auto_approve_user_ids,
+    get_approval_code_override,
     get_auto_approval_types,
     get_exclude_types,
 )
@@ -164,7 +165,28 @@ def get_auto_approval_status():
     return result
 
 
-# approval_code -> 工单类型
+# approval_code -> 工单类型（含 override 后的映射）
+def _get_approval_codes_to_query():
+    """获取用于查询的 (approval_code, approval_type) 列表，含 override"""
+    result = []
+    for approval_type, code in APPROVAL_CODES.items():
+        override = get_approval_code_override(approval_type)
+        effective = override if override else code
+        result.append((effective, approval_type))
+    return result
+
+
+def _build_approval_code_to_type():
+    """构建 approval_code -> approval_type 映射，含 override"""
+    mapping = {}
+    for approval_type, code in APPROVAL_CODES.items():
+        mapping[code] = approval_type
+        override = get_approval_code_override(approval_type)
+        if override:
+            mapping[override] = approval_type
+    return mapping
+
+
 APPROVAL_CODE_TO_TYPE = {v: k for k, v in APPROVAL_CODES.items()}
 
 
@@ -402,7 +424,8 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     """
     处理单条待审批任务：获取实例详情 -> 解析表单 -> 判断规则 -> 审批或评论
     """
-    approval_type = APPROVAL_CODE_TO_TYPE.get(approval_code)
+    code_to_type = _build_approval_code_to_type()
+    approval_type = code_to_type.get(approval_code)
     if not approval_type or approval_type in get_exclude_types():
         return
     if not is_auto_approval_enabled_for_type(approval_type):
@@ -518,47 +541,65 @@ def poll_and_process(get_token):
     轮询待审批任务并处理。
     从实例详情 task_list 中筛选出 user_id 的 PENDING 任务。
     """
-    for uid in get_auto_approve_user_ids():
+    uids = get_auto_approve_user_ids()
+    if not uids:
+        logger.debug("自动审批轮询: auto_approve_user_ids 为空，跳过")
+        return
+    for uid in uids:
+        found_any = False
         for approval_code, instance_codes in _iter_instances_for_user(uid, get_token):
+            found_any = True
             for ic in instance_codes:
-                detail, _ = get_instance_detail(ic, get_token)
+                detail, err = get_instance_detail(ic, get_token)
                 if not detail:
+                    logger.warning("自动审批: 获取实例详情失败 instance=%s err=%s", ic, err)
                     continue
                 task_list = detail.get("task_list") or []
                 for t in task_list:
-                    if t.get("user_id") == uid and t.get("status") == "PENDING":
+                    t_uid = t.get("user_id")
+                    t_status = t.get("status")
+                    if t_uid == uid and t_status == "PENDING":
+                        logger.info("自动审批: 找到待处理任务 approval=%s instance=%s task_id=%s", approval_code, ic, t.get("id"))
                         process_auto_approve_for_task(
                             approval_code, ic, uid, t.get("id"), get_token
                         )
                         break
+        if not found_any:
+            logger.debug("自动审批轮询: uid=%s 无待审批实例", uid)
 
 
 def _iter_instances_for_user(user_id, get_token):
-    """遍历各审批类型下该用户相关的实例（含待审批）"""
+    """
+    遍历各审批类型下的 PENDING 实例。
+    注意：飞书 instances/query 的 user_id 按发起人过滤，不是待审批人。
+    因此不传 user_id，查询所有 PENDING 实例，后续在 task_list 中按 user_id 筛选待审批任务。
+    """
     token = get_token()
     end_ts = int(time.time() * 1000)
     start_ts = int((time.time() - 7 * 24 * 3600) * 1000)  # 近7天
-    for approval_code in APPROVAL_CODES.values():
+    for approval_code, _ in _get_approval_codes_to_query():
         try:
+            body = {
+                "approval_code": approval_code,
+                "instance_start_time_from": str(start_ts),
+                "instance_start_time_to": str(end_ts),
+                "instance_status": "PENDING",
+            }
             res = httpx.post(
                 "https://open.feishu.cn/open-apis/approval/v4/instances/query",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 params={"user_id_type": "user_id"},
-                json={
-                    "user_id": user_id,
-                    "approval_code": approval_code,
-                    "instance_start_time_from": str(start_ts),
-                    "instance_start_time_to": str(end_ts),
-                    "instance_status": "PENDING",
-                },
+                json=body,
                 timeout=10,
             )
             data = res.json()
             if data.get("code") != 0:
+                logger.debug("自动审批: instances/query 失败 approval=%s code=%s msg=%s", approval_code, data.get("code"), data.get("msg"))
                 continue
             page = data.get("data", {})
             codes = page.get("instance_code_list", [])
             if codes:
+                logger.info("自动审批: 查询到 %d 个 PENDING 实例 approval=%s", len(codes), approval_code)
                 yield approval_code, codes
             # 分页
             while page.get("page_token"):
@@ -566,13 +607,7 @@ def _iter_instances_for_user(user_id, get_token):
                     "https://open.feishu.cn/open-apis/approval/v4/instances/query",
                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                     params={"user_id_type": "user_id", "page_token": page["page_token"]},
-                    json={
-                        "user_id": user_id,
-                        "approval_code": approval_code,
-                        "instance_start_time_from": str(start_ts),
-                        "instance_start_time_to": str(end_ts),
-                        "instance_status": "PENDING",
-                    },
+                    json=body,
                     timeout=10,
                 )
                 data2 = res2.json()

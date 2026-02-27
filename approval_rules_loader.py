@@ -89,6 +89,13 @@ def get_auto_approval_types():
     return [t for t, r in type_rules.items() if r.get("enabled", True) and t not in exclude]
 
 
+def get_approval_code_override(approval_type):
+    """获取审批类型的 approval_code 覆盖（若公司使用不同的审批定义）"""
+    rules = _load_rules()
+    overrides = rules.get("approval_code_override") or {}
+    return overrides.get(approval_type)
+
+
 def get_seal_type_rules():
     """获取用印类型与文件类型匹配规则"""
     rules = _load_rules()

@@ -3316,12 +3316,15 @@ def _start_health_server():
 
 
 def _start_auto_approval_polling():
-    """定时轮询待审批任务并执行自动审批"""
+    """定时轮询待审批任务并执行自动审批。启动时立即执行一次，再按间隔轮询"""
     from approval_auto import poll_and_process, is_auto_approval_enabled
     interval = int(os.environ.get("AUTO_APPROVAL_POLL_INTERVAL", 300))
+    first_run = True
     while True:
         try:
-            time.sleep(interval)
+            if not first_run:
+                time.sleep(interval)
+            first_run = False
             if is_auto_approval_enabled():
                 poll_and_process(get_token)
         except Exception as e:
