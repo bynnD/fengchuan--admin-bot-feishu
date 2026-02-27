@@ -985,13 +985,22 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
         }
     text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n"
     if not compliant and (pre_comment or pre_risks):
-        non_compliant_parts = []
-        if pre_comment:
-            non_compliant_parts.append(pre_comment)
+        # 整合预检提示，避免「附件中仅有合同」与「风险点：仅合同」等重复表述
+        risks_to_show = []
         if pre_risks:
-            non_compliant_parts.append("风险点：" + "；".join(pre_risks[:5]))
-        text += f"**预检提示**：{_escape_lark_md('；'.join(non_compliant_parts))}\n\n"
-    text += "请确认以上信息无误后，点击下方按钮提交工单。\n\n若信息有误，可直接回复说明要修改的字段及新值（如「把开票金额改成1000」），我会重新发卡供您确认。"
+            redundant_with_contract = {"仅合同"}
+            if pre_comment and "合同" in pre_comment:
+                risks_to_show = [r for r in pre_risks[:5] if r not in redundant_with_contract]
+            else:
+                risks_to_show = pre_risks[:5]
+        parts = []
+        if pre_comment:
+            parts.append(pre_comment.strip())
+        if risks_to_show:
+            parts.append("风险点：" + "；".join(risks_to_show))
+        consolidated = "；".join(parts) if parts else ""
+        text += f"<font color='red'>**预检提示**：{_escape_lark_md(consolidated)}</font>\n\n"
+    text += "<font color='red'>请确认以上信息无误后，点击下方按钮提交工单。\n\n若信息有误，可直接回复说明要修改的字段及新值（如「把开票金额改成1000」），我会重新发卡供您确认。</font>"
     btn_config = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": "确认提交"},
@@ -1330,7 +1339,7 @@ def on_card_action_confirm(data):
                             fail_comment = (fail_comment + "\n风险点：" + "；".join(risks[:5])).strip()
                         add_approval_comment(instance_code, fail_comment, get_token)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                    send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                    send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
                     send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
             else:
@@ -1886,6 +1895,9 @@ SEAL_DOC_TYPE_OTHER_VALUE = "mk4u3uw5-guo071d9k5m-1"
 # 文件类型业务关键词 → 优先匹配的选项文本片段（结算单、合作协议等识别为业务类型，非「保密协议等特殊交办」）
 SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("结算单", "结算单"),
+    ("对账单", "结算单"),
+    ("对账", "结算单"),
+    ("月结", "结算单"),
     ("合作协议", "协议"),
     ("合作框架", "框架"),
     ("合同", "合同"),
@@ -1893,6 +1905,20 @@ SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("采购合同", "合同"),
     ("服务协议", "协议"),
 ]
+
+
+def _infer_document_type_from_name_and_reason(file_name, reason):
+    """
+    根据文件名和用印事由推断文件业务类型，用于兜底（当 AI 未返回 document_type 或值为 PDF/Word 等格式时）。
+    返回可被 _resolve_document_type_for_seal 匹配的字符串，如「结算单」「合作协议」。
+    """
+    base_name = (file_name or "").rsplit(".", 1)[0]
+    combined = f"{base_name} {reason or ''}"
+    # 按优先级匹配：结算单/对账类优先，再协议/合同类
+    for kw, _ in SEAL_DOC_TYPE_BUSINESS_KEYWORDS:
+        if kw in combined:
+            return kw
+    return ""
 
 
 def _resolve_document_type_for_seal(document_type):
@@ -2129,10 +2155,16 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
             ext = (fname.rsplit(".", 1)[-1] or "").lower()
             doc_type = {"docx": "Word文档", "doc": "Word文档", "pdf": "PDF"}.get(ext, ext.upper() if ext else "")
             doc_fields = {"document_name": doc_name, "document_count": "1", "document_type": doc_type}
-            # 每个文件单独提取：用印公司、印章类型、用印事由等，避免后续文件误用首文件的值
+            # 每个文件单独提取：用印公司、印章类型、用印事由、文件类型等，避免后续文件误用首文件的值
             if extractor and DEEPSEEK_API_KEY:
                 ai_fields = extractor(file_content, fname, {"company": opts.get("company"), "seal_type": seal_opts}, get_token) or {}
                 doc_fields.update(ai_fields)
+            # 文件类型兜底：若 AI 未返回或为 PDF/Word 等格式，根据文件名和事由推断业务类型
+            dt = doc_fields.get("document_type", "")
+            if not dt or dt.lower() in ("pdf", "word", "word文档", "doc", "docx"):
+                inferred = _infer_document_type_from_name_and_reason(fname, doc_fields.get("reason", ""))
+                if inferred:
+                    doc_fields["document_type"] = inferred
             for k, v in (initial_fields or {}).items():
                 if v and str(v).strip() and k not in ("usage_method",):
                     doc_fields[k] = str(v).strip()
@@ -2208,6 +2240,12 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         data = SEAL_INITIAL_FIELDS.pop(open_id, {})
     initial_fields = data.get("fields", data) if isinstance(data, dict) and "fields" in data else (data if isinstance(data, dict) else {})
     doc_fields = {**doc_fields, **ai_fields}
+    # 文件类型兜底：若 AI 未返回或为 PDF/Word 等格式，根据文件名和事由推断业务类型
+    dt = doc_fields.get("document_type", "")
+    if not dt or dt.lower() in ("pdf", "word", "word文档", "doc", "docx"):
+        inferred = _infer_document_type_from_name_and_reason(file_name, doc_fields.get("reason", ""))
+        if inferred:
+            doc_fields["document_type"] = inferred
     # 仅当首次消息有有效值时才覆盖，避免空值覆盖 AI 识别结果
     # company、seal_type 若已由文件 AI 识别，则仅当首次消息提供的是有效选项值时才覆盖，防止占位符覆盖
     for k, v in initial_fields.items():
@@ -2330,7 +2368,7 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            send_card_message(open_id, f"【用印申请单】\n{summary}\n\n工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+            send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
         else:
             send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
     else:
@@ -2388,7 +2426,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                         fail_comment = (fail_comment + "\n风险点：" + "；".join(pre_risks[:5])).strip()
                     add_approval_comment(instance_code, fail_comment, get_token)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-                send_card_message(open_id, f"【用印申请单】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+                send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
                 send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
         else:
@@ -2400,7 +2438,6 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     summary = format_fields_summary(all_fields, "用印申请单")
     pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
     send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc, pre_check_result=pre_check)
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。", use_red=True)
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -2669,7 +2706,7 @@ def _process_invoice_upload_batch(open_id, user_id, files):
     # 仅合同开票时提示风险，建议补充收款/流水/对账单/电商订单等
     proof_set = set(p for p in proof_labels if p)
     if proof_set == {"合同"}:
-        summary_prefix += "\n\n⚠️ **风险提示**：当前仅提供合同，建议补充收款记录、银行流水、盖章确认的对账单或电商平台订单等凭证，以降低开票风险。"
+        summary_prefix += "\n\n<font color='red'>⚠️ **风险提示**：当前仅提供合同，建议补充收款记录、银行流水、盖章确认的对账单或电商平台订单等凭证，以降低开票风险。</font>"
     with _state_lock:
         p = PENDING_INVOICE.get(open_id)
         if p:
@@ -2753,8 +2790,6 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
             del PENDING_INVOICE[open_id]
         PENDING_INVOICE_UPLOAD.pop(open_id, None)
         # 不在确认前清空 CONVERSATIONS，等用户点击确认后再清空（见 on_card_action_confirm）
-
-    send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。", use_red=True)
 
 
 def _try_complete_invoice(open_id, user_id, text):
