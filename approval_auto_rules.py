@@ -1,6 +1,6 @@
 """
 开票申请单、用印申请单的自动审批规则
-- 开票：AI 分析附件，仅合同则添加评论不处理，其他情况自动通过
+- 开票：AI 分析附件，仅合同时添加风险提示并转人工审批，其他情况自动通过
 - 用印：两点判断（合法合规、无风险点），满足则自动通过
 便于后期维护和修改规则。
 """
@@ -54,9 +54,9 @@ def collect_file_tokens_from_form(form_list):
 def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
     """
     开票申请附件分析：判断附件是否仅有合同。
-    若仅有合同，需人工补充付款/收款证明。
+    若仅有合同，添加风险提示并转人工审批，由审批人决定是否通过。
     返回 (only_contract: bool, comment: str)
-    - only_contract=True: 附件中仅有合同，添加评论不处理
+    - only_contract=True: 附件中仅有合同，添加风险提示并转人工审批
     - only_contract=False: 其他情况，可自动通过
     """
     from file_extraction import extract_text_from_file
@@ -87,7 +87,7 @@ def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
 
 返回格式示例：
 {{"only_contract": false, "attachment_types": ["合同", "对账单"], "comment": "含合同和对账单，可自动通过。"}}
-{{"only_contract": true, "attachment_types": ["合同"], "comment": "仅有合同，需补充付款或收款证明。"}}
+{{"only_contract": true, "attachment_types": ["合同"], "comment": "仅有合同，建议人工关注。"}}
 
 只返回 JSON，不要其他内容。"""
 
@@ -106,10 +106,8 @@ def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
         comment = out.get("comment", "")
         if only_contract:
             comment = (
-                "【需补充证明】经 AI 识别，附件中仅有合同。请补充以下任一证明后重新提交：\n"
-                "· 客户的付款证明\n"
-                "· 我司的收款证明\n"
-                "补充后可重新发起开票申请。"
+                "【风险提示】经 AI 识别，附件中仅有合同（如老客户续约、框架协议下单次开票等场景可能如此）。\n"
+                "建议人工关注，由审批人根据实际情况决定是否通过。"
             )
         return only_contract, comment
     except Exception as e:

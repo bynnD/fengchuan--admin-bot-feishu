@@ -3102,8 +3102,7 @@ def on_message(data):
         if not requests:
             if unclear:
                 send_message(open_id, unclear, use_red=True)
-            else:
-                send_approval_type_options_card(open_id)
+            send_approval_type_options_card(open_id)
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": unclear or "请选择工单类型"})
