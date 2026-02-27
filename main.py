@@ -1332,12 +1332,12 @@ def on_card_action_confirm(data):
                     risks = pre_check.get("risks", [])
                     set_pre_check_result(instance_code, compliant, comment, risks)
                     if compliant:
-                        add_approval_comment(instance_code, "AI已审核通过", get_token)
+                        add_approval_comment(instance_code, "AI已审核通过", get_token, user_id=user_id)
                     elif comment or risks:
                         fail_comment = comment
                         if risks:
                             fail_comment = (fail_comment + "\n风险点：" + "；".join(risks[:5])).strip()
-                        add_approval_comment(instance_code, fail_comment, get_token)
+                        add_approval_comment(instance_code, fail_comment, get_token, user_id=user_id)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
@@ -2419,12 +2419,12 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "AI已审核通过", get_token)
+                    add_approval_comment(instance_code, "AI已审核通过", get_token, user_id=user_id)
                 elif pre_comment or pre_risks:
                     fail_comment = pre_comment
                     if pre_risks:
                         fail_comment = (fail_comment + "\n风险点：" + "；".join(pre_risks[:5])).strip()
-                    add_approval_comment(instance_code, fail_comment, get_token)
+                    add_approval_comment(instance_code, fail_comment, get_token, user_id=user_id)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
@@ -3196,8 +3196,7 @@ def on_message(data):
         unclear = result.get("unclear", "")
 
         if not requests:
-            if unclear:
-                send_message(open_id, unclear, use_red=True)
+            # 不发送 unclear 红色提示，直接发工单类型选项卡（避免与按钮内容重复）
             send_approval_type_options_card(open_id)
             with _state_lock:
                 if open_id in CONVERSATIONS:
