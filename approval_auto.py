@@ -34,8 +34,149 @@ from approval_types import (
     FIELD_LABELS,
 )
 from field_cache import get_form_fields
+from pre_check_cache import get_pre_check_result, set_pre_check_result
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_tokens_from_file_codes(file_codes, file_names_hint=None):
+    """
+    从 file_codes 提取 (token, name) 列表。
+    file_codes: dict {field_id: [token, ...]} 或 list [token, ...]
+    file_names_hint: 可选，[(token, name), ...] 或 [name, ...] 或单个 doc_name（用印首文件）
+    返回 [(token, name), ...]
+    """
+    tokens = []
+    if isinstance(file_codes, list):
+        for i, v in enumerate(file_codes):
+            tok = v.get("file_token") or v.get("code") or v.get("file_code") if isinstance(v, dict) else v
+            if not tok:
+                continue
+            tok = str(tok)
+            name = ""
+            if isinstance(v, dict):
+                name = v.get("file_name") or v.get("name") or ""
+            if not name and file_names_hint:
+                if isinstance(file_names_hint, list):
+                    if file_names_hint and isinstance(file_names_hint[0], (list, tuple)):
+                        name = next((n for t, n in file_names_hint if str(t) == tok), "")
+                    elif i < len(file_names_hint):
+                        name = str(file_names_hint[i]) if file_names_hint[i] else ""
+                elif isinstance(file_names_hint, dict):
+                    name = file_names_hint.get(tok, "")
+                elif isinstance(file_names_hint, str):
+                    name = file_names_hint if i == 0 else ""
+            tokens.append((tok, name or f"附件{i+1}"))
+    elif isinstance(file_codes, dict):
+        idx = 0
+        for v in file_codes.values():
+            lst = v if isinstance(v, list) else [v]
+            for x in lst:
+                tok = x.get("file_token") or x.get("code") or x.get("file_code") if isinstance(x, dict) else x
+                if not tok:
+                    continue
+                tok = str(tok)
+                name = ""
+                if isinstance(x, dict):
+                    name = x.get("file_name") or x.get("name") or ""
+                if not name and file_names_hint and isinstance(file_names_hint, list) and idx < len(file_names_hint):
+                    name = str(file_names_hint[idx]) if file_names_hint[idx] else ""
+                tokens.append((tok, name or f"附件{idx+1}"))
+                idx += 1
+    return tokens
+
+
+def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_tokens_with_names=None):
+    """
+    工单创建前规则预检。用于发确认卡前或直接创建前。
+    返回 (compliant: bool, comment: str, risks: list)
+    """
+    if not get_token:
+        return True, "", []
+
+    if approval_type in get_exclude_types():
+        return False, "该类型不参与自动审批", ["该类型不参与自动审批"]
+
+    if approval_type == "用印申请单":
+        seal_type = fields.get("seal_type", "")
+        doc_name = fields.get("document_name", "未知")
+        doc_type = fields.get("document_type", "")
+        seal_detail = fields.get("seal_detail", [])
+        if seal_detail and isinstance(seal_detail, list) and len(seal_detail) > 0:
+            first_row = seal_detail[0]
+            if isinstance(first_row, dict):
+                _val = first_row.get("印章类型") or first_row.get("seal_type")
+                if _val is not None and _val != "":
+                    seal_type = _val.get("text", _val) if isinstance(_val, dict) else str(_val)
+                if not doc_name or doc_name == "未知":
+                    _dn = first_row.get("文件名称")
+                    doc_name = (_dn.get("text", _dn) if isinstance(_dn, dict) else _dn) or "未知"
+                if not doc_type:
+                    _dt = first_row.get("文件类型")
+                    doc_type = (_dt.get("text", _dt) if isinstance(_dt, dict) else _dt) or ""
+
+        if file_tokens_with_names:
+            tokens_with_names = file_tokens_with_names
+        else:
+            tokens_with_names = _collect_tokens_from_file_codes(file_codes or {}, [doc_name])
+
+        if not tokens_with_names:
+            return False, "用印申请单缺少附件，无法进行 AI 分析。", ["缺少附件"]
+
+        if not seal_type:
+            return False, "用印申请单缺少印章类型。", ["缺少印章类型"]
+
+        default_fname = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
+        can_auto = True
+        comment = ""
+        all_risks = []
+        for i, (tok, fname_from_form) in enumerate(tokens_with_names):
+            file_content, dl_err = _download_approval_file(tok, get_token)
+            if not file_content:
+                return False, f"附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析。", [f"附件{i+1}下载失败"]
+            file_name = fname_from_form or (default_fname if i == 0 else f"附件{i+1}")
+            try:
+                file_can_auto, file_comment, risks = check_seal_with_ai(
+                    file_content, file_name, seal_type, get_token
+                )
+                if not file_can_auto:
+                    can_auto = False
+                    comment = file_comment
+                    all_risks.extend(risks or [])
+                    break
+            except Exception as e:
+                logger.warning("用印预检 AI 分析异常: %s", e)
+                return False, f"AI 分析异常（附件{i + 1}）：{e}", ["分析失败"]
+        return can_auto, comment, all_risks
+
+    if approval_type == "开票申请单":
+        if file_tokens_with_names:
+            tokens_with_names = file_tokens_with_names
+        else:
+            tokens_with_names = _collect_tokens_from_file_codes(file_codes or {})
+
+        if not tokens_with_names:
+            return False, "开票申请单缺少附件，无法进行 AI 分析。", ["缺少附件"]
+
+        file_contents_with_names = []
+        for i, (tok, fname_from_form) in enumerate(tokens_with_names[:10]):
+            content, dl_err = _download_approval_file(tok, get_token)
+            fname = fname_from_form or f"附件{i+1}"
+            file_contents_with_names.append((content or b"", fname))
+        try:
+            only_contract, comment = check_invoice_attachments_with_ai(file_contents_with_names, get_token)
+            if only_contract:
+                return False, comment or "附件中仅有合同。", ["仅合同"]
+            return True, "", []
+        except Exception as e:
+            logger.warning("开票预检 AI 分析异常: %s", e)
+            return False, f"AI 分析异常：{e}", ["分析失败"]
+
+    # 采购、招待等：规则检查，不调 AI
+    can_auto, comment, risk_points = check_auto_approve(approval_type, fields)
+    if can_auto is None:
+        return False, "需人工审核。", ["需人工审核"]
+    return bool(can_auto), comment or "", list(risk_points or [])
 
 # 状态文件路径
 _STATE_FILE = os.environ.get("AUTO_APPROVAL_STATE_FILE") or str(
@@ -473,7 +614,7 @@ def query_pending_tasks(user_id, get_token):
 
 def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id, get_token):
     """
-    处理单条待审批任务：获取实例详情 -> 解析表单 -> 判断规则 -> 审批或评论
+    处理单条待审批任务：先查预检缓存，有且合规则直接 approve；否则获取实例详情 -> 解析表单 -> 判断规则 -> 审批或评论
     """
     code_to_type = _build_approval_code_to_type()
     approval_type = code_to_type.get(approval_code)
@@ -485,6 +626,18 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         return
     if user_id not in get_auto_approve_user_ids():
         logger.info("自动审批: 跳过 instance=%s user_id=%s 不在 auto_approve_user_ids", instance_code, user_id)
+        return
+
+    # 查预检缓存：有且合规则则直接 approve，不重复下载、不调 AI；有缓存但不合规则等待人工
+    cached_result = get_pre_check_result(instance_code)
+    if cached_result:
+        if cached_result.get("compliant"):
+            logger.info("自动审批: instance=%s 使用预检缓存直接通过", instance_code)
+            ok, err = approve_task(approval_code, instance_code, user_id, task_id, "", get_token)
+            if not ok:
+                logger.warning("自动审批: 审批 API 失败 instance=%s: %s", instance_code, err)
+        else:
+            logger.info("自动审批: instance=%s 预检不合规，等待人工处理", instance_code)
         return
 
     detail, err = get_instance_detail(instance_code, get_token)

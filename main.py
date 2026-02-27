@@ -15,13 +15,16 @@ from approval_types import (
 )
 from approval_rules_loader import check_switch_command, get_auto_approve_user_ids
 from approval_auto import (
+    add_approval_comment,
     get_auto_approval_status,
     is_auto_approval_enabled,
+    run_pre_check,
     set_auto_approval_enabled,
     set_auto_approval_type_enabled,
     set_all_types_enabled,
     poll_and_process,
 )
+from pre_check_cache import set_pre_check_result
 from field_cache import get_form_fields, get_sub_field_options, invalidate_cache, is_free_process, mark_free_process
 from deepseek_client import call_deepseek_with_retry
 import datetime
@@ -254,7 +257,8 @@ def _try_modify_confirm(open_id, user_id, text):
         PENDING_CONFIRM.pop(confirm_id, None)
     admin_comment = get_admin_comment(approval_type, fields)
     summary = format_fields_summary(fields, approval_type)
-    send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=pending.get("file_codes"))
+    pre_check = run_pre_check(approval_type, fields, pending.get("file_codes"), get_token)
+    send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=pending.get("file_codes"), pre_check_result=pre_check)
     send_message(open_id, "已按您的要求修改，请再次确认信息无误后点击「确认提交」。", use_red=True)
     return True
 
@@ -497,7 +501,8 @@ def _process_approval_type_click(open_id, user_id, approval_type, example_text):
                 link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES[at]}"
                 send_card_message(open_id, f"【{at}】\n{summary}\n\n该类型暂不支持自动创建，请点击下方按钮在飞书中发起。", link, f"打开{at}审批表单")
             else:
-                send_confirm_card(open_id, at, summary, admin_comment, user_id, fields)
+                pre_check = run_pre_check(at, fields, None, get_token)
+                send_confirm_card(open_id, at, summary, admin_comment, user_id, fields, pre_check_result=pre_check)
     if incomplete:
         parts = [f"{at}还缺少：{'、'.join([FIELD_LABELS.get(m, m) for m in miss])}" for at, miss in incomplete]
         send_message(open_id, "请补充以下信息：\n" + "\n".join(parts), use_red=True)
@@ -954,9 +959,15 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
         logger.error("发送用印选项卡片失败: %s", resp.msg)
 
 
-def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None):
-    """发送工单确认卡片，用户点击「确认」后创建工单。支持用户通过对话修改字段后重新发卡"""
+def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None, pre_check_result=None):
+    """发送工单确认卡片，用户点击「确认」后创建工单。支持用户通过对话修改字段后重新发卡。
+    pre_check_result: (compliant, comment, risks) 预检结果，不合规时在卡片中展示不符合项（不阻止提交）"""
     confirm_id = str(uuid.uuid4())
+    compliant = True
+    pre_comment = ""
+    pre_risks = []
+    if pre_check_result:
+        compliant, pre_comment, pre_risks = pre_check_result
     with _state_lock:
         old_cid = OPEN_ID_TO_CONFIRM.pop(open_id, None)
         if old_cid:
@@ -970,8 +981,17 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             "file_codes": dict(file_codes) if file_codes else None,
             "admin_comment": admin_comment,
             "created_at": time.time(),
+            "pre_check": {"compliant": compliant, "comment": pre_comment, "risks": pre_risks},
         }
-    text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n请确认以上信息无误后，点击下方按钮提交工单。\n\n若信息有误，可直接回复说明要修改的字段及新值（如「把开票金额改成1000」），我会重新发卡供您确认。"
+    text = f"【{approval_type}】\n\n{_escape_lark_md(summary)}\n\n"
+    if not compliant and (pre_comment or pre_risks):
+        non_compliant_parts = []
+        if pre_comment:
+            non_compliant_parts.append(pre_comment)
+        if pre_risks:
+            non_compliant_parts.append("风险点：" + "；".join(pre_risks[:5]))
+        text += f"**预检提示**：{_escape_lark_md('；'.join(non_compliant_parts))}\n\n"
+    text += "请确认以上信息无误后，点击下方按钮提交工单。\n\n若信息有误，可直接回复说明要修改的字段及新值（如「把开票金额改成1000」），我会重新发卡供您确认。"
     btn_config = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": "确认提交"},
@@ -1287,6 +1307,7 @@ def on_card_action_confirm(data):
         fields = pending["fields"]
         file_codes = pending.get("file_codes")
         admin_comment = pending.get("admin_comment", "")
+        pre_check = pending.get("pre_check", {})
 
         def _create_and_notify():
             nonlocal open_id
@@ -1297,6 +1318,17 @@ def on_card_action_confirm(data):
                         CONVERSATIONS[open_id] = []
                 instance_code = resp_data.get("instance_code", "")
                 if instance_code:
+                    compliant = pre_check.get("compliant", True)
+                    comment = pre_check.get("comment", "")
+                    risks = pre_check.get("risks", [])
+                    set_pre_check_result(instance_code, compliant, comment, risks)
+                    if compliant:
+                        add_approval_comment(instance_code, "AI已审核通过", get_token)
+                    elif comment or risks:
+                        fail_comment = comment
+                        if risks:
+                            fail_comment = (fail_comment + "\n风险点：" + "；".join(risks[:5])).strip()
+                        add_approval_comment(instance_code, fail_comment, get_token)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, f"【{approval_type}】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
@@ -2337,6 +2369,8 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
             del PENDING_SEAL[open_id]
 
     if direct_create:
+        fc = {"widget15828104903330001": codes} if codes else {}
+        pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
         success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=codes)
         if success:
             with _state_lock:
@@ -2344,6 +2378,15 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                     CONVERSATIONS[open_id] = []
             instance_code = resp_data.get("instance_code", "")
             if instance_code:
+                compliant, pre_comment, pre_risks = pre_check
+                set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
+                if compliant:
+                    add_approval_comment(instance_code, "AI已审核通过", get_token)
+                elif pre_comment or pre_risks:
+                    fail_comment = pre_comment
+                    if pre_risks:
+                        fail_comment = (fail_comment + "\n风险点：" + "；".join(pre_risks[:5])).strip()
+                    add_approval_comment(instance_code, fail_comment, get_token)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, f"【用印申请单】\n{summary}\n\n工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
@@ -2355,7 +2398,8 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     fc = {"widget15828104903330001": codes} if codes else {}
     admin_comment = get_admin_comment("用印申请单", all_fields)
     summary = format_fields_summary(all_fields, "用印申请单")
-    send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc)
+    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
+    send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc, pre_check_result=pre_check)
     send_message(open_id, "请确认工单信息无误后，点击卡片上的「确认提交」按钮。若信息有误，可直接说明要修改的字段及新值。", use_red=True)
 
 
@@ -2700,7 +2744,9 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
 
     admin_comment = get_admin_comment("开票申请单", all_fields)
     summary = format_fields_summary(all_fields, "开票申请单")
-    send_confirm_card(open_id, "开票申请单", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None)
+    file_tokens_with_names = [(f["file_code"], f.get("file_name", "")) for f in (file_codes_list or []) if f.get("file_code")]
+    pre_check = run_pre_check("开票申请单", all_fields, file_codes or {}, get_token, file_tokens_with_names=file_tokens_with_names)
+    send_confirm_card(open_id, "开票申请单", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None, pre_check_result=pre_check)
 
     with _state_lock:
         if open_id in PENDING_INVOICE:
@@ -3228,7 +3274,8 @@ def on_message(data):
                     send_card_message(open_id, tip, link, f"打开{approval_type}审批表单")
                     replies.append(f"· {approval_type}：已整理，请点击按钮提交")
                 else:
-                    send_confirm_card(open_id, approval_type, format_fields_summary(fields, approval_type), admin_comment, user_id, fields)
+                    pre_check = run_pre_check(approval_type, fields, None, get_token)
+                    send_confirm_card(open_id, approval_type, format_fields_summary(fields, approval_type), admin_comment, user_id, fields, pre_check_result=pre_check)
                     replies.append(f"· {approval_type}：请确认信息后点击卡片按钮提交")
 
         if incomplete:
