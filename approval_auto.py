@@ -516,47 +516,63 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 
 def add_approval_comment(instance_code, content, get_token, user_id=None):
-    """在审批实例下添加评论。飞书要求 content 为 JSON 字符串 {\"text\":\"...\",\"files\":[]}，user_id 放请求体。"""
+    """在审批实例下添加评论。飞书要求 content 为 JSON 字符串 {\"text\":\"...\",\"files\":[]}。
+    99992402 field validation failed 时，尝试 user_id 放 query 或仅传 content。"""
     token = get_token()
     text = (content or "自动审批").strip()
     # 移除可能导致 field validation failed 的控制字符（保留换行）
     text = "".join(c for c in text if c == "\n" or not (ord(c) < 32 or ord(c) == 127))
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
-    # 飞书文档：content 为 JSON 字符串，user_id 放请求体（非 query）
     content_json = json.dumps({"text": text, "files": []}, ensure_ascii=False, separators=(",", ":"))
-    body = {"content": content_json}
-    if user_id:
-        body["user_id"] = user_id
-    res = httpx.post(
-        f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-        params={"user_id_type": "user_id"},
-        json=body,
-        timeout=10,
-    )
-    data = res.json()
-    if data.get("code") == 0:
-        logger.info("已添加审批评论: instance=%s", instance_code)
-        return True, None
-    # 99992402 时尝试不传 user_id（部分环境可能不支持请求体中的 user_id）
-    if (data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower()) and user_id:
-        res2 = httpx.post(
+
+    def _post(params, body):
+        return httpx.post(
             f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-            params={"user_id_type": "user_id"},
-            json={"content": content_json},
+            params=params,
+            json=body,
             timeout=10,
         )
-        data2 = res2.json()
-        if data2.get("code") == 0:
-            logger.info("已添加审批评论(无user_id): instance=%s", instance_code)
+
+    # 尝试1：user_id 放 query（部分版本要求）
+    if user_id:
+        params = {"user_id_type": "user_id", "user_id": user_id}
+        res = _post(params, {"content": content_json})
+        data = res.json()
+        if data.get("code") == 0:
+            logger.info("已添加审批评论: instance=%s", instance_code)
             return True, None
+
+    # 尝试2：user_id 放 body
+    if user_id:
+        body = {"content": content_json, "user_id": user_id}
+        res = _post({"user_id_type": "user_id"}, body)
+        data = res.json()
+        if data.get("code") == 0:
+            logger.info("已添加审批评论: instance=%s", instance_code)
+            return True, None
+
+    # 尝试3：仅 content（JSON 格式），不传 user_id
+    res = _post({"user_id_type": "user_id"}, {"content": content_json})
+    data = res.json()
+    if data.get("code") == 0:
+        logger.info("已添加审批评论(无user_id): instance=%s", instance_code)
+        return True, None
+
+    # 尝试4：content 改为纯文本（部分环境可能仅支持纯文本）
+    if data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower():
+        res4 = _post({"user_id_type": "user_id"}, {"content": text})
+        data4 = res4.json()
+        if data4.get("code") == 0:
+            logger.info("已添加审批评论(纯文本content): instance=%s", instance_code)
+            return True, None
+        data = data4  # 用于最终错误日志
+
     logger.warning(
-        "添加评论失败: code=%s msg=%s body=%r",
+        "添加评论失败: code=%s msg=%s",
         data.get("code"),
         data.get("msg"),
-        {k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v) for k, v in body.items()},
     )
     return False, data.get("msg", "未知错误")
 

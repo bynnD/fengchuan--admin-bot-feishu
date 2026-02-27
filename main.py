@@ -1917,6 +1917,9 @@ SEAL_OPTION_FIELDS = {
 SEAL_DOC_TYPE_OTHER_VALUE = "mk4u3uw5-guo071d9k5m-1"
 
 
+# 结算单、对账单等非合同/协议类文件，律师审核默认「未审核」
+SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS = ("结算单", "对账单", "对账", "月结")
+
 # 文件类型业务关键词 → 优先匹配的选项文本片段（结算单、合作协议等识别为业务类型，非「保密协议等特殊交办」）
 SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("结算单", "结算单"),
@@ -1930,6 +1933,14 @@ SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("采购合同", "合同"),
     ("服务协议", "协议"),
 ]
+
+
+def _is_seal_doc_type_non_contract(document_type):
+    """结算单、对账单等非合同/协议类文件，律师审核默认未审核"""
+    if not document_type:
+        return False
+    dt = str(document_type).strip()
+    return any(kw in dt for kw in SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS)
 
 
 def _infer_document_type_from_name_and_reason(file_name, reason):
@@ -2194,6 +2205,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
                 if v and str(v).strip() and k not in ("usage_method",):
                     doc_fields[k] = str(v).strip()
             doc_fields.pop("usage_method", None)
+            # 结算单、对账单等非合同/协议类文件，律师审核默认未审核
+            if _is_seal_doc_type_non_contract(doc_fields.get("document_type")) and not doc_fields.get("lawyer_reviewed"):
+                lawyer_opts = opts.get("lawyer_reviewed") or ["是", "否"]
+                unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), lawyer_opts[-1] if lawyer_opts else "否")
+                doc_fields["lawyer_reviewed"] = unreviewed
             items.append({"file_name": fname, "file_code": file_code, "doc_fields": doc_fields})
         with _state_lock:
             PENDING_SEAL_QUEUE[open_id] = {
@@ -2289,6 +2305,10 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         else:
             doc_fields[k] = v
     # 不在此处默认 usage_method，需用户明确选择盖章形式
+    # 结算单、对账单等非合同/协议类文件，律师审核默认未审核
+    if _is_seal_doc_type_non_contract(doc_fields.get("document_type")) and not doc_fields.get("lawyer_reviewed"):
+        unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), lawyer_opts[-1] if lawyer_opts else "否")
+        doc_fields["lawyer_reviewed"] = unreviewed
 
     with _state_lock:
         CONVERSATIONS.setdefault(open_id, [])
@@ -2826,6 +2846,12 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
     summary = format_fields_summary(all_fields, "开票申请单")
     file_tokens_with_names = [(f["file_code"], f.get("file_name", "")) for f in (file_codes_list or []) if f.get("file_code")]
     pre_check = run_pre_check("开票申请单", all_fields, file_codes or {}, get_token, file_tokens_with_names=file_tokens_with_names)
+    # 选项卡已展示「仅合同」风险时，确保预检结果包含该风险，以便工单创建时写入评论
+    proof_set = set(f.get("proof_type", "") for f in (file_codes_list or []) if f.get("proof_type"))
+    if proof_set == {"合同"}:
+        compliant, pre_comment, pre_risks = pre_check
+        if "仅合同" not in (pre_risks or []):
+            pre_check = (False, "附件中仅有合同。" if not pre_comment else pre_comment, list(set(pre_risks or []) | {"仅合同"}))
     send_confirm_card(open_id, "开票申请单", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None, pre_check_result=pre_check)
 
     with _state_lock:
