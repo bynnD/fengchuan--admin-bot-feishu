@@ -125,34 +125,58 @@ def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_t
         if not seal_type:
             return False, "用印申请单缺少印章类型。", ["缺少印章类型"]
 
-        # 律师未审核作为风险点：任一文件为「否」或「未审核」则不合规
-        lawyer_unreviewed = False
-        for row in (seal_detail or []):
+        # 律师未审核仅对合同/协议作为风险点；结算单、对账单等不作为风险点。仅对有风险点的文件调 AI
+        def _is_contract_or_agreement(dt):
+            if not dt:
+                return False
+            s = str(dt).strip()
+            return "合同" in s or "协议" in s
+
+        def _lawyer_unreviewed_val(v):
+            if v is None:
+                return False
+            txt = v.get("text", v) if isinstance(v, dict) else str(v)
+            txt = (txt or "").strip().lower()
+            return txt in ("未审核", "否", "no")
+
+        rows = seal_detail if (seal_detail and isinstance(seal_detail, list)) else []
+        if not rows and fields.get("lawyer_reviewed") is not None:
+            rows = [{}]  # 单文件从顶层取
+        per_file = []  # [(lawyer_unreviewed, is_contract_or_agreement), ...]
+        for i, row in enumerate(rows):
             if not isinstance(row, dict):
+                per_file.append((False, False))
                 continue
             _lv = row.get("律师是否已审核") or row.get("lawyer_reviewed")
-            if _lv is None:
-                continue
-            txt = _lv.get("text", _lv) if isinstance(_lv, dict) else str(_lv)
-            txt = (txt or "").strip().lower()
-            if txt in ("未审核", "否", "no"):
-                lawyer_unreviewed = True
-                break
-        if not lawyer_unreviewed and not seal_detail:
-            # 单文件时可能从顶层取
-            _lv = fields.get("lawyer_reviewed")
-            if _lv is not None:
-                txt = str(_lv).strip().lower()
-                if txt in ("未审核", "否", "no"):
-                    lawyer_unreviewed = True
+            if _lv is None and i == 0:
+                _lv = fields.get("lawyer_reviewed")
+            lu = _lawyer_unreviewed_val(_lv) if _lv is not None else False
+            _dt = row.get("文件类型") or row.get("document_type")
+            dt_str = _dt.get("text", _dt) if isinstance(_dt, dict) else str(_dt or "")
+            if not dt_str and i == 0:
+                dt_str = str(fields.get("document_type", "") or doc_type or "")
+            is_ca = _is_contract_or_agreement(dt_str)
+            per_file.append((lu, is_ca))
 
+        # 单文件无 seal_detail 时从顶层取
+        if not per_file and (seal_detail or fields.get("lawyer_reviewed") is not None):
+            lu = _lawyer_unreviewed_val(fields.get("lawyer_reviewed"))
+            is_ca = _is_contract_or_agreement(str(fields.get("document_type", "") or doc_type or ""))
+            per_file = [(bool(lu), is_ca)]
+
+        any_lawyer_risk = any(lu and is_ca for lu, is_ca in per_file)
+        if not any_lawyer_risk:
+            return True, "", []
+
+        # 对有律师未审核风险点的文件调 AI 审核内容
         default_fname = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
         can_auto = True
         comment = ""
-        all_risks = []
-        if lawyer_unreviewed:
-            return False, "律师未审核", ["律师未审核"]
+        all_risks = ["律师未审核"]
         for i, (tok, fname_from_form) in enumerate(tokens_with_names):
+            lu, is_ca = per_file[i] if i < len(per_file) else (False, False)
+            if not (lu and is_ca):
+                continue
             file_content, dl_err = _download_approval_file(tok, get_token)
             if not file_content:
                 return False, f"附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析。", [f"附件{i+1}下载失败"]

@@ -201,6 +201,21 @@ def _is_cancel_intent(text):
     return any(p in t for p in CANCEL_PHRASES)
 
 
+def _build_fail_comment(comment, risks, max_len=100):
+    """构建不合规评论：列出具体问题，不超过 max_len 字"""
+    issues = list(risks[:5]) if risks else ([comment.strip()] if comment else [])
+    if not issues:
+        return "不符合要求"
+    fail_comment = "不符合要求：" + "；".join(issues)
+    if len(fail_comment) <= max_len:
+        return fail_comment
+    for n in range(len(issues), 0, -1):
+        c = "不符合要求：" + "；".join(issues[:n])
+        if len(c) <= max_len:
+            return c
+    return fail_comment[: max_len - 3] + "..."
+
+
 def _try_modify_confirm(open_id, user_id, text):
     """汇总卡出现后，用户通过对话修改字段。解析修改意图，更新字段并重新发卡"""
     with _state_lock:
@@ -1332,12 +1347,9 @@ def on_card_action_confirm(data):
                     risks = pre_check.get("risks", [])
                     set_pre_check_result(instance_code, compliant, comment, risks)
                     if compliant:
-                        add_approval_comment(instance_code, "AI已审核通过", get_token, user_id=user_id)
+                        add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
                     elif comment or risks:
-                        fail_comment = comment
-                        if risks:
-                            fail_comment = (fail_comment + "\n风险点：" + "；".join(risks[:5])).strip()
-                        add_approval_comment(instance_code, fail_comment, get_token, user_id=user_id)
+                        add_approval_comment(instance_code, _build_fail_comment(comment, risks), get_token, user_id=user_id)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
@@ -2357,7 +2369,10 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
     # 工单级字段（若表单需要）：用首文件的 company
     if items[0]["doc_fields"].get("company"):
         all_fields["company"] = items[0]["doc_fields"]["company"]
-    # 附件已在每行 上传用章文件 中，无需单独传 file_codes
+    # 多文件也做预检（律师未审核、AI 内容审核），并添加评论
+    fc = {"widget15828104903330001": [item["file_code"] for item in items]}
+    file_tokens_with_names = [(item["file_code"], item["file_name"]) for item in items]
+    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token, file_tokens_with_names=file_tokens_with_names)
     success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=None)
     with _state_lock:
         if open_id in PENDING_SEAL_QUEUE:
@@ -2367,6 +2382,12 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
     if success:
         instance_code = resp_data.get("instance_code", "")
         if instance_code:
+            compliant, pre_comment, pre_risks = pre_check
+            set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
+            if compliant:
+                add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
+            elif pre_comment or pre_risks:
+                add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
             link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
             send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
         else:
@@ -2419,12 +2440,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "AI已审核通过", get_token, user_id=user_id)
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
                 elif pre_comment or pre_risks:
-                    fail_comment = pre_comment
-                    if pre_risks:
-                        fail_comment = (fail_comment + "\n风险点：" + "；".join(pre_risks[:5])).strip()
-                    add_approval_comment(instance_code, fail_comment, get_token, user_id=user_id)
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:

@@ -153,11 +153,12 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
 
 请严格按以下两点分析，并返回 JSON：
 1. legal_compliant: 文件内容是否合法合规（true/false）
-2. risk_points: 文件内容存在的风险点列表，如无则 []
-3. comment: 综合说明（简短，用于审批意见）
+2. risk_points: 具体不合规项/风险点列表，每项简短（如「缺少关键条款」「金额异常」「律师未审核」），如无则 []
+3. comment: 合规时为「文件合法合规」；不合规时必须列出具体问题（与 risk_points 一致，用；分隔），不要笼统表述
 
 返回格式示例：
 {{"legal_compliant": true, "risk_points": [], "comment": "文件合法合规。"}}
+不合规示例：{{"legal_compliant": false, "risk_points": ["缺少关键条款", "金额异常"], "comment": "缺少关键条款；金额异常"}}
 
 只返回 JSON，不要其他内容。"""
 
@@ -180,12 +181,8 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
 
         can_auto = legal and len(risks) == 0
         if not can_auto:
-            parts = []
-            if not legal:
-                parts.append("文件内容存在合规问题")
-            if risks:
-                parts.append("风险点：" + "；".join(risks[:5]))
-            comment = "；".join(parts) + "。"
+            # 具体问题用 risk_points 列出，comment 与之一致
+            comment = "；".join(risks[:5]) if risks else (comment or "存在合规问题")
         return can_auto, comment, risks
     except Exception as e:
         logger.exception("用印 AI 分析失败: %s", e)
