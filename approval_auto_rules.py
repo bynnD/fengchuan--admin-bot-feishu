@@ -26,7 +26,7 @@ def collect_file_tokens_from_form(form_list):
         if isinstance(val, list):
             for v in val:
                 if isinstance(v, dict):
-                    tok = v.get("file_token") or v.get("code") or v.get("file_code")
+                    tok = v.get("file_token") or v.get("code") or v.get("file_code") or v.get("url")
                     if tok:
                         name = v.get("name") or v.get("file_name") or ""
                         result.append((tok, str(name).strip() if name else ""))
@@ -67,18 +67,25 @@ def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
     from deepseek_client import call_deepseek_with_retry
 
     combined_parts = []
+    all_no_content = True
     for i, (content, fname) in enumerate(file_contents_with_names):
         file_text = ""
         if content and isinstance(content, bytes) and len(content) > 10:
             file_text = extract_text_from_file(content, fname, get_token)
         has_content = bool(file_text and len(file_text.strip()) > 10)
+        if has_content:
+            all_no_content = False
         part = f"--- 附件{i+1}: {fname} ---\n"
-        part += f"文件内容摘要：\n{file_text[:4000]}" if has_content else "（内容无法提取）"
+        part += f"文件内容摘要：\n{file_text[:4000]}" if has_content else "（内容无法提取，请根据文件名推断类型）"
         combined_parts.append(part)
 
     combined = "\n\n".join(combined_parts) if combined_parts else "（无附件内容）"
-
+    filename_hint = ""
+    if all_no_content and file_contents_with_names:
+        fnames = [f for _, f in file_contents_with_names]
+        filename_hint = f"\n\n【重要】以上附件内容均无法提取，请根据文件名推断：{fnames}\n文件名含「凭证」「截图」「结算」「对账」「水单」「流水」「订单」等通常非仅合同；含「合同」「协议」可能为合同类。"
     prompt = f"""你是开票审批助手。请分析以下开票申请的附件内容，判断附件类型。
+{filename_hint}
 
 {combined}
 
@@ -86,12 +93,13 @@ def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
 
 请返回 JSON：
 1. only_contract: 若所有附件都仅是合同/协议类（无付款证明、收款证明、对账单、结算单等），则为 true；否则为 false
-2. attachment_types: 识别到的附件类型列表，如 ["合同", "对账单"]
-3. comment: 简短说明
+2. attachment_types: 识别到的附件类型列表，如 ["合同", "对账单"]，无法确定时可写 ["根据文件名推断"]
+3. comment: 简短说明，仅合同时写「附件中仅有合同」；其他可自动通过时可不写或简短说明
 
 返回格式示例：
-{{"only_contract": false, "attachment_types": ["合同", "对账单"], "comment": "含合同和对账单，可自动通过。"}}
-{{"only_contract": true, "attachment_types": ["合同"], "comment": "仅有合同，建议人工关注。"}}
+{{"only_contract": false, "attachment_types": ["合同", "对账单"], "comment": ""}}
+{{"only_contract": false, "attachment_types": ["根据文件名推断"], "comment": ""}}
+{{"only_contract": true, "attachment_types": ["合同"], "comment": "附件中仅有合同。"}}
 
 只返回 JSON，不要其他内容。"""
 
@@ -109,14 +117,11 @@ def check_invoice_attachments_with_ai(file_contents_with_names, get_token):
         only_contract = bool(out.get("only_contract", False))
         comment = out.get("comment", "")
         if only_contract:
-            comment = (
-                "【风险提示】经 AI 识别，附件中仅有合同（如老客户续约、框架协议下单次开票等场景可能如此）。\n"
-                "建议人工关注，由审批人根据实际情况决定是否通过。"
-            )
+            comment = "附件中仅有合同。"
         return only_contract, comment
     except Exception as e:
         logger.exception("开票附件 AI 分析失败: %s", e)
-        return False, f"AI 分析异常：{e}，请人工审批。"
+        return False, f"AI 分析异常：{e}"
 
 
 # =============================================================================
@@ -180,8 +185,8 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
                 parts.append("文件内容存在合规问题")
             if risks:
                 parts.append("风险点：" + "；".join(risks[:5]))
-            comment = "【不符合自动审批规则】" + "；".join(parts) + "。请人工审批。"
+            comment = "；".join(parts) + "。"
         return can_auto, comment, risks
     except Exception as e:
         logger.exception("用印 AI 分析失败: %s", e)
-        return False, f"AI 分析异常：{e}，请人工审批。", ["分析失败"]
+        return False, f"AI 分析异常：{e}", ["分析失败"]

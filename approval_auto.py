@@ -205,13 +205,52 @@ def _get_logical_key(field_id, field_name, approval_type):
     return field_name or field_id
 
 
+def _build_cache_from_form_list(form_list):
+    """
+    当审批定义 API 失败时，从实例 form 构建最小字段结构。
+    返回 {field_id: {name, type, sub_fields?}}
+    """
+    if not form_list:
+        return {}
+    cached = {}
+    for item in form_list:
+        fid = item.get("id")
+        if not fid:
+            continue
+        cached[fid] = {
+            "name": item.get("name", ""),
+            "type": item.get("type", "input"),
+        }
+        if item.get("type") == "fieldList":
+            val = item.get("value", [])
+            sub_fields = []
+            if isinstance(val, list) and val:
+                first_row = val[0] if isinstance(val[0], list) else val
+                for cell in (first_row if isinstance(first_row, list) else []):
+                    if isinstance(cell, dict) and cell.get("id"):
+                        sub_fields.append({
+                            "id": cell.get("id"),
+                            "name": cell.get("name", ""),
+                            "type": cell.get("type", "input"),
+                        })
+            if sub_fields:
+                cached[fid]["sub_fields"] = sub_fields
+    return cached
+
+
 def parse_form_to_fields(approval_type, form_list, cached, get_token):
     """
     将飞书 form 反解析为逻辑字段 dict。
     form_list: 飞书实例返回的 form 数组
     cached: field_cache 的字段结构 {field_id: {name, type, ...}}
     """
-    if not form_list or not cached:
+    if not form_list:
+        return {}
+    if not cached:
+        cached = _build_cache_from_form_list(form_list)
+        if cached:
+            logger.info("自动审批: 审批定义 API 不可用，已从实例 form 构建字段结构")
+    if not cached:
         return {}
     fields = {}
     _FIELDLIST_ALIAS = {
@@ -277,7 +316,7 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
             "instance_code": instance_code,
             "user_id": user_id,
             "task_id": task_id,
-            "comment": comment or "自动审批通过",
+            "comment": comment if comment else "",
         },
         timeout=15,
     )
@@ -290,13 +329,14 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 
 def add_approval_comment(instance_code, content, get_token):
-    """在审批实例下添加评论"""
+    """在审批实例下添加评论。飞书 API 要求 content 为 JSON 字符串格式 {"text":"评论内容"}"""
     token = get_token()
+    content_json = json.dumps({"text": content or "自动审批", "files": []}, ensure_ascii=False)
     res = httpx.post(
         f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         params={"user_id_type": "user_id"},
-        json={"content": content},
+        json={"content": content_json},
         timeout=10,
     )
     data = res.json()
@@ -348,9 +388,17 @@ def _download_drive_file(file_token, get_token):
 
 def _download_approval_file(file_token_or_code, get_token):
     """
-    下载审批附件。优先使用 drive 接口，失败时尝试 media 临时链接。
+    下载审批附件。支持：1) 直接 URL 2) drive 接口 3) media 临时链接。
     返回 (content, None) 或 (None, err)
     """
+    if file_token_or_code and str(file_token_or_code).startswith("http"):
+        try:
+            res = httpx.get(str(file_token_or_code), timeout=60, follow_redirects=True)
+            if res.status_code == 200 and res.content:
+                return res.content, None
+        except Exception as e:
+            logger.debug("直接下载 URL 失败: %s", e)
+        return None, "URL 下载失败"
     content, err = _download_drive_file(file_token_or_code, get_token)
     if content:
         return content, None
@@ -475,14 +523,14 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         if not file_tokens_with_names:
             add_approval_comment(
                 instance_code,
-                "【自动审批】用印申请单缺少附件，无法进行 AI 分析，请人工审批。",
+                "用印申请单缺少附件，无法进行 AI 分析。",
                 get_token,
             )
             return
         if not seal_type:
             add_approval_comment(
                 instance_code,
-                "【自动审批】用印申请单缺少印章类型，请人工审批。",
+                "用印申请单缺少印章类型。",
                 get_token,
             )
             return
@@ -496,7 +544,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
                 logger.warning("用印附件 %d 下载失败 instance=%s: %s", i + 1, instance_code, dl_err)
                 add_approval_comment(
                     instance_code,
-                    f"【自动审批】附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析，请人工审批。",
+                    f"附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析。",
                     get_token,
                 )
                 return
@@ -513,7 +561,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
                 logger.warning("用印附件 %d AI 分析异常: %s", i + 1, e)
                 add_approval_comment(
                     instance_code,
-                    f"【自动审批】AI 分析异常（附件{i + 1}），请人工审批。{e}",
+                    f"AI 分析异常（附件{i + 1}）：{e}",
                     get_token,
                 )
                 return
@@ -528,7 +576,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
         if not file_tokens_with_names:
             add_approval_comment(
                 instance_code,
-                "【自动审批】开票申请单缺少附件，无法进行 AI 分析，请人工审批。",
+                "开票申请单缺少附件，无法进行 AI 分析。",
                 get_token,
             )
             return
@@ -544,34 +592,32 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
                 add_approval_comment(instance_code, comment, get_token)
                 return
             can_auto = True
-            comment = comment or "开票申请单已核实，已自动审批通过。"
             risks = []
         except Exception as e:
             logger.warning("开票 AI 分析异常: %s", e)
             add_approval_comment(
                 instance_code,
-                f"【自动审批】AI 分析异常，请人工审批。{e}",
+                f"AI 分析异常：{e}",
                 get_token,
             )
             return
     else:
         can_auto, comment, risk_points = check_auto_approve(approval_type, fields)
         if can_auto is None:
-            add_approval_comment(instance_code, "【自动审批】需人工审核。", get_token)
+            add_approval_comment(instance_code, "需人工审核。", get_token)
             return
         risks = risk_points or []
 
     if can_auto:
-        ok, err = approve_task(approval_code, instance_code, user_id, task_id, comment, get_token)
+        ok, err = approve_task(approval_code, instance_code, user_id, task_id, "", get_token)
         if not ok:
             logger.warning("自动审批: 审批 API 失败 instance=%s: %s", instance_code, err)
     else:
         logger.info("自动审批: instance=%s %s 不符合规则，添加评论", instance_code, approval_type)
-        fail_comment = f"【不符合自动审批规则】\n{comment}\n"
+        fail_comment = comment
         if risks:
-            fail_comment += "风险点：" + "；".join(risks[:5]) + "\n"
-        fail_comment += "请人工审批。"
-        add_approval_comment(instance_code, fail_comment, get_token)
+            fail_comment += "\n风险点：" + "；".join(risks[:5])
+        add_approval_comment(instance_code, fail_comment.strip(), get_token)
 
 
 def poll_and_process(get_token):
