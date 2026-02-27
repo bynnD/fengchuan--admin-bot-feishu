@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 
 # 配置常量
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
+# 机器人在飞书中的员工 user_id（非 open_id），用于以机器人身份发审批评论。
+# 可在飞书开放平台 -> 应用信息 -> 机器人 -> 查看机器人的用户信息获取。
+# 若未配置，评论将以工单发起人身份显示。
+BOT_USER_ID = os.environ.get("FEISHU_BOT_USER_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")  # 可选，用于 /debug-form 等调试接口认证
@@ -1323,9 +1327,10 @@ def on_card_action_confirm(data):
             if count not in ("1", "2", "3", "4", "5"):
                 doc_fields.setdefault("document_count", "1")
             file_codes = pending.get("file_codes") or []
+            file_contents = pending.get("file_contents") or []
 
             def _do_seal_async():
-                _do_create_seal(open_id, user_id, doc_fields, file_codes, direct_create=True)
+                _do_create_seal(open_id, user_id, doc_fields, file_codes, direct_create=True, file_contents=file_contents)
 
             threading.Thread(target=_do_seal_async, daemon=True).start()
             return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "正在生成工单，请稍候"}})
@@ -1359,9 +1364,9 @@ def on_card_action_confirm(data):
                     risks = pre_check.get("risks", [])
                     set_pre_check_result(instance_code, compliant, comment, risks)
                     if compliant:
-                        add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
+                        add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
                     elif comment or risks:
-                        add_approval_comment(instance_code, _build_fail_comment(comment, risks), get_token, user_id=user_id)
+                        add_approval_comment(instance_code, _build_fail_comment(comment, risks), get_token, user_id=BOT_USER_ID or None)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
@@ -2330,13 +2335,14 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
                        ai_fields.get("seal_type"), initial_fields)
     if not missing:
         # 全部可推断，直接创建工单
-        _do_create_seal(open_id, user_id, doc_fields, file_codes)
+        _do_create_seal(open_id, user_id, doc_fields, file_codes, file_contents=[(file_content, file_name)])
         return
 
     with _state_lock:
         PENDING_SEAL[open_id] = {
             "doc_fields": doc_fields,
             "file_codes": file_codes,
+            "file_contents": [(file_content, file_name)],  # 保留内存内容，避免 pre_check 通过 drive API 下载 approval file_code
             "user_id": user_id,
             "file_name": file_name,
             "created_at": time.time(),
@@ -2419,9 +2425,9 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
                 elif pre_comment or pre_risks:
-                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=BOT_USER_ID or None)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
@@ -2431,7 +2437,7 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
             send_message(open_id, f"提交失败：{msg}", use_red=True)
 
 
-def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False):
+def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create=False, file_contents=None):
     """用印申请单字段齐全时，发送确认卡片，用户点击确认后创建工单。direct_create=True 时直接创建不弹确认卡。表单为 fieldList 表格结构。"""
     all_fields = dict(all_fields)
     all_fields.setdefault("usage_method", "纸质章")
@@ -2448,6 +2454,14 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     lawyer_val = "已审核" if lawyer_raw in ("是", "yes", "已审核") else "未审核"
     resolved_lawyer = _resolve_radio_option_for_seal("widget17334701422160001", lawyer_val, default_first=True)
     resolved_doc_type = _resolve_document_type_for_seal(all_fields.get("document_type", ""))
+
+    # ⚠️ pre_check 必须在 seal_detail 写入之前调用！
+    # seal_detail 里存的是 radioV2 的 option ID（如 "m4cfd62w-mngol3pzowg-0"），
+    # 写入后 _lawyer_unreviewed_val 无法识别，会把"未审核"误判为"已审核"，导致错误放行。
+    # pre_check 直接读 all_fields 顶层的 lawyer_reviewed（原始文本"是"/"否"/"未审核"）来判断风险。
+    fc_for_pre_check = {"widget15828104903330001": codes} if codes else {}
+    pre_check = run_pre_check("用印申请单", all_fields, fc_for_pre_check, get_token, file_contents_with_names=file_contents or [])
+
     all_fields["seal_detail"] = [{
         "文件名称": all_fields.get("document_name", ""),
         "用印事由": all_fields.get("reason", ""),
@@ -2464,7 +2478,6 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
 
     if direct_create:
         fc = {"widget15828104903330001": codes} if codes else {}
-        pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
         success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=codes)
         if success:
             instance_code = resp_data.get("instance_code", "")
@@ -2473,9 +2486,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
                 elif pre_comment or pre_risks:
-                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=BOT_USER_ID or None)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
@@ -2490,7 +2503,7 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     fc = {"widget15828104903330001": codes} if codes else {}
     admin_comment = get_admin_comment("用印申请单", all_fields)
     summary = format_fields_summary(all_fields, "用印申请单")
-    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
+    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token, file_contents_with_names=file_contents or [])
     send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc, pre_check_result=pre_check)
 
 
@@ -2611,7 +2624,8 @@ def _try_complete_seal(open_id, user_id, text):
         return True
 
     file_codes = pending.get("file_codes") or []
-    _do_create_seal(open_id, user_id, all_fields, file_codes)
+    file_contents = pending.get("file_contents") or []
+    _do_create_seal(open_id, user_id, all_fields, file_codes, file_contents=file_contents)
     return True
 
 

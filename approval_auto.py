@@ -521,85 +521,88 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 
 def add_approval_comment(instance_code, content, get_token, user_id=None):
-    """在审批实例下添加评论。飞书要求 content 为 JSON 字符串。
-    铁桶防御：绝对不手动拼接字符串，AI 返回的双引号/换行/制表符等由 json.dumps 自动转义。"""
+    """在审批实例下以机器人身份添加评论。
+    使用 tenant_access_token，评论者显示为应用/机器人本身，无需传 user_id。
+    content 字段为 JSON 字符串：{"text": "...", "files": []}
+    """
     token = get_token()
-    # 仅做长度截断，不预清洗——json.dumps 会正确处理双引号、换行、制表符等
     text = (content or "自动审批").strip()
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
 
-    # 核心防线：先放入字典，再用 json.dumps 序列化，自动处理所有转义
-    content_dict = {"text": text, "files": []}
-    safe_content_str = json.dumps(content_dict, ensure_ascii=False)
+    safe_content_str = json.dumps({"text": text, "files": []}, ensure_ascii=False)
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": "python-httpx/0.28.1",
     }
+    url = f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments"
 
-    def _post(params, body):
-        return httpx.post(
-            f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments",
-            headers=headers,
-            params=params,
-            json=body,
-            timeout=10,
-        )
-
-    # 尝试1：user_id 放 body（飞书文档推荐）
-    if user_id:
-        payload = {"content": safe_content_str, "user_id": user_id}
-        logger.debug("审批评论请求 payload: %s", json.dumps(payload, ensure_ascii=False)[:200])
-        res = _post({"user_id_type": "user_id"}, payload)
-        data = res.json()
-        if data.get("code") == 0:
-            logger.info("已添加审批评论: instance=%s user_id=%s", instance_code, user_id)
-            return True, None
-
-    # 尝试2：user_id 放 query
-    if user_id:
-        params = {"user_id_type": "user_id", "user_id": user_id}
-        res = _post(params, {"content": safe_content_str})
-        data = res.json()
-        if data.get("code") == 0:
-            logger.info("已添加审批评论(query): instance=%s user_id=%s", instance_code, user_id)
-            return True, None
-
-    # 尝试3：仅 content，不传 user_id
-    res = _post({"user_id_type": "user_id"}, {"content": safe_content_str})
+    # 机器人评论：不传 user_id，直接以 tenant_access_token 身份发评论
+    res = httpx.post(
+        url,
+        headers=headers,
+        params={"user_id_type": "user_id"},
+        json={"content": safe_content_str},
+        timeout=10,
+    )
     data = res.json()
     if data.get("code") == 0:
-        logger.info("已添加审批评论(无user_id): instance=%s", instance_code)
+        logger.info("已添加审批评论(机器人): instance=%s", instance_code)
         return True, None
 
-    # 尝试4：content 改为纯文本（兜底）
+    # 兜底：content 改为纯文本（某些租户配置不接受 JSON 格式）
     if data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower():
-        res4 = _post({"user_id_type": "user_id"}, {"content": text})
-        data4 = res4.json()
-        if data4.get("code") == 0:
-            logger.info("已添加审批评论(纯文本): instance=%s", instance_code)
+        res2 = httpx.post(url, headers=headers, params={"user_id_type": "user_id"}, json={"content": text}, timeout=10)
+        data2 = res2.json()
+        if data2.get("code") == 0:
+            logger.info("已添加审批评论(纯文本兜底): instance=%s", instance_code)
             return True, None
-        data = data4
+        data = data2
 
     logger.warning(
-        "添加评论失败: code=%s msg=%s instance=%s user_id=%r content_len=%d content_preview=%r",
-        data.get("code"),
-        data.get("msg"),
-        instance_code,
-        user_id,
-        len(safe_content_str),
+        "添加评论失败: code=%s msg=%s instance=%s content_preview=%r",
+        data.get("code"), data.get("msg"), instance_code,
         safe_content_str[:120] + "..." if len(safe_content_str) > 120 else safe_content_str,
     )
     return False, data.get("msg", "未知错误")
 
 
+def _download_approval_instance_file(file_key, instance_code, get_token):
+    """
+    从审批实例下载附件（审批专用 API）。
+    /approval/v4/files/upload 上传后返回的 file_code 不是 drive token，
+    必须通过此接口下载，不能用 drive API。
+    返回 (content, None) 或 (None, err)
+    """
+    if not file_key or not instance_code:
+        return None, "缺少 file_key 或 instance_code"
+    try:
+        token = get_token()
+        res = httpx.get(
+            f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/files/{file_key}/download",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=60,
+            follow_redirects=True,
+        )
+        if res.status_code == 200:
+            ct = res.headers.get("content-type", "").lower()
+            if "application/json" not in ct and res.content:
+                return res.content, None
+            try:
+                data = res.json()
+                return None, data.get("msg", "审批文件下载返回异常")
+            except Exception:
+                pass
+        return None, f"HTTP {res.status_code}"
+    except Exception as e:
+        logger.warning("审批实例文件下载异常 file_key=%s instance=%s: %s", file_key, instance_code, e)
+        return None, str(e)
+
+
 def _download_drive_file(file_token, get_token):
     """
-    从飞书云空间下载文件。
-    审批附件的 file_code 与 drive file_token 通常一致，可直接用于 drive/v1/files/{file_token}/download。
-    支持：1) 直接返回二进制流 2) 返回 JSON 含 download_link 3) 302 重定向
+    从飞书云空间下载文件（仅适用于真正的 drive file_token，不适用于审批 file_code）。
     返回 (content, None) 或 (None, err)
     """
     if not file_token:
@@ -607,7 +610,6 @@ def _download_drive_file(file_token, get_token):
     token = get_token()
     url = f"https://open.feishu.cn/open-apis/drive/v1/files/{file_token}/download"
     try:
-        # 允许跟随重定向（飞书可能返回 302 到实际文件 URL）
         res = httpx.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
@@ -634,9 +636,15 @@ def _download_drive_file(file_token, get_token):
         return None, str(e)
 
 
-def _download_approval_file(file_token_or_code, get_token):
+def _download_approval_file(file_token_or_code, get_token, instance_code=None):
     """
-    下载审批附件。支持：1) 直接 URL 2) drive 接口 3) media 临时链接。
+    下载审批附件。
+    优先顺序：
+      1. 审批实例文件 API（需 instance_code，这是 approval file_code 的唯一正确下载方式）
+      2. drive API（仅对真正的云空间 file_token 有效）
+      3. media 临时链接（兜底）
+    注意：pre_check 时 instance_code 尚不存在，应通过 file_contents_with_names 传内存文件内容，
+    避免在 pre_check 阶段调用此函数下载 approval file_code。
     返回 (content, None) 或 (None, err)
     """
     if file_token_or_code and str(file_token_or_code).startswith("http"):
@@ -647,10 +655,20 @@ def _download_approval_file(file_token_or_code, get_token):
         except Exception as e:
             logger.debug("直接下载 URL 失败: %s", e)
         return None, "URL 下载失败"
+
+    # 优先：审批实例专用 API（approval file_code 只能走这里）
+    if instance_code:
+        content, err = _download_approval_instance_file(file_token_or_code, instance_code, get_token)
+        if content:
+            return content, None
+        logger.debug("审批实例文件下载失败，降级到 drive API: %s", err)
+
+    # 备选：drive API（仅对 drive token 有效）
     content, err = _download_drive_file(file_token_or_code, get_token)
     if content:
         return content, None
-    # 备选：batch_get_tmp_download_url（适用于部分媒体类型）
+
+    # 兜底：media 临时下载链接
     try:
         token = get_token()
         res = httpx.post(
