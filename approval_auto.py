@@ -167,9 +167,12 @@ def get_auto_approval_status():
 
 # approval_code -> 工单类型（含 override 后的映射）
 def _get_approval_codes_to_query():
-    """获取用于查询的 (approval_code, approval_type) 列表，含 override"""
+    """获取用于查询的 (approval_code, approval_type) 列表，含 override。跳过 exclude_types（不参与自动审批且可能在工作区不存在）"""
+    exclude = get_exclude_types()
     result = []
     for approval_type, code in APPROVAL_CODES.items():
+        if approval_type in exclude:
+            continue
         override = get_approval_code_override(approval_type)
         effective = override if override else code
         result.append((effective, approval_type))
