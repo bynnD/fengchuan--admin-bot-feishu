@@ -20,6 +20,7 @@ from approval_auto import (
     set_auto_approval_enabled,
     set_auto_approval_type_enabled,
     set_all_types_enabled,
+    poll_and_process,
 )
 from field_cache import get_form_fields, get_sub_field_options, invalidate_cache, is_free_process, mark_free_process
 from deepseek_client import call_deepseek_with_retry
@@ -2973,6 +2974,20 @@ def on_message(data):
                     for t, on in st["types"].items():
                         lines.append(f"  · {t}：{'开' if on else '关'}")
                     send_message(open_id, "自动审批状态：\n" + "\n".join(lines))
+                    return
+                if action == "poll":
+                    was_disabled = not is_auto_approval_enabled()
+                    if was_disabled:
+                        set_auto_approval_enabled(True, user_id)
+                    try:
+                        poll_and_process(get_token)
+                        msg = "已执行一次轮询，处理待审批工单。"
+                        if was_disabled:
+                            msg = "已临时开启自动审批并执行轮询。\n\n" + msg
+                        send_message(open_id, msg)
+                    except Exception as e:
+                        logger.exception("手动轮询异常: %s", e)
+                        send_message(open_id, f"轮询执行异常：{e}", use_red=True)
                     return
 
         # 汇总卡出现后，用户通过对话修改字段

@@ -68,6 +68,7 @@ def get_switch_commands():
         "enable_all": tuple(cmds.get("enable_all") or ["全部开启"]),
         "disable_all": tuple(cmds.get("disable_all") or ["全部关闭"]),
         "query": tuple(cmds.get("query") or ["自动审批状态", "自动审批开没开"]),
+        "poll": tuple(cmds.get("poll") or ["轮询"]),
         "enable_type_keywords": list(cmds.get("enable_type_keywords") or ["采购", "开票", "用印"]),
         "disable_type_keywords": list(cmds.get("disable_type_keywords") or ["采购", "开票", "用印"]),
     }
@@ -123,6 +124,8 @@ def check_switch_command(text):
         return ("disable_all", None)
     if t in cmds["query"]:
         return ("query", None)
+    if t in cmds["poll"]:
+        return ("poll", None)
     # 按类型：开启采购/开启采购申请、关闭用印 等
     for kw in cmds["enable_type_keywords"]:
         full = _TYPE_ALIAS.get(kw, kw)
