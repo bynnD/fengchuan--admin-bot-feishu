@@ -69,6 +69,8 @@ SEAL_UPLOAD_DEBOUNCE_SEC = 4  # 连续上传多文件时，等待此秒数无新
 # 开票等待上传时收集多文件（防抖）：{open_id: {"files": [{...}], "user_id", "created_at", "timer"}}
 PENDING_INVOICE_UPLOAD = {}
 INVOICE_UPLOAD_DEBOUNCE_SEC = 12  # 连续上传多文件时，等待此秒数无新文件后批量处理，再统一发卡（合同+对账单需时间上传）
+# 开票处理中：pop 后到发卡完成期间，拒绝新文件，避免竞态导致双卡
+PENDING_INVOICE_PROCESSING = set()
 # 多文件用印排队：{open_id: {"items": [{file_name, file_code, doc_fields}, ...], "current_index": 0, "selections": [{lawyer, usage, count}, ...], "user_id", "created_at"}}
 PENDING_SEAL_QUEUE = {}
 FILE_INTENT_WAIT_SEC = 180  # 3 分钟内未说明意图则弹出选项卡
@@ -146,6 +148,7 @@ def _clean_expired_pending(open_id=None):
         for oid in list(PENDING_INVOICE.keys()) if open_id is None else ([open_id] if open_id in PENDING_INVOICE else []):
             if oid in PENDING_INVOICE and now - PENDING_INVOICE[oid].get("created_at", 0) > PENDING_TTL:
                 del PENDING_INVOICE[oid]
+                PENDING_INVOICE_PROCESSING.discard(oid)
                 entry = PENDING_INVOICE_UPLOAD.pop(oid, None)
                 if entry and entry.get("timer"):
                     try:
@@ -556,6 +559,15 @@ def send_message(open_id, text, use_red=False):
         logger.error("发送消息失败: %s, content前100字: %r", resp.msg, text[:100])
 
 
+def _on_work_order_card_sent(open_id):
+    """工单创建完成并发送查询工单消息卡时调用，标记本次任务结束，下次用户消息按全新任务处理"""
+    with _state_lock:
+        if open_id in CONVERSATIONS:
+            CONVERSATIONS[open_id] = []
+        PENDING_INVOICE_UPLOAD.pop(open_id, None)
+        PENDING_INVOICE_PROCESSING.discard(open_id)
+
+
 def send_card_message(open_id, text, url, btn_label, use_desktop_link=False):
     """发送卡片消息。use_desktop_link=True 时使用飞书官方审批 applink，在应用内打开"""
     if use_desktop_link and "instanceCode=" in url:
@@ -704,6 +716,8 @@ def _schedule_invoice_upload_process(open_id, user_id, immediate=False):
         uid = entry.get("user_id", "")
         if not files:
             return
+        with _state_lock:
+            PENDING_INVOICE_PROCESSING.add(open_id)
         threading.Thread(target=lambda: _process_invoice_upload_batch(open_id, uid, files), daemon=True).start()
 
     with _state_lock:
@@ -1337,11 +1351,9 @@ def on_card_action_confirm(data):
             nonlocal open_id
             success, msg, resp_data, summary = create_approval(user_id, approval_type, fields, file_codes=file_codes)
             if success:
-                with _state_lock:
-                    if open_id in CONVERSATIONS:
-                        CONVERSATIONS[open_id] = []
                 instance_code = resp_data.get("instance_code", "")
                 if instance_code:
+                    _on_work_order_card_sent(open_id)
                     compliant = pre_check.get("compliant", True)
                     comment = pre_check.get("comment", "")
                     risks = pre_check.get("risks", [])
@@ -1353,6 +1365,7 @@ def on_card_action_confirm(data):
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
+                    _on_work_order_card_sent(open_id)
                     send_message(open_id, f"· {approval_type}：✅ 已提交\n{summary}")
             else:
                 send_message(open_id, f"提交失败：{msg}", use_red=True)
@@ -2379,19 +2392,21 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
             del PENDING_SEAL_QUEUE[open_id]
         if open_id in CONVERSATIONS:
             CONVERSATIONS[open_id] = []
-    if success:
-        instance_code = resp_data.get("instance_code", "")
-        if instance_code:
-            compliant, pre_comment, pre_risks = pre_check
-            set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
-            if compliant:
-                add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
-            elif pre_comment or pre_risks:
-                add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
-            link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
-            send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
-        else:
-            send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
+        if success:
+            instance_code = resp_data.get("instance_code", "")
+            if instance_code:
+                _on_work_order_card_sent(open_id)
+                compliant, pre_comment, pre_risks = pre_check
+                set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
+                if compliant:
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
+                elif pre_comment or pre_risks:
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
+                link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
+                send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
+            else:
+                _on_work_order_card_sent(open_id)
+                send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
     else:
         send_message(open_id, f"提交失败：{msg}", use_red=True)
 
@@ -2432,11 +2447,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
         pre_check = run_pre_check("用印申请单", all_fields, fc, get_token)
         success, msg, resp_data, summary = create_approval(user_id, "用印申请单", all_fields, file_codes=codes)
         if success:
-            with _state_lock:
-                if open_id in CONVERSATIONS:
-                    CONVERSATIONS[open_id] = []
             instance_code = resp_data.get("instance_code", "")
             if instance_code:
+                _on_work_order_card_sent(open_id)
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
@@ -2446,6 +2459,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
+                with _state_lock:
+                    if open_id in CONVERSATIONS:
+                        CONVERSATIONS[open_id] = []
                 send_message(open_id, f"· 用印申请单：✅ 已提交\n{summary}")
         else:
             send_message(open_id, f"提交失败：{msg}", use_red=True)
@@ -2623,6 +2639,15 @@ def _infer_invoice_proof_type(file_name, ai_fields):
 
 def _process_invoice_upload_batch(open_id, user_id, files):
     """批量处理开票凭证文件，全部处理完后统一发送选项卡片。合同+对账单合并为一张发票，金额优先取自对账单。"""
+    try:
+        _process_invoice_upload_batch_impl(open_id, user_id, files)
+    finally:
+        with _state_lock:
+            PENDING_INVOICE_PROCESSING.discard(open_id)
+
+
+def _process_invoice_upload_batch_impl(open_id, user_id, files):
+    """_process_invoice_upload_batch 的实现逻辑"""
     with _state_lock:
         pending = PENDING_INVOICE.get(open_id)
         if not pending:
@@ -2821,6 +2846,7 @@ def _try_complete_invoice(open_id, user_id, text):
         with _state_lock:
             if open_id in PENDING_INVOICE:
                 del PENDING_INVOICE[open_id]
+                PENDING_INVOICE_PROCESSING.discard(open_id)
                 PENDING_INVOICE_UPLOAD.pop(open_id, None)
         send_message(open_id, "已取消开票申请单，如需办理请重新发起。", use_red=True)
         return True
@@ -2914,6 +2940,8 @@ def on_message(data):
                     step = pending.get("step", "") if pending else ""
                 if step == "user_fields":
                     send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。", use_red=True)
+                elif open_id in PENDING_INVOICE_PROCESSING:
+                    send_message(open_id, "您上传的凭证正在处理中，请稍候。处理完成后如需补充凭证，请回复「取消」后重新发起。", use_red=True)
                 else:
                     file_name = content_json.get("file_name", "未知文件")
                     with _state_lock:
@@ -2974,6 +3002,8 @@ def on_message(data):
                 pending = PENDING_INVOICE.get(open_id, {})
                 if pending.get("step") == "user_fields":
                     send_message(open_id, "您已进入选项步骤，请先完成上方卡片的选项选择并点击确认。如需重新上传，请回复「取消」后重新发起。", use_red=True)
+                elif open_id in PENDING_INVOICE_PROCESSING:
+                    send_message(open_id, "您上传的凭证正在处理中，请稍候。处理完成后如需补充凭证，请回复「取消」后重新发起。", use_red=True)
                 else:
                     image_key = content_json.get("image_key") or content_json.get("file_key", "")
                     if not image_key:
