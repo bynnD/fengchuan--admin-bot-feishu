@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
+# paddlepaddle 2.5.2 已从 PyPI 下架，从官方源安装（2.6 在部分环境会 SIGILL）
+RUN pip install paddlepaddle==2.5.2 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/ \
+    || pip install paddlepaddle==2.5.2 -i https://mirror.baidu.com/pypi/simple
 RUN pip install -r requirements.txt
 COPY . .
 CMD ["python", "-u", "main.py"]
