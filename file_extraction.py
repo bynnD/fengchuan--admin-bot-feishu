@@ -5,31 +5,48 @@
 
 import base64
 import logging
+import time
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# 飞书 OCR 频率限制时重试：最多 3 次，退避 2s / 4s / 8s
+OCR_RETRY_MAX = 3
+OCR_RETRY_DELAYS = (2, 4, 8)
 
 
 def feishu_ocr(image_content, get_token):
     """调用飞书 OCR 识别图片/扫描件中的文字。返回拼接后的文本。"""
     if not image_content:
         return ""
-    try:
-        token = get_token()
-        b64 = base64.b64encode(image_content).decode("utf-8")
-        res = httpx.post(
-            "https://open.feishu.cn/open-apis/optical_char_recognition/v1/image/basic_recognize",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"image": b64},
-            timeout=15
-        )
-        data = res.json()
-        if data.get("code") == 0:
-            text_list = data.get("data", {}).get("text_list", [])
-            return "\n".join(t for t in text_list if t) if text_list else ""
-        logger.warning("飞书 OCR 失败: %s", data.get('msg', ''))
-    except Exception as e:
-        logger.warning("飞书 OCR 异常: %s", e)
+    token = get_token()
+    b64 = base64.b64encode(image_content).decode("utf-8")
+    for attempt in range(OCR_RETRY_MAX):
+        try:
+            res = httpx.post(
+                "https://open.feishu.cn/open-apis/optical_char_recognition/v1/image/basic_recognize",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"image": b64},
+                timeout=15
+            )
+            data = res.json()
+            if data.get("code") == 0:
+                text_list = data.get("data", {}).get("text_list", [])
+                return "\n".join(t for t in text_list if t) if text_list else ""
+            msg = data.get("msg", "")
+            # 频率限制时退避重试
+            if "frequency" in msg.lower() or "limit" in msg.lower():
+                if attempt < OCR_RETRY_MAX - 1:
+                    delay = OCR_RETRY_DELAYS[attempt]
+                    logger.info("飞书 OCR 频率限制，%ds 后重试 (%d/%d)", delay, attempt + 1, OCR_RETRY_MAX)
+                    time.sleep(delay)
+                    token = get_token()  # 刷新 token
+                    continue
+            logger.warning("飞书 OCR 失败: %s", msg)
+            break
+        except Exception as e:
+            logger.warning("飞书 OCR 异常: %s", e)
+            break
     return ""
 
 
@@ -96,6 +113,8 @@ def extract_text_from_file(file_content, file_name, get_token):
             doc = fitz.open(stream=file_content, filetype="pdf")
             ocr_parts = []
             for i in range(min(len(doc), 20)):
+                if i > 0:
+                    time.sleep(1)  # 页间间隔，降低飞书 OCR 频率限制触发
                 page = doc[i]
                 pix = page.get_pixmap(dpi=150)
                 img_bytes = pix.tobytes("png")
