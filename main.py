@@ -36,10 +36,6 @@ logger = logging.getLogger(__name__)
 
 # 配置常量
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
-# 机器人在飞书中的员工 user_id（非 open_id），用于以机器人身份发审批评论。
-# 可在飞书开放平台 -> 应用信息 -> 机器人 -> 查看机器人的用户信息获取。
-# 若未配置，评论将以工单发起人身份显示。
-BOT_USER_ID = os.environ.get("FEISHU_BOT_USER_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")  # 可选，用于 /debug-form 等调试接口认证
@@ -1364,9 +1360,9 @@ def on_card_action_confirm(data):
                     risks = pre_check.get("risks", [])
                     set_pre_check_result(instance_code, compliant, comment, risks)
                     if compliant:
-                        add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
+                        add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
                     elif comment or risks:
-                        add_approval_comment(instance_code, _build_fail_comment(comment, risks), get_token, user_id=BOT_USER_ID or None)
+                        add_approval_comment(instance_code, _build_fail_comment(comment, risks), get_token, user_id=user_id)
                     link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                     send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
                 else:
@@ -2425,9 +2421,9 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
                 elif pre_comment or pre_risks:
-                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=BOT_USER_ID or None)
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, f"工单已创建（共 {len(items)} 份文件），点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:
@@ -2486,9 +2482,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
                 compliant, pre_comment, pre_risks = pre_check
                 set_pre_check_result(instance_code, compliant, pre_comment, pre_risks)
                 if compliant:
-                    add_approval_comment(instance_code, "符合规范", get_token, user_id=BOT_USER_ID or None)
+                    add_approval_comment(instance_code, "符合规范", get_token, user_id=user_id)
                 elif pre_comment or pre_risks:
-                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=BOT_USER_ID or None)
+                    add_approval_comment(instance_code, _build_fail_comment(pre_comment, pre_risks), get_token, user_id=user_id)
                 link = f"https://applink.feishu.cn/client/approval?instanceCode={instance_code}"
                 send_card_message(open_id, "工单已创建，点击下方按钮查看：", link, "查看工单", use_desktop_link=True)
             else:

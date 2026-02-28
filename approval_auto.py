@@ -174,14 +174,27 @@ def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_t
         can_auto = True
         comment = ""
         all_risks = ["律师未审核"]
+
+        # 优先使用内存中的文件内容（避免审批 file_code 无法用 drive API 下载导致 404）
+        # file_contents_with_names: [(content_bytes, file_name), ...]
+        in_memory = list(file_contents_with_names) if file_contents_with_names else []
+
         for i, (tok, fname_from_form) in enumerate(tokens_with_names):
             lu, is_ca = per_file[i] if i < len(per_file) else (False, False)
             if not (lu and is_ca):
                 continue
-            file_content, dl_err = _download_approval_file(tok, get_token)
-            if not file_content:
-                return False, f"附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析。", [f"附件{i+1}下载失败"]
             file_name = fname_from_form or (default_fname if i == 0 else f"附件{i+1}")
+            # 优先使用内存内容，无内存内容时才通过 token 下载
+            if i < len(in_memory) and in_memory[i][0]:
+                file_content = in_memory[i][0]
+                mem_name = in_memory[i][1]
+                if mem_name:
+                    file_name = mem_name
+                logger.debug("用印预检: 使用内存文件内容 附件%d name=%s", i + 1, file_name)
+            else:
+                file_content, dl_err = _download_approval_file(tok, get_token)
+                if not file_content:
+                    return False, f"附件{i + 1}下载失败（{dl_err}），无法进行 AI 分析。", [f"附件{i+1}下载失败"]
             try:
                 file_can_auto, file_comment, risks = check_seal_with_ai(
                     file_content, file_name, seal_type, get_token
@@ -521,15 +534,16 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
 
 
 def add_approval_comment(instance_code, content, get_token, user_id=None):
-    """在审批实例下以机器人身份添加评论。
-    使用 tenant_access_token，评论者显示为应用/机器人本身，无需传 user_id。
-    content 字段为 JSON 字符串：{"text": "...", "files": []}
+    """在审批实例下添加审批评论。
+    飞书审批评论 API 强制要求 user_id 放在 Query 参数中（不能放 Body，否则报 99992402）。
+    user_id 传工单发起人或机器人自身的 user_id，决定评论显示名称。
     """
     token = get_token()
     text = (content or "自动审批").strip()
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
 
+    # json.dumps 自动处理双引号/换行/特殊字符转义
     safe_content_str = json.dumps({"text": text, "files": []}, ensure_ascii=False)
 
     headers = {
@@ -538,31 +552,31 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
     }
     url = f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments"
 
-    # 机器人评论：不传 user_id，直接以 tenant_access_token 身份发评论
-    res = httpx.post(
-        url,
-        headers=headers,
-        params={"user_id_type": "user_id"},
-        json={"content": safe_content_str},
-        timeout=10,
-    )
+    if not user_id:
+        logger.warning("add_approval_comment: user_id 为空，飞书 API 要求必须传 user_id，评论将失败")
+        return False, "user_id 为空"
+
+    # user_id 必须放 Query 参数，不能放 Body
+    params = {"user_id_type": "user_id", "user_id": user_id}
+
+    res = httpx.post(url, headers=headers, params=params, json={"content": safe_content_str}, timeout=10)
     data = res.json()
     if data.get("code") == 0:
-        logger.info("已添加审批评论(机器人): instance=%s", instance_code)
+        logger.info("已添加审批评论: instance=%s user_id=%s", instance_code, user_id)
         return True, None
 
-    # 兜底：content 改为纯文本（某些租户配置不接受 JSON 格式）
+    # 兜底：content 改为纯文本（某些租户不接受 JSON 格式）
     if data.get("code") == 99992402 or "validation" in str(data.get("msg", "")).lower():
-        res2 = httpx.post(url, headers=headers, params={"user_id_type": "user_id"}, json={"content": text}, timeout=10)
+        res2 = httpx.post(url, headers=headers, params=params, json={"content": text}, timeout=10)
         data2 = res2.json()
         if data2.get("code") == 0:
-            logger.info("已添加审批评论(纯文本兜底): instance=%s", instance_code)
+            logger.info("已添加审批评论(纯文本兜底): instance=%s user_id=%s", instance_code, user_id)
             return True, None
         data = data2
 
     logger.warning(
-        "添加评论失败: code=%s msg=%s instance=%s content_preview=%r",
-        data.get("code"), data.get("msg"), instance_code,
+        "添加评论失败: code=%s msg=%s instance=%s user_id=%s content_preview=%r",
+        data.get("code"), data.get("msg"), instance_code, user_id,
         safe_content_str[:120] + "..." if len(safe_content_str) > 120 else safe_content_str,
     )
     return False, data.get("msg", "未知错误")
