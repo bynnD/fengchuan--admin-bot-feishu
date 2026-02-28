@@ -12,6 +12,7 @@ openpyxl
 pymupdf
 
 # 本地 OCR（替代飞书 OCR，避免频率限制）
-# paddlepaddle 2.5.2 需从官方源安装，见 Dockerfile
+# 2.5.2 已下架，使用 2.6.2；若仍 SIGILL 需改用 Tesseract
+paddlepaddle==2.6.2
 paddleocr>=2.7.0,<3.0
 opencv-python-headless
