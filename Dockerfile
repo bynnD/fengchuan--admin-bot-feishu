@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1
-# Tesseract OCR（轻量，镜像约 500MB 内）
+# RapidOCR/OpenCV 所需系统库（无头环境）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr tesseract-ocr-chi-sim \
+    libxcb1 libgl1 libsm6 libxext6 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .

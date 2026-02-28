@@ -12,6 +12,6 @@ openpyxl
 pymupdf
 
 # 本地 OCR（替代飞书 OCR，避免频率限制）
-# Tesseract 轻量，镜像小，适合 Zeabur 部署
-pytesseract>=0.3.10
-Pillow
+# RapidOCR 基于 ONNX，中文识别强，无 PaddlePaddle SIGILL
+rapidocr-onnxruntime>=1.4.0
+opencv-python-headless
