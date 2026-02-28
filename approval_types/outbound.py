@@ -9,3 +9,7 @@ FIELD_HINTS = "destination(外出地点), start_date(YYYY-MM-DD), end_date(YYYY-
 FIELD_LABELS = {
     "destination": "外出地点",
 }
+
+
+def get_admin_comment(fields):
+    return "请核实以上填报信息无误后提交"

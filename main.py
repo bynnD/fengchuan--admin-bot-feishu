@@ -288,8 +288,15 @@ def _try_modify_confirm(open_id, user_id, text):
         PENDING_CONFIRM.pop(confirm_id, None)
     admin_comment = get_admin_comment(approval_type, fields)
     summary = format_fields_summary(fields, approval_type)
-    pre_check = run_pre_check(approval_type, fields, pending.get("file_codes"), get_token)
-    send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=pending.get("file_codes"), pre_check_result=pre_check)
+    file_contents = pending.get("file_contents") or []
+    pre_check = run_pre_check(
+        approval_type, fields, pending.get("file_codes"), get_token,
+        file_contents_with_names=file_contents if file_contents else None,
+    )
+    send_confirm_card(
+        open_id, approval_type, summary, admin_comment, user_id, fields,
+        file_codes=pending.get("file_codes"), pre_check_result=pre_check, file_contents=file_contents,
+    )
     send_message(open_id, "已按您的要求修改，请再次确认信息无误后点击「确认提交」。", use_red=True)
     return True
 
@@ -995,9 +1002,10 @@ def send_seal_options_card(open_id, user_id, doc_fields, file_codes, file_name):
         logger.error("发送用印选项卡片失败: %s", resp.msg)
 
 
-def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None, pre_check_result=None):
+def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, fields, file_codes=None, pre_check_result=None, file_contents=None):
     """发送工单确认卡片，用户点击「确认」后创建工单。支持用户通过对话修改字段后重新发卡。
-    pre_check_result: (compliant, comment, risks) 或 (compliant, comment, risks, extra)，extra 含 rule_risks/ai_comment 时用于两段式评论"""
+    pre_check_result: (compliant, comment, risks) 或 (compliant, comment, risks, extra)，extra 含 rule_risks/ai_comment 时用于两段式评论
+    file_contents: [(content_bytes, file_name), ...] 内存中的文件内容，用于修改确认时预检，避免 approval file_code 用 drive 下载导致 404"""
     confirm_id = str(uuid.uuid4())
     compliant = True
     pre_comment = ""
@@ -1023,6 +1031,7 @@ def send_confirm_card(open_id, approval_type, summary, admin_comment, user_id, f
             "approval_type": approval_type,
             "fields": dict(fields),
             "file_codes": dict(file_codes) if file_codes else None,
+            "file_contents": list(file_contents) if file_contents else None,
             "admin_comment": admin_comment,
             "created_at": time.time(),
             "pre_check": {"compliant": compliant, "comment": pre_comment, "risks": pre_risks, "rule_risks": rule_risks, "ai_comment": ai_comment},
@@ -1441,8 +1450,14 @@ def analyze_message(history):
     )
     messages = [{"role": "system", "content": system_prompt}] + history
     try:
-        res = call_deepseek_with_retry(messages, response_format={"type": "json_object"}, timeout=30)
-        content = res.json()["choices"][0]["message"]["content"]
+        content = None
+        for attempt in range(2):
+            res = call_deepseek_with_retry(messages, response_format={"type": "json_object"}, timeout=30)
+            content = res.json().get("choices", [{}])[0].get("message", {}).get("content")
+            if content is not None and content.strip():
+                break
+            if attempt == 0:
+                time.sleep(1)
         if content is None:
             raise ValueError("AI 返回内容为空")
         content = content.strip()
@@ -2505,8 +2520,9 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     fc = {"widget15828104903330001": codes} if codes else {}
     admin_comment = get_admin_comment("用印申请单", all_fields)
     summary = format_fields_summary(all_fields, "用印申请单")
-    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token, file_contents_with_names=file_contents or [])
-    send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc, pre_check_result=pre_check)
+    file_contents_list = file_contents or []
+    pre_check = run_pre_check("用印申请单", all_fields, fc, get_token, file_contents_with_names=file_contents_list)
+    send_confirm_card(open_id, "用印申请单", summary, admin_comment, user_id, all_fields, file_codes=fc, pre_check_result=pre_check, file_contents=file_contents_list)
 
 
 def _try_complete_seal(open_id, user_id, text):
@@ -2863,7 +2879,11 @@ def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
         compliant, pre_comment, pre_risks = pre_check
         if "仅合同" not in (pre_risks or []):
             pre_check = (False, "附件中仅有合同。" if not pre_comment else pre_comment, list(set(pre_risks or []) | {"仅合同"}))
-    send_confirm_card(open_id, "开票申请单", summary, admin_comment, user_id, all_fields, file_codes=file_codes or None, pre_check_result=pre_check)
+    send_confirm_card(
+        open_id, "开票申请单", summary, admin_comment, user_id, all_fields,
+        file_codes=file_codes or None, pre_check_result=pre_check,
+        file_contents=file_contents_with_names if file_contents_with_names else None,
+    )
 
     with _state_lock:
         if open_id in PENDING_INVOICE:
