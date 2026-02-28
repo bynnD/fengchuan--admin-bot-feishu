@@ -147,18 +147,23 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
         f"文件内容摘要：\n{file_text[:6000]}" if has_content else "（文件内容无法提取，仅根据文件名和类型推断）"
     )
 
-    prompt = f"""你是一个用印合规审核助手。请对以下文件进行两点分析：
+    prompt = f"""你是一个用印合规审核助手。你只审核文件内容本身，不审核规则（如「律师是否已审核」由系统规则判断，切勿返回）。
+
+请对以下文件进行两点分析：
 
 {combined}
 
 请严格按以下两点分析，并返回 JSON：
 1. legal_compliant: 文件内容是否合法合规（true/false）
-2. risk_points: 具体不合规项/风险点列表，每项简短（如「缺少关键条款」「金额异常」「律师未审核」），如无则 []
-3. comment: 合规时为「文件合法合规」；不合规时必须列出具体问题（与 risk_points 一致，用；分隔），不要笼统表述
+2. risk_points: 具体不合规项/风险点列表，每项必须具体说明，如无则 []
+   - 若缺少关键条款：必须写明缺了哪些（如「缺少违约责任条款」「缺少争议解决条款」）
+   - 若金额异常：必须写明具体问题（如「第3页合同金额10万与附件对账单8万不一致」「金额单位混用元与万元」）
+   - 禁止返回「律师未审核」，该由系统规则判断
+3. comment: 合规时为「文件合法合规」；不合规时必须列出具体问题（与 risk_points 一致，用；分隔），表述要具体
 
 返回格式示例：
 {{"legal_compliant": true, "risk_points": [], "comment": "文件合法合规。"}}
-不合规示例：{{"legal_compliant": false, "risk_points": ["缺少关键条款", "金额异常"], "comment": "缺少关键条款；金额异常"}}
+不合规示例：{{"legal_compliant": false, "risk_points": ["缺少违约责任条款", "第2页合同金额与附件对账单金额不一致"], "comment": "缺少违约责任条款；第2页合同金额与附件对账单金额不一致"}}
 
 只返回 JSON，不要其他内容。"""
 
@@ -177,6 +182,8 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
         risks = out.get("risk_points") or []
         if not isinstance(risks, list):
             risks = [str(risks)] if risks else []
+        # 过滤「律师未审核」：该由系统规则判断，AI 只审核文件内容
+        risks = [r for r in risks if str(r).strip() != "律师未审核"]
         comment = out.get("comment", "")
 
         can_auto = legal and len(risks) == 0

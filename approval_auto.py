@@ -170,10 +170,11 @@ def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_t
             return True, "", []
 
         # 对有律师未审核风险点的文件调 AI 审核内容
+        # 规则风险与 AI 意见分离：规则（如律师未审核）由系统判断，AI 只审核文件内容
+        rule_risks = ["律师未审核"]
         default_fname = f"{doc_name}.{doc_type}" if doc_type else (doc_name or "未知")
         can_auto = True
-        comment = ""
-        all_risks = ["律师未审核"]
+        ai_comment = ""
 
         # 优先使用内存中的文件内容（避免审批 file_code 无法用 drive API 下载导致 404）
         # file_contents_with_names: [(content_bytes, file_name), ...]
@@ -201,13 +202,16 @@ def run_pre_check(approval_type, fields, file_codes=None, get_token=None, file_t
                 )
                 if not file_can_auto:
                     can_auto = False
-                    comment = file_comment
-                    all_risks.extend(risks or [])
-                    break
+                    ai_comment = file_comment
+                    # AI 只返回文件内容风险，不包含「律师未审核」
+                    ai_risks = [r for r in (risks or []) if r != "律师未审核"]
+                    all_risks = rule_risks + ai_risks
+                    return can_auto, ai_comment, all_risks, {"rule_risks": rule_risks, "ai_comment": ai_comment}
+                break
             except Exception as e:
                 logger.warning("用印预检 AI 分析异常: %s", e)
                 return False, f"AI 分析异常（附件{i + 1}）：{e}", ["分析失败"]
-        return can_auto, comment, all_risks
+        return can_auto, ai_comment, rule_risks, {"rule_risks": rule_risks, "ai_comment": ai_comment}
 
     if approval_type == "开票申请单":
         # 优先使用传入的内存文件内容，避免审批 file_code 无法用 drive 下载导致 404
