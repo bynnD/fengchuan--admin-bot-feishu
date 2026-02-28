@@ -48,6 +48,14 @@ def get_admin_comment(fields):
 
 参考 `seal.py`（用印申请单）的实现。
 
+## 选项卡选项（main.py）
+
+若工单有选项卡片（如用印的盖章形式、开票的发票类型），选项必须从飞书表单动态获取，确保与工单配置一致。在 `main.py` 中：
+
+1. 定义 `XXX_OPTION_FIELDS = {逻辑键: 字段ID}` 映射
+2. 通过 `_get_field_options_texts(approval_type, field_id)` 获取选项文本列表
+3. 该函数自动支持顶层控件和 fieldList 子字段，无需区分
+
 ## 删除工单类型
 
 删除对应 py 文件，并从 `__init__.py` 的 `_TYPES` 中移除即可。

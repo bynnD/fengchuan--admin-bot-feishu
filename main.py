@@ -206,6 +206,12 @@ def _is_cancel_intent(text):
 
 def _build_fail_comment(comment, risks, max_len=200, rule_risks=None, ai_comment=None):
     """构建不合规评论。用印申请单时 rule_risks 与 ai_comment 可分别传入，输出两段式格式。"""
+    issues = list(risks[:5]) if risks else ([comment.strip()] if comment else [])
+    # 类型排除/未启用：使用说明性文案，避免「不符合要求」造成误解（非工单内容问题）
+    if issues == ["该类型不参与自动审批"]:
+        return "说明：该工单类型未纳入自动审批范围，需人工审核。"
+    if issues == ["该类型未启用自动审批"]:
+        return "说明：该工单类型未启用自动审批，需人工审核。"
     if rule_risks is not None and ai_comment is not None:
         # 两段式：规则输出 + AI审批意见
         part1 = "不符合要求：" + "；".join(rule_risks) if rule_risks else ""
@@ -220,7 +226,6 @@ def _build_fail_comment(comment, risks, max_len=200, rule_risks=None, ai_comment
             fail_comment = "不符合要求"
         return fail_comment[:max_len] if len(fail_comment) > max_len else fail_comment
 
-    issues = list(risks[:5]) if risks else ([comment.strip()] if comment else [])
     if not issues:
         return "不符合要求"
     fail_comment = "不符合要求：" + "；".join(issues)
@@ -804,7 +809,8 @@ def _validate_seal_options(doc_fields):
     count = str(doc_fields.get("document_count", "1")).strip()
     if lawyer not in ("是", "否"):
         return False, "请先完成律师审核、盖章方式、盖章份数的选择"
-    if usage not in ("纸质章", "电子章", "外带印章"):
+    usage_opts = _get_seal_form_options().get("usage_method") or ["纸质章", "电子章", "外带印章"]
+    if usage not in usage_opts:
         return False, "请先完成律师审核、盖章方式、盖章份数的选择"
     if count not in ("1", "2", "3", "4", "5"):
         return False, "请先完成律师审核、盖章方式、盖章份数的选择"
@@ -882,7 +888,7 @@ def _build_seal_options_card(doc_fields, file_name):
             {"tag": "hr"},
             {"tag": "div", "text": {"tag": "plain_text", "content": "律师是否已审核（必填）", "lines": 1}},
             {"tag": "action", "actions": lawyer_btns},
-            {"tag": "div", "text": {"tag": "plain_text", "content": "盖章形式（纸质章/电子章/外带印章）", "lines": 1}},
+            {"tag": "div", "text": {"tag": "plain_text", "content": f"盖章形式（{'/'.join(usage_opts)}）", "lines": 1}},
             {"tag": "action", "actions": usage_btns},
             {"tag": "div", "text": {"tag": "plain_text", "content": "文件数量（1-5份）", "lines": 1}},
             {"tag": "action", "actions": count_btns},
@@ -1348,7 +1354,8 @@ def on_card_action_confirm(data):
                 with _state_lock:
                     PENDING_SEAL[open_id] = pending
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「律师是否已审核」"}})
-            if usage not in ("纸质章", "电子章", "外带印章"):
+            usage_opts = _get_seal_form_options().get("usage_method") or ["纸质章", "电子章", "外带印章"]
+            if usage not in usage_opts:
                 with _state_lock:
                     PENDING_SEAL[open_id] = pending
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "请先选择「盖章形式」"}})
@@ -1903,11 +1910,42 @@ ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
 # 用印申请单选项字段（表格结构时选项在 sub_fields 内，此处作 fallback）
 SEAL_OPTION_FIELDS = {
-    "usage_method": "widget17334699216260001",   # 盖章形式：纸质章/电子章/外带印章
+    "usage_method": "widget17334699216260001",   # 盖章形式
     "seal_type": "widget15754438920110001",     # 印章类型
     "document_type": "widget17334700336550001", # 文件类型
     "lawyer_reviewed": "widget17334701422160001",  # 律师是否已审核
 }
+
+
+def _get_field_options_texts(approval_type, field_id, approval_code=None, token=None):
+    """
+    从表单获取字段选项的文本列表。支持顶层控件和 fieldList 子字段。
+    所有选项卡选项均应通过此函数获取，确保与飞书工单配置一致。
+    返回 [text1, text2, ...]
+    """
+    if not token:
+        token = get_token()
+    if not approval_code:
+        approval_code = APPROVAL_CODES.get(approval_type, "")
+    cached = get_form_fields(approval_type, approval_code, token)
+    if not cached:
+        return []
+    info = cached.get(field_id, {})
+    opts = info.get("options") or info.get("option", [])
+    if not opts:
+        opts = get_sub_field_options(approval_type, field_id, approval_code, token)
+    if isinstance(opts, str):
+        try:
+            opts = json.loads(opts) if opts else []
+        except json.JSONDecodeError:
+            opts = []
+    texts = []
+    for o in (opts or []):
+        if isinstance(o, dict):
+            t = o.get("text") or o.get("value", "")
+            if t:
+                texts.append(str(t))
+    return texts
 
 
 # 用印「文件类型」控件「其他」选项的 value，表单选项变更时需同步更新
@@ -2030,26 +2068,10 @@ def _resolve_radio_option_for_seal(field_id, raw_value, default_first=True):
 
 
 def _get_seal_form_options():
-    """从工单模版读取用印申请单的选项，返回 {逻辑键: [选项文本列表]}"""
-    token = get_token()
-    cached = get_form_fields("用印申请单", APPROVAL_CODES["用印申请单"], token)
-    if not cached:
-        return {}
+    """从工单模版读取用印申请单的选项，返回 {逻辑键: [选项文本列表]}。"""
     result = {}
     for logical_key, field_id in SEAL_OPTION_FIELDS.items():
-        info = cached.get(field_id, {})
-        opts = info.get("options", [])
-        if isinstance(opts, str):
-            try:
-                opts = json.loads(opts) if opts else []
-            except json.JSONDecodeError:
-                opts = []
-        texts = []
-        for o in opts:
-            if isinstance(o, dict):
-                t = o.get("text") or o.get("value", "")
-                if t:
-                    texts.append(str(t))
+        texts = _get_field_options_texts("用印申请单", field_id)
         if texts:
             result[logical_key] = texts
     return result
@@ -2066,25 +2088,9 @@ INVOICE_OPTION_FIELDS = {
 
 def _get_invoice_form_options():
     """从工单模版读取开票申请单的发票类型、开票项目选项"""
-    token = get_token()
-    cached = get_form_fields("开票申请单", APPROVAL_CODES.get("开票申请单", ""), token)
-    if not cached:
-        return {}
     result = {}
     for logical_key, field_id in INVOICE_OPTION_FIELDS.items():
-        info = cached.get(field_id, {})
-        opts = info.get("options", [])
-        if isinstance(opts, str):
-            try:
-                opts = json.loads(opts) if opts else []
-            except json.JSONDecodeError:
-                opts = []
-        texts = []
-        for o in opts:
-            if isinstance(o, dict):
-                t = o.get("text") or o.get("value", "")
-                if t:
-                    texts.append(str(t))
+        texts = _get_field_options_texts("开票申请单", field_id)
         if texts:
             result[logical_key] = texts
     return result
