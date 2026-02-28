@@ -15,11 +15,32 @@ def tesseract_ocr(image_content):
         return ""
     try:
         import pytesseract
-        from PIL import Image
+        from PIL import Image, ImageEnhance
         img = Image.open(BytesIO(image_content))
-        if img.mode != "RGB":
+        # 转 RGB（Tesseract 对 RGB 识别更好）
+        if img.mode in ("RGBA", "P"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "RGBA":
+                background.paste(img, mask=img.split()[3])
+            else:
+                background.paste(img)
+            img = background
+        elif img.mode != "RGB":
             img = img.convert("RGB")
-        text = pytesseract.image_to_string(img, lang="chi_sim+eng")
+        # 小图放大，提升数字识别率（截图/手机拍图常偏小）
+        w, h = img.size
+        if max(w, h) < 1200:
+            scale = 1200 / max(w, h)
+            new_size = (int(w * scale), int(h * scale))
+            try:
+                resample = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample = Image.LANCZOS
+            img = img.resize(new_size, resample)
+        # 增强对比度，减少误识别
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
+        text = pytesseract.image_to_string(img, lang="chi_sim+eng", config="--psm 6")
         return text.strip() if text else ""
     except Exception as e:
         logger.warning("Tesseract OCR 异常: %s", e)
