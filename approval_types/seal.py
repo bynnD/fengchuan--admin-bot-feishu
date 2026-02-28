@@ -1,4 +1,4 @@
-# 用印申请单（40D94E43 表单仅含备注，需通过链接在飞书中发起）
+# 用印申请单（40D94E43 表单含表格 fieldList + 备注）
 
 import json
 import logging
@@ -20,16 +20,34 @@ IMAGE_FIELDS = []
 
 FIELD_LABELS = {
     "remarks": "备注",
+    "seal_detail": "用印明细",
 }
 
-FIELD_NAME_ALIASES = {"备注": "remarks"}
+FIELD_NAME_ALIASES = {
+    "备注": "remarks",
+    "用印明细": "seal_detail",
+    "盖章明细": "seal_detail",
+    "明细": "seal_detail",
+}
 
 # 40D94E43 表单字段 ID
 FIELD_ID_FALLBACK = {
     "remarks": "widget17375349954340001",
 }
 
-FIELD_ORDER = ["remarks"]
+FIELD_ORDER = ["seal_detail", "remarks"]
+
+# 用印明细 fieldList 子字段（表单未返回 sub_fields 时兜底，id 需与飞书表单一致）
+# 可调用 /debug-form?type=用印申请单 查看实际字段 id
+FIELDLIST_SUBFIELDS_FALLBACK = {
+    "seal_detail": [
+        {"id": "widget17334700336550001", "type": "radioV2", "name": "文件类型"},
+        {"id": "widget15754438920110001", "type": "radioV2", "name": "印章类型"},
+        {"id": "widget17334699216260001", "type": "radioV2", "name": "盖章形式"},
+        {"id": "widget17334701422160001", "type": "radioV2", "name": "律师是否已审核"},
+        {"id": "widget15828104903330001", "type": "attachmentV2", "name": "上传用章文件"},
+    ]
+}
 DATE_FIELDS = set()
 
 SUPPORTS_IMAGE = False
