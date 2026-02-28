@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 NAME = "用印申请单"
 APPROVAL_CODE = "40D94E43-270A-4B16-BCC2-B7A71B6EA7BF"
-LINK_ONLY = True  # 新表单仅含备注，不支持 API 创建，走链接流程
-HAS_FILE_EXTRACTION = False  # LINK_ONLY 时不再走文件提取流程
+LINK_ONLY = False
+HAS_FILE_EXTRACTION = True
 
 FIELD_HINTS = "remarks(备注,可选)"
 
