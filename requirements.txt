@@ -12,7 +12,6 @@ openpyxl
 pymupdf
 
 # 本地 OCR（替代飞书 OCR，避免频率限制）
-# 2.5.2 已下架，使用 2.6.2；若仍 SIGILL 需改用 Tesseract
-paddlepaddle==2.6.2
-paddleocr>=2.7.0,<3.0
+# EasyOCR 对 CPU 指令集要求低，无 SIGILL 问题
+easyocr>=1.7.0
 opencv-python-headless
