@@ -8,11 +8,13 @@ default_enabled: false
 
 # 启用自动审批的审批人 user_id 列表
 auto_approve_user_ids:
-  - "723eg4a6"
+  - "531dcb19"
 
 # 不参与自动审批的工单类型
 exclude_types:
   - "外出报备"
+  - "用印申请单"  # 新表单仅含备注，结构不兼容自动审批
+  - "用印申请单"  # 新表单仅含备注，结构不兼容自动审批
 
 # 开关固定指令（仅 auto_approve_user_ids 中的用户有效）
 switch_commands:

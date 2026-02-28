@@ -9,60 +9,61 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "开票申请单"
-APPROVAL_CODE = "6706BE14-0ED3-4718-8E57-DF5F52935BDE"
+APPROVAL_CODE = "624B0174-A255-4EA0-A790-0DE8F2B1F46B"
 LINK_ONLY = False
 HAS_FILE_EXTRACTION = True  # 从结算单和合同自动提取字段
 
 FIELD_HINTS = (
     "invoice_type(发票类型,用户必须明确说明), invoice_items(开票项目,用户必须明确说明), "
     "amount(金额,从结算单识别), buyer_name(购方名称/开票抬头,从合同识别), tax_id(购方税号,从合同识别), "
-    "settlement_file(结算单附件), contract_file(合同附件)"
+    "company(所属公司), settlement_file(开票结算单附件), contract_file(开票合同附件), "
+    "settlement_sealed(开票结算单是否已盖章), contract_sealed(开票合同是否已盖章)"
 )
 
 # 用户必须明确说明
 USER_REQUIRED_FIELDS = ["invoice_type", "invoice_items"]
 # 从结算单/合同自动识别
-AUTO_FIELDS = ["amount", "buyer_name", "tax_id", "contract_no", "settlement_no", "business_type", "proof_file_type"]
+AUTO_FIELDS = ["amount", "buyer_name", "tax_id", "contract_no", "settlement_no"]
 
 CONVERSATION_FIELDS = ["invoice_type", "invoice_items"]
 IMAGE_FIELDS = AUTO_FIELDS
 
 FIELD_LABELS = {
-    "invoice_type":   "发票类型",
-    "invoice_items": "开票项目",
-    "amount":         "开票金额",
-    "buyer_name":    "购方名称/开票抬头",
-    "tax_id":        "购方税号",
-    "contract_no":   "合同编号",
-    "settlement_no": "结算单编号",
-    "remarks":       "备注",
-    "business_type": "业务类型",
-    "proof_file_type": "开票证明文件类型",
-    "contract_sealed": "开票合同是否盖章",
+    "invoice_type":     "发票类型",
+    "invoice_items":    "开票项目",
+    "amount":           "开票金额",
+    "buyer_name":       "客户/开票名称",
+    "tax_id":           "税务登记证号/社会统一信用代码",
+    "company":          "所属公司",
+    "contract_no":      "合同编号",
+    "settlement_no":    "结算单编号",
+    "remarks":          "备注",
+    "settlement_sealed": "开票结算单是否已盖章",
+    "contract_sealed":  "开票合同是否已盖章",
 }
 
-# 表单字段名可能为「购方名称」「开票抬头」「客户/开票名称」等，均映射到 buyer_name；
-# 「购方税号」「税务登记证号」「社会统一信用代码」等映射到 tax_id；「开票金额」「发票金额」映射到 amount
+# 表单字段名映射到逻辑字段名
 FIELD_NAME_ALIASES = {
     "购方名称": "buyer_name", "开票抬头": "buyer_name", "客户/开票名称": "buyer_name",
     "购方税号": "tax_id", "税务登记证号": "tax_id", "社会统一信用代码": "tax_id",
     "税务登记证号/社会统一信用代码": "tax_id",
     "开票金额": "amount", "发票金额": "amount",
-    "开票证明文件类型（可多选）": "proof_file_type",
-    "开票合同是否盖章": "contract_sealed",
+    "开票合同是否已盖章": "contract_sealed",
+    "开票结算单是否已盖章": "settlement_sealed",
+    "所属公司": "company",
 }
-# 与 6706BE14 审批定义一致
+# 624B0174 开票申请表单字段 ID
 FIELD_ID_FALLBACK = {
-    "buyer_name":      "widget17334740014470001",   # 客户/开票名称
-    "tax_id":          "widget17334740172520001",   # 税务登记证号/社会统一信用代码
-    "invoice_type":    "widget16457794296140001",   # 发票类型
-    "invoice_items":   "widget17660282371600001",   # 开票项目
-    "amount":          "widget17334740447380001",   # 开票金额
-    "business_type":   "widget17660274322300001",   # 业务类型
-    "proof_file_type": "widget17660291688960001",   # 开票证明文件类型（可多选）
-    "contract_sealed": "widget17334733872820001",   # 开票合同是否盖章
+    "company":          "widget16457793731980001",   # 所属公司
+    "buyer_name":       "widget17375318335110001",   # 客户/开票名称
+    "tax_id":           "widget17375318355270001",   # 税务登记证号/社会统一信用代码
+    "invoice_type":     "widget16457794296140001",   # 发票类型
+    "invoice_items":    "widget17375316363080001",   # 开票项目
+    "amount":           "widget17375326852760001",   # 开票金额
+    "settlement_sealed": "widget17375319011020001",  # 开票结算单是否已盖章
+    "contract_sealed":  "widget17375319126200001",   # 开票合同是否已盖章
 }
-FIELD_ORDER = ["invoice_type", "invoice_items", "amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_sealed", "contract_no", "settlement_no", "remarks"]
+FIELD_ORDER = ["company", "invoice_type", "invoice_items", "amount", "buyer_name", "tax_id", "settlement_sealed", "contract_sealed", "contract_no", "settlement_no", "remarks"]
 DATE_FIELDS = set()
 SUPPORTS_IMAGE = True
 
@@ -97,14 +98,6 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
         f"- tax_id: 购方税号/纳税人识别号\n"
         f"- contract_no: 合同编号\n"
         f"- settlement_no: 结算单编号\n"
-        f"- business_type: 业务类型。从合同/协议或含产品信息的截图中提取。"
-        f"合同：从正文第一页、标题、服务内容等直接读取业务/产品名称。"
-        f"电商订单截图、发货截图、收款截图：若图片中有商品名称（如「NBBOSS老板的AI外脑」「NBBOSS」），则提取该产品名作为业务类型。"
-        f"优先使用产品/服务名称（如 NBBOSS、小蓝词），而非公司/品牌名（如 Right-bot）。"
-        f"如写「NBBOSS」则返回NBBOSS，写「小蓝词」则返回小蓝词，写「广告」则返回广告。不要推测、不要使用文中/图中未出现的词汇。"
-        f"结算单、对账单、银行流水（无产品信息时）等纯数字类文件不要返回 business_type。\n"
-        f"- proof_file_type: 开票证明文件类型，可多选。可选值：合同、对账单、有赞商城后台订单、微信小店后台订单、企业微信收款订单、其他。"
-        f"根据文件内容判断：结算单/对账单→对账单；合同/协议→合同；银行流水/水单→其他；订单明细/发货截图/收款截图→有赞商城后台订单或微信小店后台订单或企业微信收款订单或其他（能区分平台则选对应项）\n"
         f"只返回能明确识别的字段，不要猜测。只返回JSON，不要其他内容。"
     )
     try:
@@ -126,14 +119,7 @@ def extract_fields_from_file(file_content, file_name, form_opts, get_token):
             v = out.get(k)
             if v is None:
                 continue
-            if k == "proof_file_type":
-                if isinstance(v, list):
-                    items = [str(x).strip() for x in v if x and str(x).strip()]
-                    if items:
-                        result[k] = items
-                elif str(v).strip():
-                    result[k] = [str(v).strip()]
-            elif v and str(v).strip():
+            if v and str(v).strip():
                 result[k] = str(v).strip()
         return result
     except Exception as e:

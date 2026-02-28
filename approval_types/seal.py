@@ -1,4 +1,4 @@
-# 用印申请
+# 用印申请单（40D94E43 表单仅含备注，需通过链接在飞书中发起）
 
 import json
 import logging
@@ -9,76 +9,37 @@ from deepseek_client import call_deepseek_with_retry
 logger = logging.getLogger(__name__)
 
 NAME = "用印申请单"
-APPROVAL_CODE = "A0FF356F-AF36-4781-8785-309FB6D5CE50"
-LINK_ONLY = False
-HAS_FILE_EXTRACTION = True  # 有附件识别读取需求，使用通用文件内容提取（含 OCR）
+APPROVAL_CODE = "40D94E43-270A-4B16-BCC2-B7A71B6EA7BF"
+LINK_ONLY = True  # 新表单仅含备注，不支持 API 创建，走链接流程
+HAS_FILE_EXTRACTION = False  # LINK_ONLY 时不再走文件提取流程
 
-FIELD_HINTS = (
-    "company(用印公司,从文件内容识别), usage_method(盖章形式:纸质章/电子章/外带印章,默认纸质章), "
-    "reason(文件用途/用印事由,从文件内容识别), seal_type(印章类型,从文件内容识别:公章/合同章/法人章/财务章), "
-    "lawyer_reviewed(律师是否已审核:是/否,用户必须明确提供), "
-    "document_name(文件名称,从上传文档识别), document_count(文件数量,默认1), "
-    "document_type(文件类型,从上传文档识别), remarks(备注,可选)"
-)
+FIELD_HINTS = "remarks(备注,可选)"
 
-# 用户对话中提供
-CONVERSATION_FIELDS = ["company", "usage_method", "reason", "seal_type", "lawyer_reviewed"]
-# 从上传文档自动识别（含文件内容 AI 识别的用印公司、印章类型、用印事由）
-IMAGE_FIELDS = ["document_name", "document_type", "document_count", "company", "seal_type", "reason"]
+CONVERSATION_FIELDS = []
+IMAGE_FIELDS = []
 
 FIELD_LABELS = {
-    "company":         "用印公司",
-    "usage_method":    "盖章形式",
-    "reason":          "文件用途/用印事由",
-    "seal_type":       "印章类型",
-    "document_name":   "文件名称",
-    "document_count":  "文件数量",
-    "document_type":   "文件类型",
-    "lawyer_reviewed": "律师是否已审核",
-    "remarks":         "备注",
-    "seal_detail":     "明细",
+    "remarks": "备注",
 }
 
-# 表单为 fieldList 表格，字段名映射
-FIELD_NAME_ALIASES = {
-    "明细": "seal_detail",
-    "盖章或外带印章": "usage_method",
-    "盖章形式": "usage_method",
-    "盖章或外带": "usage_method",
-    "文件数量": "document_count",
-    "用印事由": "reason",
-}
+FIELD_NAME_ALIASES = {"备注": "remarks"}
 
-# 表格主字段 ID（用印申请单 - 明细 fieldList）
+# 40D94E43 表单字段 ID
 FIELD_ID_FALLBACK = {
-    "seal_detail":     "widget17719721160210001",   # 明细 fieldList
+    "remarks": "widget17375349954340001",
 }
 
-# 表格子字段（从 value 第一行解析），附件在行内
-FIELDLIST_SUBFIELDS_FALLBACK = {
-    "seal_detail": [
-        {"id": "widget3", "type": "input", "name": "文件名称"},
-        {"id": "widget0", "type": "textarea", "name": "用印事由"},
-        {"id": "widget17334700336550001", "type": "radioV2", "name": "文件类型"},
-        {"id": "widget15754438920110001", "type": "radioV2", "name": "印章类型"},
-        {"id": "widget17334699216260001", "type": "radioV2", "name": "盖章形式"},
-        {"id": "widget4", "type": "number", "name": "文件数量"},
-        {"id": "widget17334701422160001", "type": "radioV2", "name": "律师是否已审核"},
-        {"id": "widget15828104903330001", "type": "attachmentV2", "name": "上传用章文件"},
-    ]
-}
-
-FIELD_ORDER = ["seal_detail"]
+FIELD_ORDER = ["remarks"]
 DATE_FIELDS = set()
 
-SUPPORTS_IMAGE = True
+SUPPORTS_IMAGE = False
 
 
 def get_admin_comment(fields):
     return "请核实以上填报信息无误后提交"
 
 
-# 用印公司默认选项（当表单未返回时使用）
+# 保留供 LINK_ONLY 时若有其他入口使用
 DEFAULT_COMPANY_OPTS = ["风船", "微驰", "拓梦", "亿帆", "万数汇", "耀玩社", "利斯特", "利信", "利智", "海南风汇万聚", "海南万数汇集"]
 DEFAULT_SEAL_OPTS = ["公章", "合同章", "法人章", "财务章"]
 

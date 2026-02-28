@@ -263,8 +263,7 @@ def _try_modify_confirm(open_id, user_id, text):
         f"请解析用户要修改的字段。用户可能说「把金额改成1000」「购方名称改为XXX公司」「税号错了，应该是123」等。"
         f"可修改字段（逻辑键名）：{labels}\n"
         f"只返回JSON，格式如 {{\"amount\": 1000, \"buyer_name\": \"XXX公司\"}}，仅包含用户明确要修改的字段。"
-        f"若用户未表达修改意图（如「确认」「没问题」「提交」等），返回 {{}}。"
-        f"proof_file_type 为数组，如 [\"合同\",\"对账单\"]。只返回JSON，不要其他内容。"
+        f"若用户未表达修改意图（如「确认」「没问题」「提交」等），返回 {{}}。只返回JSON，不要其他内容。"
     )
     try:
         res = call_deepseek_with_retry([{"role": "user", "content": prompt}], response_format={"type": "json_object"}, timeout=15)
@@ -504,12 +503,6 @@ def _process_approval_type_click(open_id, user_id, approval_type, example_text):
     req = requests[0]
     miss = req.get("missing", [])
     fields_check = req.get("fields", {})
-    if approval_type == "采购申请":
-        cd = fields_check.get("cost_detail")
-        if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
-            if "cost_detail" not in miss:
-                miss.append("cost_detail")
-                req["missing"] = miss
     if approval_type == "招待/团建物资领用":
         idetail = fields_check.get("item_detail")
         if not idetail or (isinstance(idetail, list) and len(idetail) == 0) or idetail == "":
@@ -1107,9 +1100,13 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "无效的工单类型"}})
             def _handle_type_select():
                 if at == "用印申请单":
-                    with _state_lock:
-                        SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
-                    send_message(open_id, "请补充以下信息：\n用印申请单还缺少：上传用章文件\n请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
+                    if at in LINK_ONLY_TYPES:
+                        link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES[at]}"
+                        send_card_message(open_id, "【用印申请单】\n\n当前用印申请单需在飞书中填写，请点击下方按钮发起工单（需在飞书客户端内打开）。", link, "打开用印申请单")
+                    else:
+                        with _state_lock:
+                            SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
+                        send_message(open_id, "请补充以下信息：\n用印申请单还缺少：上传用章文件\n请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
                 elif at == "开票申请单":
                     with _state_lock:
                         PENDING_INVOICE[open_id] = {
@@ -1146,10 +1143,14 @@ def on_card_action_confirm(data):
                 return P2CardActionTriggerResponse(d={"toast": {"type": "error", "content": "会话已过期，请重新上传文件"}})
             if intent == "用印申请单":
                 files_list = pending_file.get("files", [])
-                with _state_lock:
-                    SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
-                if files_list:
-                    threading.Thread(target=lambda: _handle_file_message(open_id, user_id, None, None, files_list=files_list), daemon=True).start()
+                if "用印申请单" in LINK_ONLY_TYPES:
+                    link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES['用印申请单']}"
+                    send_card_message(open_id, "【用印申请单】\n\n当前用印申请单需在飞书中填写，请点击下方按钮发起工单（需在飞书客户端内打开）。", link, "打开用印申请单")
+                else:
+                    with _state_lock:
+                        SEAL_INITIAL_FIELDS[open_id] = {"fields": {}, "created_at": time.time()}
+                    if files_list:
+                        threading.Thread(target=lambda: _handle_file_message(open_id, user_id, None, None, files_list=files_list), daemon=True).start()
                 return P2CardActionTriggerResponse(d={"toast": {"type": "success", "content": "已选择用印申请单，正在处理"}})
             if intent == "开票申请单":
                 files_list = pending_file.get("files", [])
@@ -1423,15 +1424,11 @@ def analyze_message(history):
         f"2. 明天、后天、下周一等换算成具体日期(YYYY-MM-DD)\n"
         f"3. 只有真的无法推断的字段才放入missing\n"
         f"4. reason可根据上下文推断，实在没有才列为missing\n"
-        f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间\n"
-        f"6. 采购的cost_detail是费用明细列表(必填)，每项必须含名称、规格、数量、金额。"
-        f"「是否有库存」由审批人填写，发起人不填，不要提取。"
-        f"格式为[{{\"名称\":\"笔记本电脑\",\"规格\":\"ThinkPad X1\",\"数量\":\"1\",\"金额\":\"8000\"}}]。"
-        f"缺少名称/规格/数量/金额任一项就把cost_detail列入missing。purchase_reason可从物品信息推断(如'采购笔记本电脑')。"
+        f"5. 采购：purchase_reason可包含具体物品，expected_date为期望交付时间。"
         f"purchase_type(采购类别)可根据采购物品自动推断，如办公电脑、办公桌→办公用品，设备、机器→设备类等。\n"
-        f"7. 招待/团建物资领用：item_detail是物品明细列表(必填)，每项含名称、数量。"
+        f"6. 招待/团建物资领用：item_detail是物品明细列表(必填)，每项含名称、数量。"
         f"格式为[{{\"名称\":\"矿泉水\",\"数量\":\"2\"}}]。缺少名称或数量任一项就把item_detail列入missing。\n"
-        f"8. 用印申请单：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
+        f"7. 用印申请单：识别到用印需求时，只提取对话中能得到的字段(company/seal_type/reason等)，"
         f"document_name/document_type不需要用户说，会从上传文件自动获取。"
         f"lawyer_reviewed(律师是否已审核)必须用户明确提供「是」或「否」，未明确说明则放入 missing。"
         f"若用户明确说「盖公章」「要盖公章」「公章」等，必须将 seal_type 提取为「公章」，不要放入 missing。"
@@ -1658,18 +1655,6 @@ def build_form(approval_type, fields, token, file_codes=None):
                             raw = opt_val or opt_text
                             matched = True
                             break
-                # 开票申请单「业务类型」：无精确匹配时做关键词模糊匹配，避免误用 opts[0]（如 Right-bot）
-                if not matched and logical_key == "business_type" and approval_type == "开票申请单" and raw_str:
-                    for kw in ("小蓝词", "NBBOSS", "Right-bot", "right-bot"):
-                        if kw.lower() in raw_str.lower():
-                            for opt in opts:
-                                if isinstance(opt, dict):
-                                    ot = str(opt.get("text", "") or opt.get("value", ""))
-                                    if kw.lower() in ot.lower():
-                                        raw = opt.get("value") or opt.get("key", "") or ot
-                                        matched = True
-                                        break
-                            break
                 if not matched:
                     raw = (opts[0].get("value") or opts[0].get("key", "")) if isinstance(opts[0], dict) else ""
         if field_type == "checkboxV2":
@@ -1812,44 +1797,11 @@ def _form_summary(form_list, cached, approval_type=None):
     return "\n".join(lines)
 
 
-def _infer_purchase_type_from_cost_detail(cost_detail):
-    """根据采购物品推断采购类别。返回推断的类别文本，失败返回空。"""
-    if not cost_detail or not isinstance(cost_detail, list):
-        return ""
-    items_desc = []
-    for item in cost_detail[:5]:
-        if isinstance(item, dict):
-            name = item.get("名称") or item.get("name") or item.get("物品") or ""
-            spec = item.get("规格") or item.get("spec") or ""
-            items_desc.append(f"{name} {spec}".strip() or "未知")
-        else:
-            items_desc.append(str(item)[:50])
-    if not items_desc:
-        return ""
-    text = "、".join(items_desc)
-    prompt = (
-        f"根据采购物品推断采购类别。\n物品：{text}\n"
-        f"常见类别：办公用品、设备、耗材、原材料等。"
-        f"只返回一个最合适的类别词，不要其他内容。"
-    )
-    try:
-        res = call_deepseek_with_retry([{"role": "user", "content": prompt}], timeout=10, max_retries=1, max_tokens=20)
-        out = res.json()["choices"][0]["message"]["content"].strip()
-        return out.split("\n")[0].strip() if out else ""
-    except Exception as e:
-        logger.warning("推断采购类别失败: %s", e)
-        return ""
-
-
 def create_approval(user_id, approval_type, fields, file_codes=None):
     approval_code = APPROVAL_CODES[approval_type]
     token = get_token()
 
     fields = dict(fields)
-    if approval_type == "采购申请" and not fields.get("purchase_type") and fields.get("cost_detail"):
-        inferred = _infer_purchase_type_from_cost_detail(fields["cost_detail"])
-        if inferred:
-            fields["purchase_type"] = inferred
 
     cached = get_form_fields(approval_type, approval_code, token)
     form_list = build_form(approval_type, fields, token, file_codes=file_codes)
@@ -2088,12 +2040,12 @@ def _get_seal_form_options():
     return result
 
 
-# 开票申请单附件字段 ID（6706BE14 表单仅一个「上传开票证明文件」，结算单+合同合并上传）
-INVOICE_ATTACHMENT_FIELD_ID = "widget16457795866320001"
-# 开票申请单选项字段（发票类型、开票项目）
+# 开票申请单附件字段 ID（624B0174 表单：开票结算单、开票合同分开；此为结算单 fallback）
+INVOICE_ATTACHMENT_FIELD_ID = "widget16457801562650001"
+# 开票申请单选项字段（发票类型为 radioV2；开票项目为 input 无选项，用 fallback）
 INVOICE_OPTION_FIELDS = {
     "invoice_type": "widget16457794296140001",
-    "invoice_items": "widget17660282371600001",
+    "invoice_items": "widget17375316363080001",
 }
 
 
@@ -2165,7 +2117,7 @@ def _build_invoice_options_card(doc_fields, summary_prefix=""):
 
 
 def _get_invoice_attachment_field_ids():
-    """从开票申请单表单缓存中查找附件字段。新表单仅一个「上传开票证明文件」，结算单+合同合并"""
+    """从开票申请单表单缓存中查找附件字段。624B0174 表单：开票结算单、开票合同分开"""
     token = get_token()
     cached = get_form_fields("开票申请单", APPROVAL_CODES.get("开票申请单", ""), token)
     if not cached:
@@ -2189,6 +2141,11 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
     """处理文件消息：下载文件→上传审批附件→提取文件名→合并首次消息与文件名推断→等用户补充其余字段。
     files_list: 可选，多文件时传入 [{"message_id", "content_json", "file_name"}, ...]，单文件时用 message_id/content_json
     多文件时采用排队模式：先出第1张卡，选完点「下一份」出第2张，全部选完后出「提交工单」按钮。"""
+    # 用印申请单为 LINK_ONLY 时，直接发送链接，不走文件处理流程
+    if files_list and "用印申请单" in LINK_ONLY_TYPES:
+        link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES['用印申请单']}"
+        send_card_message(open_id, "【用印申请单】\n\n当前用印申请单需在飞书中填写，请点击下方按钮发起工单（需在飞书客户端内打开）。", link, "打开用印申请单")
+        return
     if files_list and len(files_list) > 1:
         # 多文件排队模式：先出第1张卡，选完「下一份」出第2张，全部选完出「提交工单」
         opts = _get_seal_form_options()
@@ -2736,7 +2693,7 @@ def _process_invoice_upload_batch_impl(open_id, user_id, files):
     # 合同+对账单组合时：金额取自对账单，购方/税号/业务类型取自合同
     amount_from_settlement = None  # 对账单/结算单的金额优先
     amount_from_contract = None
-    contract_fields = {}  # 合同中的 buyer_name, tax_id, business_type 等
+    contract_fields = {}  # 合同中的 buyer_name, tax_id, contract_no 等
     for i, f in enumerate(files):
         msg_id = f.get("message_id")
         cj = f.get("content_json", {})
@@ -2759,12 +2716,6 @@ def _process_invoice_upload_batch_impl(open_id, user_id, files):
         if ai_fields:
             logger.info("开票文件识别结果: %s", ai_fields)
         proof_type = _infer_invoice_proof_type(file_name, ai_fields)
-        # 合并 proof_file_type
-        if not doc_fields.get("proof_file_type"):
-            doc_fields["proof_file_type"] = [proof_type]
-        elif proof_type not in (doc_fields.get("proof_file_type") or []):
-            existing = doc_fields.get("proof_file_type") or []
-            doc_fields["proof_file_type"] = list(dict.fromkeys(existing + [proof_type]))
         # 金额：对账单/银行流水/订单等优先，合同次之（收集，最后统一写入）
         amt = str(ai_fields.get("amount", "")).strip() if ai_fields.get("amount") else ""
         if amt:
@@ -2772,21 +2723,14 @@ def _process_invoice_upload_batch_impl(open_id, user_id, files):
                 amount_from_settlement = amt  # 对账单、其他、订单类
             else:
                 amount_from_contract = amt
-        # 合同字段：购方、税号、业务类型等
+        # 合同字段：购方、税号、合同编号等
         if proof_type == "合同":
-            for k in ("buyer_name", "tax_id", "business_type", "contract_no"):
+            for k in ("buyer_name", "tax_id", "contract_no"):
                 if ai_fields.get(k) and str(ai_fields[k]).strip():
                     contract_fields[k] = str(ai_fields[k]).strip()
-        # 通用合并（proof_file_type、其他字段）
+        # 通用合并
         for k, v in ai_fields.items():
-            if k == "proof_file_type":
-                new_items = v if isinstance(v, list) else ([v] if v and str(v).strip() else [])
-                existing = doc_fields.get(k)
-                existing = existing if isinstance(existing, list) else ([existing] if existing and str(existing).strip() else [])
-                merged = list(dict.fromkeys(existing + [str(x).strip() for x in new_items if x and str(x).strip()]))
-                if merged:
-                    doc_fields[k] = merged
-            elif k != "amount" and v and str(v).strip():
+            if k != "amount" and v and str(v).strip():
                 doc_fields[k] = v
         # 保存 content 供 run_pre_check 复用，避免审批 file_code 无法用 drive 下载导致 404
         file_codes_list.append({
@@ -2819,7 +2763,7 @@ def _process_invoice_upload_batch_impl(open_id, user_id, files):
         if isinstance(v, list):
             return "、".join(str(x) for x in v if x)
         return v
-    order = ["amount", "buyer_name", "tax_id", "business_type", "proof_file_type", "contract_no", "settlement_no"]
+    order = ["amount", "buyer_name", "tax_id", "contract_no", "settlement_no"]
     lines = []
     for k in order:
         if k in doc_fields and doc_fields[k]:
@@ -2881,12 +2825,8 @@ def _handle_invoice_file(open_id, user_id, message_id, content_json):
 def _do_create_invoice(open_id, user_id, all_fields, file_codes_list):
     """开票申请单字段齐全时，发送确认卡片，用户点击确认后创建工单。file_codes_list: [{file_code, proof_type, file_name}, ...]"""
     all_fields = dict(all_fields)
-    # 业务类型兜底：开票项目含 NBBOSS 但 AI 误识别为 Right-bot 时，以开票项目为准
-    inv_items = str(all_fields.get("invoice_items", "")).upper()
-    bt = str(all_fields.get("business_type", "")).strip().lower()
-    if "NBBOSS" in inv_items and bt in ("right-bot", "rightbot"):
-        all_fields["business_type"] = "NBBOSS"
-    all_fields.setdefault("proof_file_type", ["合同"])
+    all_fields.setdefault("company", "亿帆")
+    all_fields.setdefault("settlement_sealed", "未盖章")
     all_fields.setdefault("contract_sealed", "已盖章")
     aid = _get_invoice_attachment_field_ids()
     codes = [f["file_code"] for f in (file_codes_list or []) if f.get("file_code")]
@@ -3356,12 +3296,16 @@ def on_message(data):
 
         if needs_seal and needs_invoice:
             req_seal = next(r for r in requests if r.get("approval_type") == "用印申请单")
-            initial = req_seal.get("fields", {})
-            if initial:
-                with _state_lock:
-                    SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
-            send_message(open_id, "您同时发起了用印申请单和开票申请单。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请单」。\n\n"
-                         "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
+            if "用印申请单" in LINK_ONLY_TYPES:
+                link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES['用印申请单']}"
+                send_card_message(open_id, "【用印申请单】\n\n您同时发起了用印和开票。用印申请单需在飞书中填写，请先点击下方按钮发起用印工单。", link, "打开用印申请单")
+            else:
+                initial = req_seal.get("fields", {})
+                if initial:
+                    with _state_lock:
+                        SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
+                send_message(open_id, "您同时发起了用印申请单和开票申请单。请先完成用印申请单（上传需要盖章的文件），完成后再发送「开票申请单」。\n\n"
+                             "请上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
             with _state_lock:
                 if open_id in CONVERSATIONS:
                     CONVERSATIONS[open_id].append({"role": "assistant", "content": "请先完成用印申请单"})
@@ -3374,15 +3318,19 @@ def on_message(data):
                 miss = req.get("missing", [])
                 fields_check = req.get("fields", {})
                 if at == "用印申请单" and open_id not in PENDING_SEAL:
-                    initial = req.get("fields", {}) or {}
-                    with _state_lock:
-                        SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
-                    send_message(open_id, "请补充以下信息：\n"
+                    if at in LINK_ONLY_TYPES:
+                        link = f"https://applink.feishu.cn/client/approval?tab=create&definitionCode={APPROVAL_CODES[at]}"
+                        send_card_message(open_id, "【用印申请单】\n\n当前用印申请单需在飞书中填写，请点击下方按钮发起工单（需在飞书客户端内打开）。", link, "打开用印申请单")
+                    else:
+                        initial = req.get("fields", {}) or {}
+                        with _state_lock:
+                            SEAL_INITIAL_FIELDS[open_id] = {"fields": initial, "created_at": time.time()}
+                        send_message(open_id, "请补充以下信息：\n"
                                  f"用印申请单还缺少：上传用章文件\n"
                                  f"请先上传需要盖章的文件（Word/PDF/图片均可），我会自动识别内容。", use_red=True)
-                    with _state_lock:
-                        if open_id in CONVERSATIONS:
-                            CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
+                        with _state_lock:
+                            if open_id in CONVERSATIONS:
+                                CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传需要盖章的文件"})
                     continue
                 if at == "开票申请单" and open_id not in PENDING_INVOICE:
                     initial = req.get("fields", {})
@@ -3403,12 +3351,6 @@ def on_message(data):
                         if open_id in CONVERSATIONS:
                             CONVERSATIONS[open_id].append({"role": "assistant", "content": "请上传结算单"})
                     continue
-                if at == "采购申请":
-                    cd = fields_check.get("cost_detail")
-                    if not cd or (isinstance(cd, list) and len(cd) == 0) or cd == "":
-                        if "cost_detail" not in miss:
-                            miss.append("cost_detail")
-                            req["missing"] = miss
                 if at == "招待/团建物资领用":
                     idetail = fields_check.get("item_detail")
                     if not idetail or (isinstance(idetail, list) and len(idetail) == 0) or idetail == "":
