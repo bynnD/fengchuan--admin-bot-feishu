@@ -537,17 +537,51 @@ def approve_task(approval_code, instance_code, user_id, task_id, comment, get_to
     return False, data.get("msg", "未知错误")
 
 
+# 机器人自身 open_id 缓存（首次发评论时自动获取，全局复用，无需手动配置）
+_bot_open_id_cache = None
+_bot_open_id_lock = threading.Lock()
+
+
+def _get_bot_open_id(get_token):
+    """获取机器人自身的 open_id，用于以机器人身份发审批评论。
+    调用飞书 /bot/v3/info 接口，结果永久缓存，不重复请求。
+    """
+    global _bot_open_id_cache
+    if _bot_open_id_cache:
+        return _bot_open_id_cache
+    with _bot_open_id_lock:
+        if _bot_open_id_cache:
+            return _bot_open_id_cache
+        try:
+            token = get_token()
+            res = httpx.get(
+                "https://open.feishu.cn/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            data = res.json()
+            if data.get("code") == 0:
+                open_id = data.get("bot", {}).get("open_id", "")
+                if open_id:
+                    _bot_open_id_cache = open_id
+                    logger.info("已获取机器人 open_id: %s", open_id)
+                    return open_id
+            logger.warning("获取机器人 open_id 失败: code=%s msg=%s", data.get("code"), data.get("msg"))
+        except Exception as e:
+            logger.warning("获取机器人 open_id 异常: %s", e)
+    return None
+
+
 def add_approval_comment(instance_code, content, get_token, user_id=None):
-    """在审批实例下添加审批评论。
-    飞书审批评论 API 强制要求 user_id 放在 Query 参数中（不能放 Body，否则报 99992402）。
-    user_id 传工单发起人或机器人自身的 user_id，决定评论显示名称。
+    """在审批实例下以机器人身份添加审批评论。
+    自动获取机器人 open_id，评论显示为机器人账号。
+    若无法获取机器人 open_id，则放弃发评论（不以发起人身份替代）。
     """
     token = get_token()
     text = (content or "自动审批").strip()
     if len(text) > 65536:
         text = text[:65530] + "...(已截断)"
 
-    # json.dumps 自动处理双引号/换行/特殊字符转义
     safe_content_str = json.dumps({"text": text, "files": []}, ensure_ascii=False)
 
     headers = {
@@ -556,17 +590,18 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
     }
     url = f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}/comments"
 
-    if not user_id:
-        logger.warning("add_approval_comment: user_id 为空，飞书 API 要求必须传 user_id，评论将失败")
-        return False, "user_id 为空"
+    bot_open_id = _get_bot_open_id(get_token)
+    if not bot_open_id:
+        logger.warning("添加评论跳过: 无法获取机器人 open_id instance=%s", instance_code)
+        return False, "无法获取机器人 open_id"
 
-    # user_id 必须放 Query 参数，不能放 Body
-    params = {"user_id_type": "user_id", "user_id": user_id}
+    # user_id 必须放 Query 参数，不能放 Body；使用 open_id 类型
+    params = {"user_id_type": "open_id", "user_id": bot_open_id}
 
     res = httpx.post(url, headers=headers, params=params, json={"content": safe_content_str}, timeout=10)
     data = res.json()
     if data.get("code") == 0:
-        logger.info("已添加审批评论: instance=%s user_id=%s", instance_code, user_id)
+        logger.info("已添加审批评论(机器人): instance=%s", instance_code)
         return True, None
 
     # 兜底：content 改为纯文本（某些租户不接受 JSON 格式）
@@ -574,13 +609,13 @@ def add_approval_comment(instance_code, content, get_token, user_id=None):
         res2 = httpx.post(url, headers=headers, params=params, json={"content": text}, timeout=10)
         data2 = res2.json()
         if data2.get("code") == 0:
-            logger.info("已添加审批评论(纯文本兜底): instance=%s user_id=%s", instance_code, user_id)
+            logger.info("已添加审批评论(纯文本兜底): instance=%s", instance_code)
             return True, None
         data = data2
 
     logger.warning(
-        "添加评论失败: code=%s msg=%s instance=%s user_id=%s content_preview=%r",
-        data.get("code"), data.get("msg"), instance_code, user_id,
+        "添加评论失败: code=%s msg=%s instance=%s content_preview=%r",
+        data.get("code"), data.get("msg"), instance_code,
         safe_content_str[:120] + "..." if len(safe_content_str) > 120 else safe_content_str,
     )
     return False, data.get("msg", "未知错误")
