@@ -138,7 +138,7 @@ docker run -e FEISHU_APP_ID=xxx -e FEISHU_APP_SECRET=xxx -e DEEPSEEK_API_KEY=xxx
 
 将项目部署到 Railway 或 Zeabur，配置上述环境变量即可。程序使用 WebSocket 长连接，无需额外公网回调地址。
 
-> **内存建议**：图片/扫描件使用 EasyOCR 本地识别，建议实例内存 ≥ 2GB。
+> **内存建议**：图片/扫描件使用 Tesseract 本地识别，镜像轻量，建议实例内存 ≥ 1GB。
 
 ---
 

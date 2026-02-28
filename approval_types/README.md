@@ -43,7 +43,7 @@ def get_admin_comment(fields):
 
 1. 设置 `HAS_FILE_EXTRACTION = True`
 2. 实现 `extract_fields_from_file(file_content, file_name, form_opts, get_token) -> dict`
-   - 内部调用 `file_extraction.extract_text_from_file()` 获取文本（含 EasyOCR 本地识别图片/扫描件）
+   - 内部调用 `file_extraction.extract_text_from_file()` 获取文本（含 Tesseract 本地识别图片/扫描件）
    - 根据业务用 AI 从文本中提取字段，返回 `{字段名: 值}`
 
 参考 `seal.py`（用印申请单）的实现。

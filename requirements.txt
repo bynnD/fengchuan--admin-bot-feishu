@@ -12,6 +12,6 @@ openpyxl
 pymupdf
 
 # 本地 OCR（替代飞书 OCR，避免频率限制）
-# EasyOCR 对 CPU 指令集要求低，无 SIGILL 问题
-easyocr>=1.7.0
-opencv-python-headless
+# Tesseract 轻量，镜像小，适合 Zeabur 部署
+pytesseract>=0.3.10
+Pillow

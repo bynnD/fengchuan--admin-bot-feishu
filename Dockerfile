@@ -1,9 +1,8 @@
 FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1
-# EasyOCR/OpenCV 所需系统库（无头环境）
-# libgl1-mesa-glx 在 Debian 12+ 已废弃，改用 libgl1
+# Tesseract OCR（轻量，镜像约 500MB 内）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxcb1 libgl1 libsm6 libxext6 libxrender1 \
+    tesseract-ocr tesseract-ocr-chi-sim \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
