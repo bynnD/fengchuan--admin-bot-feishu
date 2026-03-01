@@ -155,15 +155,15 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
 
 请严格按以下两点分析，并返回 JSON：
 1. legal_compliant: 文件内容是否合法合规（true/false）
-2. risk_points: 具体不合规项/风险点列表，每项必须具体说明，如无则 []
-   - 若缺少关键条款：必须写明缺了哪些（如「缺少违约责任条款」「缺少争议解决条款」）
-   - 若金额异常：必须写明具体问题（如「第3页合同金额10万与附件对账单8万不一致」「金额单位混用元与万元」）
+2. risk_points: 具体不合规项/风险点列表，每项【25字以内】简洁说明，如无则 []
+   - 若缺少关键条款：写明缺了哪些（如「缺少违约责任条款」）
+   - 若金额异常：写明具体问题（如「第3页金额与对账单不一致」）
    - 禁止返回「律师未审核」，该由系统规则判断
-3. comment: 合规时为「文件合法合规」；不合规时必须列出具体问题（与 risk_points 一致，用；分隔），表述要具体
+3. comment: 合规时为「文件合法合规」；不合规时必须【200字以内】概括所有 risk_points，每条用分号分隔，表述简洁（每条建议不超过25字），确保全部建议都能完整展示
 
 返回格式示例：
 {{"legal_compliant": true, "risk_points": [], "comment": "文件合法合规。"}}
-不合规示例：{{"legal_compliant": false, "risk_points": ["缺少违约责任条款", "第2页合同金额与附件对账单金额不一致"], "comment": "缺少违约责任条款；第2页合同金额与附件对账单金额不一致"}}
+不合规示例：{{"legal_compliant": false, "risk_points": ["缺少违约责任条款", "第2页合同金额与附件对账单不一致"], "comment": "缺少违约责任条款；第2页金额与附件对账单不一致"}}
 
 只返回 JSON，不要其他内容。"""
 
@@ -188,8 +188,17 @@ def check_seal_with_ai(file_content, file_name, seal_type, get_token):
 
         can_auto = legal and len(risks) == 0
         if not can_auto:
-            # 具体问题用 risk_points 列出，comment 与之一致
+            # 具体问题用 risk_points 列出，comment 与之一致；200字以内确保完整展示
             comment = "；".join(risks[:5]) if risks else (comment or "存在合规问题")
+            if len(comment) > 200:
+                # 每条缩略至约25字，确保全部建议都能展示
+                def _abbr(s, max_len=25):
+                    s = str(s).strip()
+                    return (s[:max_len] + "…") if len(s) > max_len else s
+                parts = [_abbr(r) for r in (risks[:5] if risks else [comment])]
+                comment = "；".join(parts)
+                if len(comment) > 200:
+                    comment = comment[:197] + "…"
         return can_auto, comment, risks
     except Exception as e:
         logger.exception("用印 AI 分析失败: %s", e)

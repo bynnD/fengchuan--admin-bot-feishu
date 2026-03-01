@@ -213,15 +213,21 @@ def _build_fail_comment(comment, risks, max_len=200, rule_risks=None, ai_comment
     if issues == ["该类型未启用自动审批"]:
         return "说明：该工单类型未启用自动审批，需人工审核。"
     if rule_risks is not None and ai_comment is not None:
-        # 两段式：规则输出 + AI审批意见
+        # 两段式：规则输出 + AI审批意见；200字以内，优先保证 AI 意见完整展示
         part1 = "不符合要求：" + "；".join(rule_risks) if rule_risks else ""
-        part2 = "AI审批意见：" + ai_comment.strip() if (ai_comment and ai_comment.strip()) else ""
-        if part1 and part2:
-            fail_comment = part1 + "\n\n" + part2
+        ai_text = (ai_comment or "").strip()
+        part2_prefix = "AI审批意见："
+        if part1 and ai_text:
+            # 为 AI 意见预留空间：part1 + \n\n + prefix + ai_text <= max_len
+            sep_len = 2 + len(part2_prefix)  # \n\n + "AI审批意见："
+            ai_budget = max(50, max_len - len(part1) - sep_len)
+            if len(ai_text) > ai_budget:
+                ai_text = ai_text[: ai_budget - 1] + "…"
+            fail_comment = part1 + "\n\n" + part2_prefix + ai_text
         elif part1:
             fail_comment = part1
-        elif part2:
-            fail_comment = part2
+        elif ai_text:
+            fail_comment = part2_prefix + (ai_text[: max_len - len(part2_prefix)] if len(ai_text) > max_len - len(part2_prefix) else ai_text)
         else:
             fail_comment = "不符合要求"
         return fail_comment[:max_len] if len(fail_comment) > max_len else fail_comment
@@ -1822,7 +1828,7 @@ def _form_summary(form_list, cached, approval_type=None):
                         if ctype in ("radioV2", "radio"):
                             opts = sf_info.get("options", [])
                             if not opts and approval_type and approval_code and cid:
-                                opts = get_sub_field_options(approval_type, cid, approval_code, get_token)
+                                opts = get_sub_field_options(approval_type, cid, approval_code, get_token())
                             display = _value_to_text(cval, opts) if cval else ""
                         elif ctype in ("attach", "attachV2", "attachmentV2", "attachment", "image", "imageV2"):
                             display = "已上传" if cval else ""
@@ -1977,14 +1983,15 @@ def _get_field_options_texts(approval_type, field_id, approval_code=None, token=
 SEAL_DOC_TYPE_OTHER_VALUE = "mk4u3uw5-guo071d9k5m-1"
 
 
-# 结算单、对账单等非合同/协议类文件，律师审核默认「未审核」
-SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS = ("结算单", "对账单", "对账", "月结")
+# 结算单、对账单等非合同/协议类文件，律师审核默认「否」/「未审核」
+SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS = ("结算单", "对账单", "对账", "对账账", "月结")
 
 # 文件类型业务关键词 → 优先匹配的选项文本片段（结算单、合作协议等识别为业务类型，非「保密协议等特殊交办」）
 SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("结算单", "结算单"),
     ("对账单", "结算单"),
     ("对账", "结算单"),
+    ("对账账", "结算单"),
     ("月结", "结算单"),
     ("合作协议", "协议"),
     ("合作框架", "框架"),
@@ -2024,10 +2031,10 @@ def _resolve_document_type_for_seal(document_type):
     结算单、合作协议等识别为业务类型；保密协议等匹配「保密协议等特殊交办文件」。
     当值为 PDF/Word 等文件格式或不在选项中时，使用「其他」选项。
     """
-    opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token)
+    opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token())
     if not opts:
         invalidate_cache("用印申请单")  # 旧缓存可能无 sub_field options，清除后下次重试
-        opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token)
+        opts = get_sub_field_options("用印申请单", "widget17334700336550001", APPROVAL_CODES["用印申请单"], get_token())
     if not opts:
         return SEAL_DOC_TYPE_OTHER_VALUE
     raw = str(document_type or "").strip()
@@ -2071,10 +2078,10 @@ def _resolve_radio_option_for_seal(field_id, raw_value, default_first=True):
     将文本值解析为用印表单 radioV2 控件的有效 option value。
     用于 seal_type、usage_method 等 fieldList 子字段。
     """
-    opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token)
+    opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token())
     if not opts:
         invalidate_cache("用印申请单")
-        opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token)
+        opts = get_sub_field_options("用印申请单", field_id, APPROVAL_CODES["用印申请单"], get_token())
     if not opts:
         return ""
     raw = str(raw_value or "").strip()
@@ -2238,11 +2245,14 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
                 if v and str(v).strip() and k not in ("usage_method",):
                     doc_fields[k] = str(v).strip()
             doc_fields.pop("usage_method", None)
-            # 结算单、对账单等非合同/协议类文件，律师审核默认未审核
-            if _is_seal_doc_type_non_contract(doc_fields.get("document_type")) and not doc_fields.get("lawyer_reviewed"):
-                lawyer_opts = opts.get("lawyer_reviewed") or ["是", "否"]
-                unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), lawyer_opts[-1] if lawyer_opts else "否")
-                doc_fields["lawyer_reviewed"] = unreviewed
+            # 结算单、对账单等非合同/协议类文件，律师审核默认未审核，印章类型默认合同章
+            if _is_seal_doc_type_non_contract(doc_fields.get("document_type")):
+                if not doc_fields.get("lawyer_reviewed"):
+                    lawyer_opts = opts.get("lawyer_reviewed") or ["是", "否"]
+                    unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), "否")
+                    doc_fields["lawyer_reviewed"] = unreviewed
+                if not doc_fields.get("seal_type") and "合同章" in (seal_opts or []):
+                    doc_fields["seal_type"] = "合同章"
             items.append({"file_name": fname, "file_code": file_code, "doc_fields": doc_fields})
         with _state_lock:
             PENDING_SEAL_QUEUE[open_id] = {
@@ -2338,10 +2348,13 @@ def _handle_file_message(open_id, user_id, message_id, content_json, files_list=
         else:
             doc_fields[k] = v
     # 不在此处默认 usage_method，需用户明确选择盖章形式
-    # 结算单、对账单等非合同/协议类文件，律师审核默认未审核
-    if _is_seal_doc_type_non_contract(doc_fields.get("document_type")) and not doc_fields.get("lawyer_reviewed"):
-        unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), lawyer_opts[-1] if lawyer_opts else "否")
-        doc_fields["lawyer_reviewed"] = unreviewed
+    # 结算单、对账单等非合同/协议类文件，律师审核默认未审核，印章类型默认合同章
+    if _is_seal_doc_type_non_contract(doc_fields.get("document_type")):
+        if not doc_fields.get("lawyer_reviewed"):
+            unreviewed = next((o for o in lawyer_opts if o in ("未审核", "否")), "否")
+            doc_fields["lawyer_reviewed"] = unreviewed
+        if not doc_fields.get("seal_type") and "合同章" in seal_opts:
+            doc_fields["seal_type"] = "合同章"
 
     with _state_lock:
         CONVERSATIONS.setdefault(open_id, [])
