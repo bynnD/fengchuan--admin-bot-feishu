@@ -13,7 +13,7 @@ from approval_types import (
     LINK_ONLY_TYPES, FIELD_ID_FALLBACK, FIELD_ORDER, DATE_FIELDS, FIELD_LABELS_REVERSE,
     IMAGE_SUPPORT_TYPES, FIELDLIST_SUBFIELDS_FALLBACK, get_admin_comment, get_file_extractor
 )
-from approval_rules_loader import check_switch_command, get_auto_approve_user_ids
+from approval_rules_loader import check_switch_command, get_auto_approve_user_ids, get_auto_approve_open_ids
 from approval_auto import (
     add_approval_comment,
     get_auto_approval_status,
@@ -1984,7 +1984,7 @@ SEAL_DOC_TYPE_OTHER_VALUE = "mk4u3uw5-guo071d9k5m-1"
 
 
 # 结算单、对账单等非合同/协议类文件，律师审核默认「否」/「未审核」
-SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS = ("结算单", "对账单", "对账", "对账账", "月结")
+SEAL_DOC_TYPE_NON_CONTRACT_KEYWORDS = ("结算单", "对账单", "对账", "对账账", "月结", "报价单", "报价")
 
 # 文件类型业务关键词 → 优先匹配的选项文本片段（结算单、合作协议等识别为业务类型，非「保密协议等特殊交办」）
 SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
@@ -1993,6 +1993,8 @@ SEAL_DOC_TYPE_BUSINESS_KEYWORDS = [
     ("对账", "结算单"),
     ("对账账", "结算单"),
     ("月结", "结算单"),
+    ("报价单", "报价单"),
+    ("报价", "报价单"),
     ("合作协议", "协议"),
     ("合作框架", "框架"),
     ("合同", "合同"),
@@ -3168,8 +3170,9 @@ def on_message(data):
             send_approval_type_options_card(open_id)
             return
 
-        # 自动审批开关：仅 auto_approve_user_ids 中的用户可操作
-        if user_id in get_auto_approve_user_ids():
+        # 自动审批开关：仅 auto_approve_user_ids 或 auto_approve_open_ids 中的用户可操作
+        allowed_ids = get_auto_approve_user_ids() + get_auto_approve_open_ids()
+        if user_id in allowed_ids:
             cmd = check_switch_command(text)
             if cmd:
                 action, approval_type = cmd[0], cmd[1] if len(cmd) > 1 else None

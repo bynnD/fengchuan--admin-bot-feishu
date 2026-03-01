@@ -6,9 +6,14 @@ default_enabled: false
 # approval_code_override:
 #   开票申请单: "你的开票审批定义ID"
 
-# 启用自动审批的审批人 user_id 列表
+# 仅针对到达该 user_id 审批节点的待审核工单进行自动审批（与飞书 task_list 返回的 user_id 格式一致）
+# 若日志显示 PENDING 任务审批人与此处不匹配，可能是 open_id，请改用 auto_approve_open_ids
 auto_approve_user_ids:
   - "531dcb19"
+
+# 若 task_list 返回 open_id 格式（如 g87a9ddg），在此配置后轮询会用 open_id 匹配；配置此项时优先使用
+# auto_approve_open_ids:
+#   - "g87a9ddg"
 
 # 不参与自动审批的工单类型
 exclude_types:

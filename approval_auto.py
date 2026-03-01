@@ -22,6 +22,7 @@ from approval_auto_rules import (
 from approval_rules_loader import (
     check_auto_approve,
     get_auto_approve_user_ids,
+    get_auto_approve_open_ids,
     get_approval_code_override,
     get_auto_approval_types,
     get_exclude_types,
@@ -513,13 +514,13 @@ def parse_form_to_fields(approval_type, form_list, cached, get_token):
     return fields
 
 
-def approve_task(approval_code, instance_code, user_id, task_id, comment, get_token):
-    """调用飞书同意审批任务 API"""
+def approve_task(approval_code, instance_code, user_id, task_id, comment, get_token, user_id_type="user_id"):
+    """调用飞书同意审批任务 API。user_id 与 user_id_type 需一致（user_id 或 open_id）。"""
     token = get_token()
     res = httpx.post(
         "https://open.feishu.cn/open-apis/approval/v4/tasks/approve",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-        params={"user_id_type": "user_id"},
+        params={"user_id_type": user_id_type},
         json={
             "approval_code": approval_code,
             "instance_code": instance_code,
@@ -742,13 +743,13 @@ def _download_approval_file(file_token_or_code, get_token, instance_code=None):
     return None, err or "下载失败"
 
 
-def get_instance_detail(instance_code, get_token):
-    """获取审批实例详情"""
+def get_instance_detail(instance_code, get_token, user_id_type="user_id"):
+    """获取审批实例详情。user_id_type 决定 task_list 中 user_id 的格式，需与 auto_approve 配置一致。"""
     token = get_token()
     res = httpx.get(
         f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_code}",
         headers={"Authorization": f"Bearer {token}"},
-        params={"user_id_type": "user_id"},
+        params={"user_id_type": user_id_type},
         timeout=10,
     )
     data = res.json()
@@ -790,7 +791,7 @@ def query_pending_tasks(user_id, get_token):
     return tasks
 
 
-def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id, get_token):
+def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id, get_token, user_id_type="user_id"):
     """
     处理单条待审批任务：轮询只根据预检结果做动作。
     有缓存且合规则 -> 直接 approve（不下载、不调 AI）；
@@ -804,8 +805,9 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     if not is_auto_approval_enabled_for_type(approval_type):
         logger.info("自动审批: 跳过 instance=%s %s 未启用自动审批", instance_code, approval_type)
         return
-    if user_id not in get_auto_approve_user_ids():
-        logger.info("自动审批: 跳过 instance=%s user_id=%s 不在 auto_approve_user_ids", instance_code, user_id)
+    allowed_ids = get_auto_approve_open_ids() if user_id_type == "open_id" else get_auto_approve_user_ids()
+    if user_id not in allowed_ids:
+        logger.info("自动审批: 跳过 instance=%s %s=%s 不在 auto_approve 列表", instance_code, user_id_type, user_id)
         return
 
     # 轮询只根据预检结果做动作：有缓存且合规则直接 approve；有缓存但不合规则或无缓存则等待人工（不下载、不调 AI）
@@ -813,7 +815,7 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
     if cached_result:
         if cached_result.get("compliant"):
             logger.info("自动审批: instance=%s 使用预检缓存直接通过", instance_code)
-            ok, err = approve_task(approval_code, instance_code, user_id, task_id, "", get_token)
+            ok, err = approve_task(approval_code, instance_code, user_id, task_id, "", get_token, user_id_type)
             if not ok:
                 logger.warning("自动审批: 审批 API 失败 instance=%s: %s", instance_code, err)
         else:
@@ -825,20 +827,25 @@ def process_auto_approve_for_task(approval_code, instance_code, user_id, task_id
 def poll_and_process(get_token):
     """
     轮询待审批任务并处理。
-    从实例详情 task_list 中筛选出 user_id 的 PENDING 任务。
+    从实例详情 task_list 中筛选出配置的审批人 PENDING 任务。
+    支持 user_id 或 open_id：若配置了 auto_approve_open_ids 则用 open_id 匹配。
     """
-    uids = get_auto_approve_user_ids()
-    if not uids:
-        logger.info("自动审批轮询: auto_approve_user_ids 为空，跳过")
+    open_ids = get_auto_approve_open_ids()
+    user_ids = get_auto_approve_user_ids()
+    use_open_id = bool(open_ids)
+    allowed_ids = open_ids if use_open_id else user_ids
+    if not allowed_ids:
+        logger.info("自动审批轮询: auto_approve_user_ids 和 auto_approve_open_ids 均为空，跳过")
         return
-    logger.info("自动审批轮询: 开始 uid=%s", uids)
+    id_type = "open_id" if use_open_id else "user_id"
+    logger.info("自动审批轮询: 开始 %s=%s", id_type, allowed_ids)
     processed_count = 0
-    for uid in uids:
+    for uid in allowed_ids:
         found_any = False
         for approval_code, instance_codes in _iter_instances_for_user(uid, get_token):
             found_any = True
             for ic in instance_codes:
-                detail, err = get_instance_detail(ic, get_token)
+                detail, err = get_instance_detail(ic, get_token, user_id_type=id_type)
                 if not detail:
                     logger.warning("自动审批: 获取实例详情失败 instance=%s err=%s", ic, err)
                     continue
@@ -850,7 +857,7 @@ def poll_and_process(get_token):
                     if t_uid == uid and t_status == "PENDING":
                         logger.info("自动审批: 找到待处理任务 approval=%s instance=%s task_id=%s", approval_code, ic, t.get("id"))
                         process_auto_approve_for_task(
-                            approval_code, ic, uid, t.get("id"), get_token
+                            approval_code, ic, uid, t.get("id"), get_token, user_id_type=id_type
                         )
                         processed_count += 1
                         matched = True
@@ -858,11 +865,11 @@ def poll_and_process(get_token):
                 if not matched:
                     pending_uids = [t.get("user_id") for t in task_list if t.get("status") == "PENDING"]
                     logger.info(
-                        "自动审批: 实例 %s 无匹配任务 (期望 uid=%s, PENDING 任务审批人=%s)",
-                        ic, uid, pending_uids,
+                        "自动审批: 实例 %s 无匹配任务 (期望 %s=%s, PENDING 任务审批人=%s)",
+                        ic, id_type, uid, pending_uids,
                     )
         if not found_any:
-            logger.info("自动审批轮询: uid=%s 无待审批实例", uid)
+            logger.info("自动审批轮询: %s=%s 无待审批实例", id_type, uid)
     logger.info("自动审批轮询: 完成，本次处理 %d 个任务", processed_count)
 
 

@@ -52,6 +52,12 @@ def get_auto_approve_user_ids():
     return rules.get("auto_approve_user_ids") or []
 
 
+def get_auto_approve_open_ids():
+    """获取启用自动审批的 open_id 列表。若配置此项，轮询时使用 open_id 匹配 task_list。"""
+    rules = _load_rules()
+    return rules.get("auto_approve_open_ids") or []
+
+
 def get_exclude_types():
     """获取不参与自动审批的工单类型"""
     rules = _load_rules()
