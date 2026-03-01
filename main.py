@@ -1521,8 +1521,9 @@ def _match_sub_field(sf_name, item):
     return ""
 
 
-def _format_field_value(logical_key, raw_value, field_type, field_info=None):
-    """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。"""
+def _format_field_value(logical_key, raw_value, field_type, field_info=None, approval_type=None, approval_code=None, token=None):
+    """根据控件类型格式化值。fieldList 需传二维数组 [[{id,type,value},...]]。
+    radioV2/radio 需传 option value 非 text，approval_type/approval_code/token 用于解析子字段选项。"""
     if field_type == "fieldList":
         sub_fields = (field_info or {}).get("sub_fields", [])
         if isinstance(raw_value, list) and raw_value:
@@ -1550,6 +1551,27 @@ def _format_field_value(logical_key, raw_value, field_type, field_info=None):
                                     opt = opts[0]
                                     if isinstance(opt, dict):
                                         val = opt.get("value") or opt.get("key", "") or opt.get("text", "")
+                            # radioV2/radio 必须传 option value，不能传 text（如「纸质章」→「m67nc98b-xxx」）
+                            elif sf_type in ("radioV2", "radio") and val:
+                                opts = sf.get("options", [])
+                                if not opts and approval_type and approval_code and token:
+                                    opts = get_sub_field_options(approval_type, sf["id"], approval_code, token)
+                                val_str = str(val).strip()
+                                resolved = False
+                                for opt in (opts or []):
+                                    if isinstance(opt, dict):
+                                        ov = opt.get("value") or opt.get("key", "")
+                                        ot = str(opt.get("text", ""))
+                                        if val_str == ov or val_str == ot:
+                                            val = ov or ot
+                                            resolved = True
+                                            break
+                                        if val_str in (str(ov), ot):
+                                            val = ov or ot
+                                            resolved = True
+                                            break
+                                if not resolved and opts and opts[0]:
+                                    val = opts[0].get("value") or opts[0].get("key", "")
                             row.append({"id": sf["id"], "type": sf_type, "value": val})
                         rows.append(row)
                     elif isinstance(item, list):
@@ -1703,7 +1725,10 @@ def build_form(approval_type, fields, token, file_codes=None):
             fallback_subs = (FIELDLIST_SUBFIELDS_FALLBACK.get(approval_type) or {}).get(logical_key)
             if fallback_subs:
                 field_info = {**field_info, "sub_fields": fallback_subs}
-        value = _format_field_value(logical_key, raw, field_type, field_info)
+        value = _format_field_value(
+            logical_key, raw, field_type, field_info,
+            approval_type=approval_type, approval_code=approval_code, token=token,
+        )
         ftype = field_type if field_type in ("input", "textarea", "date", "number", "amount", "radioV2", "fieldList", "checkboxV2") else "input"
         if field_type in ("input", "textarea") and value == "":
             value = "无"
@@ -1910,7 +1935,7 @@ ATTACHMENT_FIELD_ID = "widget15828104903330001"
 
 # 用印申请单选项字段（表格结构时选项在 sub_fields 内，此处作 fallback）
 SEAL_OPTION_FIELDS = {
-    "usage_method": "widget17334699216260001",   # 盖章形式
+    "usage_method": "widget17375347703620001",   # 盖章形式
     "seal_type": "widget15754438920110001",     # 印章类型
     "document_type": "widget17334700336550001", # 文件类型
     "lawyer_reviewed": "widget17334701422160001",  # 律师是否已审核
@@ -2390,12 +2415,12 @@ def _do_create_seal_multi(open_id, user_id, items, selections):
     rows = []
     for i, (item, sel) in enumerate(zip(items, selections)):
         df = {**item["doc_fields"], **sel}
-        resolved_usage = _resolve_radio_option_for_seal("widget17334699216260001", sel.get("usage_method", "纸质章"), default_first=True)
+        resolved_usage = _resolve_radio_option_for_seal(SEAL_OPTION_FIELDS["usage_method"], sel.get("usage_method", "纸质章"), default_first=True)
         resolved_seal = _resolve_radio_option_for_seal("widget15754438920110001", df.get("seal_type", ""), default_first=True)
         lawyer_val = "已审核" if str(sel.get("lawyer_reviewed", "")).strip() in ("是", "yes", "已审核") else "未审核"
         resolved_lawyer = _resolve_radio_option_for_seal("widget17334701422160001", lawyer_val, default_first=True)
         resolved_doc_type = _resolve_document_type_for_seal(df.get("document_type", ""))
-        usage_val = resolved_usage or _resolve_radio_option_for_seal("widget17334699216260001", "纸质章", default_first=True)
+        usage_val = resolved_usage or _resolve_radio_option_for_seal(SEAL_OPTION_FIELDS["usage_method"], "纸质章", default_first=True)
         rows.append({
             "文件名称": df.get("document_name", item["file_name"].rsplit(".", 1)[0] if "." in item["file_name"] else item["file_name"]),
             "用印事由": df.get("reason", ""),
@@ -2458,10 +2483,10 @@ def _do_create_seal(open_id, user_id, all_fields, file_codes=None, direct_create
     codes = file_codes if isinstance(file_codes, list) else ([file_codes] if file_codes else [])
     # 盖章形式、印章类型：需解析为表单 option value（飞书要求传 value 非 text）
     seal_form_type = _resolve_radio_option_for_seal(
-        "widget17334699216260001", all_fields.get("usage_method", "纸质章"), default_first=True
+        SEAL_OPTION_FIELDS["usage_method"], all_fields.get("usage_method", "纸质章"), default_first=True
     )
     if not seal_form_type:
-        seal_form_type = _resolve_radio_option_for_seal("widget17334699216260001", "纸质章", default_first=True)
+        seal_form_type = _resolve_radio_option_for_seal(SEAL_OPTION_FIELDS["usage_method"], "纸质章", default_first=True)
     resolved_seal_type = _resolve_radio_option_for_seal("widget15754438920110001", all_fields.get("seal_type", ""), default_first=True)
     lawyer_raw = str(all_fields.get("lawyer_reviewed", "")).strip()
     lawyer_val = "已审核" if lawyer_raw in ("是", "yes", "已审核") else "未审核"

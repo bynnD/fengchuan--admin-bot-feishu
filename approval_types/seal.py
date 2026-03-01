@@ -43,7 +43,7 @@ FIELDLIST_SUBFIELDS_FALLBACK = {
     "seal_detail": [
         {"id": "widget17334700336550001", "type": "radioV2", "name": "文件类型"},
         {"id": "widget15754438920110001", "type": "radioV2", "name": "印章类型"},
-        {"id": "widget17334699216260001", "type": "radioV2", "name": "盖章形式"},
+        {"id": "widget17375347703620001", "type": "radioV2", "name": "盖章形式"},
         {"id": "widget17334701422160001", "type": "radioV2", "name": "律师是否已审核"},
         {"id": "widget15828104903330001", "type": "attachmentV2", "name": "上传用章文件"},
     ]
